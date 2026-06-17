@@ -1,0 +1,32 @@
+[package]
+name = "kms"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+async-nats = "0.39"
+async-stream = "0.3"
+bytes = "1"
+futures-util = "0.3"
+h2 = "0.4"
+hex = "0.4"
+http = "1"
+keinbuild = { path = "../keinbuild" }
+keinctl = { path = "../keinctl" }
+prost = "0.14"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-stream = "0.1"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-health = "0.14"
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+foundationdb = { version = "0.10", default-features = false, features = ["embedded-fdb-include", "fdb-6_3"] }
+
+[build-dependencies]
+keinbuild = { path = "../keinbuild" }

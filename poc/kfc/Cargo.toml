@@ -1,0 +1,20 @@
+[package]
+name = "kfc"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[features]
+default = []
+fuse = ["dep:fuser", "fuser/macos-no-mount"]
+
+[dependencies]
+async-nats = "0.39"
+futures-util = "0.3"
+fuser = { version = "0.17", optional = true }
+keinctl = { path = "../keinctl" }
+ksc = { path = "../ksc" }
+libc = "0.2"
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tonic = { version = "0.14", features = ["transport"] }

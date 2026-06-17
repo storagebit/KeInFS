@@ -1,0 +1,27 @@
+[package]
+name = "krs"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[features]
+default = []
+# Forward the ISA-L erasure-coding backend through both the shared engine and
+# the KSC object path KRS rebuilds with. Without this, a release KRS would
+# silently run the slow software backend even when the rest of the build is ISA-L.
+isa-l-backend = ["ksc/isa-l-backend", "kee/isa-l-backend"]
+
+[dependencies]
+kee = { path = "../kee" }
+keinbuild = { path = "../keinbuild" }
+keinctl = { path = "../keinctl" }
+ksc = { path = "../ksc" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tonic = { version = "0.14", features = ["transport"] }
+uuid = { version = "1", features = ["v4"] }
+
+[build-dependencies]
+keinbuild = { path = "../keinbuild" }

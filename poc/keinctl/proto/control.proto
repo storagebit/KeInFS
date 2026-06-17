@@ -1,0 +1,1030 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andreas Krause / storagebit
+
+syntax = "proto3";
+
+package keinfs.control;
+
+enum FailureDomain {
+  FAILURE_DOMAIN_UNSPECIFIED = 0;
+  FAILURE_DOMAIN_DRIVE_DOMAIN_LAB = 1;
+  FAILURE_DOMAIN_NODE = 2;
+  FAILURE_DOMAIN_RACK = 3;
+}
+
+enum NamespaceState {
+  NAMESPACE_STATE_UNSPECIFIED = 0;
+  NAMESPACE_STATE_ACTIVE = 1;
+  NAMESPACE_STATE_DISABLED = 2;
+  NAMESPACE_STATE_DELETING = 3;
+}
+
+enum NamespaceEntryKind {
+  NAMESPACE_ENTRY_KIND_UNSPECIFIED = 0;
+  NAMESPACE_ENTRY_KIND_PROJECT = 1;
+  NAMESPACE_ENTRY_KIND_TEAM = 2;
+  NAMESPACE_ENTRY_KIND_GROUP = 3;
+  NAMESPACE_ENTRY_KIND_WORKSPACE = 4;
+  NAMESPACE_ENTRY_KIND_BUCKET = 5;
+  NAMESPACE_ENTRY_KIND_COLLECTION = 6;
+  NAMESPACE_ENTRY_KIND_OBJECT = 7;
+}
+
+enum WriteIntentState {
+  WRITE_INTENT_STATE_UNSPECIFIED = 0;
+  WRITE_INTENT_STATE_PENDING = 1;
+  WRITE_INTENT_STATE_RESERVED = 2;
+  WRITE_INTENT_STATE_COMMITTED = 3;
+  WRITE_INTENT_STATE_ABORTED = 4;
+  WRITE_INTENT_STATE_EXPIRED = 5;
+}
+
+enum FragmentWriteState {
+  FRAGMENT_WRITE_STATE_UNSPECIFIED = 0;
+  FRAGMENT_WRITE_STATE_PLANNED = 1;
+  FRAGMENT_WRITE_STATE_WRITTEN = 2;
+  FRAGMENT_WRITE_STATE_FAILED = 3;
+}
+
+enum ReservationState {
+  RESERVATION_STATE_UNSPECIFIED = 0;
+  RESERVATION_STATE_RESERVED = 1;
+  RESERVATION_STATE_FINALIZED = 2;
+  RESERVATION_STATE_RELEASED = 3;
+}
+
+enum RebuildTaskState {
+  REBUILD_TASK_STATE_UNSPECIFIED = 0;
+  REBUILD_TASK_STATE_PENDING = 1;
+  REBUILD_TASK_STATE_LEASED = 2;
+  REBUILD_TASK_STATE_COMPLETED = 3;
+  REBUILD_TASK_STATE_FAILED = 4;
+}
+
+enum PlacementTaskState {
+  PLACEMENT_TASK_STATE_UNSPECIFIED = 0;
+  PLACEMENT_TASK_STATE_PENDING = 1;
+  PLACEMENT_TASK_STATE_LEASED = 2;
+  PLACEMENT_TASK_STATE_COMPLETED = 3;
+  PLACEMENT_TASK_STATE_FAILED = 4;
+}
+
+enum PlacementTaskKind {
+  PLACEMENT_TASK_KIND_UNSPECIFIED = 0;
+  PLACEMENT_TASK_KIND_REBUILD = 1;
+  PLACEMENT_TASK_KIND_REBALANCE = 2;
+  PLACEMENT_TASK_KIND_EVACUATE = 3;
+}
+
+enum TargetLifecycleState {
+  TARGET_LIFECYCLE_STATE_UNSPECIFIED = 0;
+  TARGET_LIFECYCLE_STATE_ACTIVE = 1;
+  TARGET_LIFECYCLE_STATE_DRAINING = 2;
+  TARGET_LIFECYCLE_STATE_UNHEALTHY = 3;
+  TARGET_LIFECYCLE_STATE_RETIRED = 4;
+}
+
+enum ServiceKind {
+  SERVICE_KIND_UNSPECIFIED = 0;
+  SERVICE_KIND_KMS = 1;
+  SERVICE_KIND_KAS = 2;
+  SERVICE_KIND_KRS = 3;
+  SERVICE_KIND_KST = 4;
+  SERVICE_KIND_KSC = 5;
+  SERVICE_KIND_KEINCTL = 6;
+}
+
+enum MetadataEventKind {
+  METADATA_EVENT_KIND_UNSPECIFIED = 0;
+  METADATA_EVENT_KIND_NAMESPACE_CREATED = 1;
+  METADATA_EVENT_KIND_ENTRY_CREATED = 2;
+  METADATA_EVENT_KIND_BUCKET_CREATED = 3;
+  METADATA_EVENT_KIND_OBJECT_HEAD_UPDATED = 4;
+  METADATA_EVENT_KIND_WRITE_INTENT_CREATED = 5;
+  METADATA_EVENT_KIND_WRITE_INTENT_ABORTED = 6;
+  METADATA_EVENT_KIND_WRITE_INTENT_EXPIRED = 7;
+  METADATA_EVENT_KIND_REBUILD_TASK_CREATED = 8;
+  METADATA_EVENT_KIND_REBUILD_COMMITTED = 9;
+  METADATA_EVENT_KIND_SHARD_MAP_UPDATED = 10;
+  METADATA_EVENT_KIND_WRITE_INTENT_REPAIRED = 11;
+  METADATA_EVENT_KIND_PLACEMENT_TASK_CREATED = 12;
+  METADATA_EVENT_KIND_PLACEMENT_TASK_COMMITTED = 13;
+  METADATA_EVENT_KIND_TARGET_STATE_UPDATED = 14;
+  METADATA_EVENT_KIND_OBJECT_DELETED = 15;
+  METADATA_EVENT_KIND_OBJECT_VERSIONS_DELETED = 16;
+}
+
+message NamespaceRecord {
+  string namespace_id = 1;
+  string tenant_id = 2;
+  string display_name = 3;
+  NamespaceState state = 4;
+  string shard_id = 5;
+}
+
+message NamespaceDomainEntry {
+  string entry_id = 1;
+  string namespace_id = 2;
+  string parent_entry_id = 3;
+  string name = 4;
+  NamespaceEntryKind kind = 5;
+  string path = 6;
+}
+
+message ShardMapEntry {
+  string shard_id = 1;
+  string namespace_id = 2;
+  string path_prefix_start = 3;
+  string path_prefix_end = 4;
+  string leader_endpoint = 5;
+  repeated string replica_endpoints = 6;
+  uint64 revision = 7;
+}
+
+message MetadataEvent {
+  uint64 revision = 1;
+  string namespace_id = 2;
+  string entry_id = 3;
+  string parent_entry_id = 4;
+  string entry_path = 5;
+  MetadataEventKind event_kind = 6;
+  string bucket_id = 7;
+  string object_entry_id = 8;
+  string version_id = 9;
+  string summary = 10;
+  string json_payload = 11;
+}
+
+message MetadataInvalidationEvent {
+  string namespace_id = 1;
+  string bucket_id = 2;
+  string key = 3;
+  string entry_id = 4;
+  string parent_entry_id = 5;
+  MetadataEventKind event_kind = 6;
+  string version_id = 7;
+}
+
+message ObjectHead {
+  string object_entry_id = 1;
+  string current_version_id = 2;
+  uint64 revision = 3;
+}
+
+message EcProfile {
+  string id = 1;
+  string codec_id = 2;
+  uint32 data_fragments = 3;
+  uint32 parity_fragments = 4;
+  uint32 fragment_bytes = 5;
+  FailureDomain failure_domain = 6;
+}
+
+message BucketRecord {
+  string bucket_id = 1;
+  string ec_profile_id = 2;
+  string namespace_id = 3;
+  string parent_entry_id = 4;
+  string bucket_entry_id = 5;
+}
+
+message FragmentPlan {
+  uint32 fragment_index = 1;
+  bytes chunk_id = 2;
+  string target_id = 3;
+  string endpoint = 4;
+  uint64 granule_index = 5;
+  uint32 generation = 6;
+  uint32 stripe_index = 7;
+}
+
+message StripeManifest {
+  repeated FragmentPlan fragments = 1;
+}
+
+message FragmentRef {
+  uint32 stripe_index = 1;
+  uint32 fragment_index = 2;
+}
+
+message ObjectVersionManifest {
+  string version_id = 1;
+  string bucket_id = 2;
+  string key = 3;
+  uint64 logical_length_bytes = 4;
+  string ec_profile_id = 5;
+  repeated StripeManifest stripes = 6;
+  string namespace_id = 7;
+  string object_entry_id = 8;
+  string bucket_entry_id = 9;
+}
+
+message WriteIntent {
+  string intent_id = 1;
+  string version_id = 2;
+  string bucket_id = 3;
+  string key = 4;
+  uint64 logical_length_bytes = 5;
+  string ec_profile_id = 6;
+  uint32 stripe_count = 7;
+  repeated FragmentPlan fragment_plans = 8;
+  uint64 expires_at_unix_ms = 9;
+  WriteIntentState state = 10;
+  string reservation_id = 11;
+  string namespace_id = 12;
+  string object_entry_id = 13;
+  string bucket_entry_id = 14;
+  repeated string reservation_ids = 15;
+  repeated FragmentWriteStatus fragment_status = 16;
+  bool reservations_finalized = 17;
+  string parent_entry_id = 18;
+  string parent_path = 19;
+}
+
+message RebuildTask {
+  string task_id = 1;
+  string failed_target_id = 2;
+  string object_version_ref = 3;
+  uint32 stripe_index = 4;
+  uint32 fragment_index = 5;
+  string replacement_target_id = 6;
+  uint64 replacement_granule_index = 7;
+  string lease_owner = 8;
+  uint64 lease_expires_at_unix_ms = 9;
+  RebuildTaskState state = 10;
+  string namespace_id = 11;
+  string bucket_id = 12;
+  string object_entry_id = 13;
+}
+
+message FragmentWriteStatus {
+  uint32 fragment_index = 1;
+  FragmentWriteState state = 2;
+  string reservation_id = 3;
+  uint32 reservation_placement_index = 4;
+  uint32 stripe_index = 5;
+}
+
+message PlacementTask {
+  string task_id = 1;
+  PlacementTaskKind task_kind = 2;
+  string source_target_id = 3;
+  string object_version_ref = 4;
+  uint32 stripe_index = 5;
+  uint32 fragment_index = 6;
+  string destination_target_id = 7;
+  uint64 destination_granule_index = 8;
+  string lease_owner = 9;
+  uint64 lease_expires_at_unix_ms = 10;
+  PlacementTaskState state = 11;
+  string namespace_id = 12;
+  string bucket_id = 13;
+  string object_entry_id = 14;
+  string reason = 15;
+}
+
+message TargetRecord {
+  string target_id = 1;
+  string endpoint = 2;
+  string server_id = 3;
+  string rack_id = 4;
+  FailureDomain failure_domain = 5;
+  uint64 granule_count = 6;
+  uint64 free_granules = 7;
+  bool healthy = 8;
+  uint64 last_heartbeat_unix_ms = 9;
+  TargetLifecycleState lifecycle_state = 10;
+  string allocation_shard_id = 11;
+}
+
+message PlacementReservation {
+  string target_id = 1;
+  string endpoint = 2;
+  uint64 granule_index = 3;
+  uint32 fragment_index = 4;
+  string reservation_id = 5;
+  uint32 reservation_placement_index = 6;
+}
+
+message PlacementReservationRecord {
+  string reservation_id = 1;
+  ReservationState state = 2;
+  repeated PlacementReservation placements = 3;
+  uint64 expires_at_unix_ms = 4;
+}
+
+message BuildInfo {
+  string package_name = 1;
+  string binary_name = 2;
+  string version = 3;
+  uint64 release = 4;
+  string git_sha = 5;
+  bool git_dirty = 6;
+  uint64 built_at_unix_s = 7;
+  string build_profile = 8;
+  string target_triple = 9;
+}
+
+message ServiceInstanceRecord {
+  string instance_id = 1;
+  ServiceKind service_kind = 2;
+  string node_id = 3;
+  string endpoint = 4;
+  string package_name = 5;
+  BuildInfo build = 6;
+  string config_hash = 7;
+  uint32 pid = 8;
+  string runtime_root = 9;
+  string instance_label = 10;
+  uint64 started_at_unix_ms = 11;
+  uint64 heartbeat_at_unix_ms = 12;
+  uint64 heartbeat_interval_ms = 13;
+}
+
+message CreateNamespaceRequest {
+  NamespaceRecord namespace = 1;
+}
+
+message CreateNamespaceReply {
+  NamespaceRecord namespace = 1;
+  ShardMapEntry shard_map = 2;
+}
+
+message ListNamespacesRequest {
+  string tenant_id = 1;
+}
+
+message ListNamespacesReply {
+  repeated NamespaceRecord namespaces = 1;
+}
+
+message GetNamespaceRequest {
+  string namespace_id = 1;
+}
+
+message GetNamespaceReply {
+  NamespaceRecord namespace = 1;
+  ShardMapEntry shard_map = 2;
+}
+
+message CreateNamespaceEntryRequest {
+  NamespaceDomainEntry entry = 1;
+}
+
+message CreateNamespaceEntryReply {
+  NamespaceDomainEntry entry = 1;
+}
+
+message DeleteNamespaceEntryRequest {
+  string namespace_id = 1;
+  string entry_id = 2;
+}
+
+message DeleteNamespaceEntryReply {
+  NamespaceDomainEntry entry = 1;
+}
+
+message CreateEcProfileRequest {
+  EcProfile profile = 1;
+}
+
+message CreateEcProfileReply {
+  EcProfile profile = 1;
+}
+
+message ListEcProfilesRequest {}
+
+message ListEcProfilesReply {
+  repeated EcProfile profiles = 1;
+}
+
+message CreateBucketRequest {
+  BucketRecord bucket = 1;
+}
+
+message CreateBucketReply {
+  BucketRecord bucket = 1;
+}
+
+message GetBucketRequest {
+  string bucket_id = 1;
+}
+
+message GetBucketReply {
+  BucketRecord bucket = 1;
+  EcProfile ec_profile = 2;
+}
+
+message ListBucketsRequest {
+  string namespace_id = 1;
+  string parent_entry_id = 2;
+}
+
+message ListBucketsReply {
+  repeated BucketRecord buckets = 1;
+}
+
+message ResolvePathRequest {
+  string namespace_id = 1;
+  string path = 2;
+}
+
+message ResolvePathReply {
+  NamespaceRecord namespace = 1;
+  repeated NamespaceDomainEntry chain = 2;
+  BucketRecord bucket = 3;
+  NamespaceDomainEntry final_entry = 4;
+  ObjectHead object_head = 5;
+}
+
+message ListChildrenRequest {
+  string namespace_id = 1;
+  string parent_entry_id = 2;
+  string cursor = 3;
+  uint32 limit = 4;
+}
+
+message ListChildrenReply {
+  repeated NamespaceDomainEntry entries = 1;
+  string next_cursor = 2;
+  uint64 current_revision = 3;
+}
+
+message WatchEntryRequest {
+  string entry_id = 1;
+  uint64 start_revision = 2;
+}
+
+message WatchEntryReply {
+  MetadataEvent event = 1;
+}
+
+message WatchPrefixRequest {
+  string namespace_id = 1;
+  string parent_entry_id = 2;
+  uint64 start_revision = 3;
+}
+
+message WatchPrefixReply {
+  MetadataEvent event = 1;
+}
+
+message ResolveShardRequest {
+  string namespace_id = 1;
+  string path = 2;
+  string entry_id = 3;
+}
+
+message ResolveShardReply {
+  ShardMapEntry shard_map = 1;
+}
+
+message InitiateObjectWriteRequest {
+  string bucket_id = 1;
+  string key = 2;
+  uint64 logical_length_bytes = 3;
+  uint32 initial_window_stripe_count = 4;
+}
+
+message InitiateObjectWriteReply {
+  WriteIntent intent = 1;
+  EcProfile ec_profile = 2;
+  repeated FragmentPlan initial_fragment_plans = 3;
+  uint32 initial_window_stripe_count = 4;
+}
+
+message ReserveObjectWriteWindowRequest {
+  string intent_id = 1;
+  uint32 start_stripe_index = 2;
+  uint32 stripe_count = 3;
+}
+
+message ReserveObjectWriteWindowReply {
+  repeated FragmentPlan fragment_plans = 1;
+}
+
+message CommitObjectWriteWindowRequest {
+  string intent_id = 1;
+  repeated FragmentRef successful_fragments = 2;
+}
+
+message CommitObjectWriteWindowReply {}
+
+message CommitObjectWriteRequest {
+  string intent_id = 1;
+  repeated FragmentRef successful_fragments = 2;
+}
+
+message CommitObjectWriteReply {
+  ObjectVersionManifest manifest = 1;
+}
+
+message AbortObjectWriteRequest {
+  string intent_id = 1;
+}
+
+message AbortObjectWriteReply {
+  WriteIntent intent = 1;
+}
+
+message RepairObjectWriteRequest {
+  string intent_id = 1;
+  repeated FragmentRef failed_fragments = 2;
+}
+
+message RepairObjectWriteReply {
+  WriteIntent intent = 1;
+}
+
+message ListWriteIntentsRequest {
+  string bucket_id = 1;
+  WriteIntentState state = 2;
+  uint32 limit = 3;
+}
+
+message WriteIntentSummary {
+  string intent_id = 1;
+  string version_id = 2;
+  string bucket_id = 3;
+  string key = 4;
+  uint64 logical_length_bytes = 5;
+  string ec_profile_id = 6;
+  uint64 expires_at_unix_ms = 7;
+  WriteIntentState state = 8;
+  string namespace_id = 9;
+  string object_entry_id = 10;
+  string bucket_entry_id = 11;
+  repeated string reservation_ids = 12;
+  repeated FragmentWriteStatus fragment_status = 13;
+}
+
+message ListWriteIntentsReply {
+  repeated WriteIntentSummary intents = 1;
+}
+
+message GetWriteIntentRequest {
+  string intent_id = 1;
+}
+
+message GetWriteIntentReply {
+  WriteIntent intent = 1;
+}
+
+message ResolveObjectReadRequest {
+  string bucket_id = 1;
+  string key = 2;
+}
+
+message ResolveObjectReadReply {
+  ObjectVersionManifest manifest = 1;
+  EcProfile ec_profile = 2;
+}
+
+message DeleteObjectRequest {
+  string bucket_id = 1;
+  string key = 2;
+  repeated string version_ids = 3;
+}
+
+message DeletedObjectVersion {
+  string version_id = 1;
+  uint64 logical_length_bytes = 2;
+  uint32 stripe_count = 3;
+  uint32 fragment_count = 4;
+}
+
+message DeleteObjectReply {
+  repeated DeletedObjectVersion deleted_versions = 1;
+  uint64 fragment_delete_attempts = 2;
+  uint64 fragment_delete_successes = 3;
+  uint64 reclaimed_granules = 4;
+  bool cleanup_complete = 5;
+}
+
+message LeaseRebuildTasksRequest {
+  string lease_owner = 1;
+  uint32 max_tasks = 2;
+  uint64 lease_ttl_ms = 3;
+}
+
+message LeasedRebuildTask {
+  RebuildTask task = 1;
+  ObjectVersionManifest manifest = 2;
+  EcProfile ec_profile = 3;
+}
+
+message LeaseRebuildTasksReply {
+  repeated LeasedRebuildTask tasks = 1;
+}
+
+message LeasePlacementTasksRequest {
+  string lease_owner = 1;
+  uint32 max_tasks = 2;
+  uint64 lease_ttl_ms = 3;
+}
+
+message LeasedPlacementTask {
+  PlacementTask task = 1;
+  ObjectVersionManifest manifest = 2;
+  EcProfile ec_profile = 3;
+}
+
+message LeasePlacementTasksReply {
+  repeated LeasedPlacementTask tasks = 1;
+}
+
+message CommitRebuildRequest {
+  string task_id = 1;
+  FragmentPlan replacement_fragment = 2;
+}
+
+message CommitRebuildReply {
+  ObjectVersionManifest manifest = 1;
+}
+
+message CommitPlacementTaskRequest {
+  string task_id = 1;
+  FragmentPlan replacement_fragment = 2;
+}
+
+message CommitPlacementTaskReply {
+  ObjectVersionManifest manifest = 1;
+}
+
+message FailPlacementTaskRequest {
+  string task_id = 1;
+  string failure_reason = 2;
+}
+
+message FailPlacementTaskReply {
+  PlacementTask task = 1;
+}
+
+message PlacementTaskSummary {
+  string task_id = 1;
+  PlacementTaskKind task_kind = 2;
+  string source_target_id = 3;
+  string object_version_ref = 4;
+  uint32 stripe_index = 5;
+  uint32 fragment_index = 6;
+  string destination_target_id = 7;
+  uint64 destination_granule_index = 8;
+  string lease_owner = 9;
+  uint64 lease_expires_at_unix_ms = 10;
+  PlacementTaskState state = 11;
+  string namespace_id = 12;
+  string bucket_id = 13;
+  string object_entry_id = 14;
+  string reason = 15;
+}
+
+message ListPlacementTasksRequest {
+  string source_target_id = 1;
+  string object_version_ref = 2;
+  PlacementTaskKind task_kind = 3;
+  PlacementTaskState state = 4;
+  uint32 limit = 5;
+}
+
+message ListPlacementTasksReply {
+  repeated PlacementTaskSummary tasks = 1;
+}
+
+message GetPlacementTaskRequest {
+  string task_id = 1;
+}
+
+message GetPlacementTaskReply {
+  PlacementTask task = 1;
+  ObjectVersionManifest manifest = 2;
+  EcProfile ec_profile = 3;
+}
+
+message ReportTargetFailureRequest {
+  string target_id = 1;
+}
+
+message ReportTargetFailureReply {
+  uint32 created_tasks = 1;
+}
+
+message DrainTargetRequest {
+  string target_id = 1;
+}
+
+message DrainTargetReply {
+  uint32 created_tasks = 1;
+}
+
+message PreviewTargetRebalanceRequest {
+  repeated string source_target_ids = 1;
+  repeated string include_target_ids = 2;
+  repeated string exclude_target_ids = 3;
+  uint32 max_tasks = 4;
+}
+
+message PreviewTargetRebalanceReply {
+  uint64 live_fragments = 1;
+  uint32 candidate_tasks = 2;
+}
+
+message EnqueueTargetRebalanceRequest {
+  repeated string source_target_ids = 1;
+  repeated string include_target_ids = 2;
+  repeated string exclude_target_ids = 3;
+  uint32 max_tasks = 4;
+}
+
+message EnqueueTargetRebalanceReply {
+  uint32 created_tasks = 1;
+}
+
+message RecoverTargetRequest {
+  string target_id = 1;
+}
+
+message RecoverTargetReply {
+  TargetRecord target = 1;
+  uint64 live_fragments = 2;
+}
+
+message RetireTargetRequest {
+  string target_id = 1;
+}
+
+message RetireTargetReply {
+  TargetRecord target = 1;
+  uint64 live_fragments = 2;
+}
+
+message GetTargetPlacementStatusRequest {
+  string target_id = 1;
+}
+
+message TargetPlacementStatus {
+  string target_id = 1;
+  uint64 live_fragments = 2;
+  uint32 pending_rebuild_tasks = 3;
+  uint32 pending_rebalance_tasks = 4;
+  uint32 pending_evacuate_tasks = 5;
+  uint32 leased_tasks = 6;
+  uint32 failed_tasks = 7;
+}
+
+message GetTargetPlacementStatusReply {
+  TargetPlacementStatus status = 1;
+}
+
+message ListMetadataEventsRequest {
+  string namespace_id = 1;
+  string entry_id = 2;
+  string parent_entry_id = 3;
+  uint64 start_revision = 4;
+  uint32 limit = 5;
+}
+
+message ListMetadataEventsReply {
+  repeated MetadataEvent events = 1;
+}
+
+message RegisterTargetRequest {
+  TargetRecord target = 1;
+}
+
+message RegisterTargetReply {
+  TargetRecord target = 1;
+}
+
+message HeartbeatTargetRequest {
+  string target_id = 1;
+  bool healthy = 2;
+  uint64 observed_unix_ms = 3;
+}
+
+message HeartbeatTargetReply {
+  TargetRecord target = 1;
+}
+
+message ListTargetsRequest {}
+
+message ListTargetsReply {
+  repeated TargetRecord targets = 1;
+}
+
+message SetTargetStateRequest {
+  string target_id = 1;
+  TargetLifecycleState lifecycle_state = 2;
+}
+
+message SetTargetStateReply {
+  TargetRecord target = 1;
+}
+
+message ListReservationsRequest {
+  ReservationState state = 1;
+  string target_id = 2;
+  uint32 limit = 3;
+}
+
+message ListReservationsReply {
+  repeated PlacementReservationRecord reservations = 1;
+}
+
+message GetReservationRequest {
+  string reservation_id = 1;
+}
+
+message GetReservationReply {
+  PlacementReservationRecord reservation = 1;
+}
+
+message UpsertServiceInstanceRequest {
+  ServiceInstanceRecord instance = 1;
+}
+
+message UpsertServiceInstanceReply {
+  ServiceInstanceRecord instance = 1;
+}
+
+message ListServiceInstancesRequest {
+  ServiceKind service_kind = 1;
+  string node_id = 2;
+  uint32 limit = 3;
+}
+
+message ListServiceInstancesReply {
+  repeated ServiceInstanceRecord instances = 1;
+}
+
+message GetServiceInstanceRequest {
+  string instance_id = 1;
+}
+
+message GetServiceInstanceReply {
+  ServiceInstanceRecord instance = 1;
+}
+
+message ReserveStripePlacementRequest {
+  string reservation_id = 1;
+  uint32 fragment_count = 2;
+  FailureDomain failure_domain = 3;
+  repeated string excluded_target_ids = 4;
+  string allocation_shard_id = 5;
+}
+
+message ReserveStripePlacementReply {
+  PlacementReservationRecord reservation = 1;
+}
+
+message ReserveStripeBatchRequest {
+  uint32 batch_size = 1;
+  uint32 fragment_count = 2;
+  FailureDomain failure_domain = 3;
+  repeated string excluded_target_ids = 4;
+  uint64 reservation_ttl_ms = 5;
+  string allocation_shard_id = 6;
+}
+
+message ReserveStripeBatchReply {
+  repeated PlacementReservationRecord reservations = 1;
+}
+
+message FinalizeReservationsRequest {
+  string reservation_id = 1;
+  repeated uint32 placement_indexes = 2;
+}
+
+message FinalizeReservationsReply {
+  PlacementReservationRecord reservation = 1;
+}
+
+message ReservationMutation {
+  string reservation_id = 1;
+  repeated uint32 placement_indexes = 2;
+}
+
+message FinalizeReservationsBatchRequest {
+  repeated ReservationMutation mutations = 1;
+}
+
+message FinalizeReservationsBatchReply {
+  repeated PlacementReservationRecord reservations = 1;
+}
+
+message ReleaseReservationsRequest {
+  string reservation_id = 1;
+  repeated uint32 placement_indexes = 2;
+}
+
+message ReleaseReservationsReply {
+  PlacementReservationRecord reservation = 1;
+}
+
+message ReleaseReservationsBatchRequest {
+  repeated ReservationMutation mutations = 1;
+}
+
+message ReleaseReservationsBatchReply {
+  repeated PlacementReservationRecord reservations = 1;
+}
+
+message TargetGranule {
+  string target_id = 1;
+  uint64 granule_index = 2;
+}
+
+message ReclaimTargetGranulesRequest {
+  repeated TargetGranule granules = 1;
+}
+
+message ReclaimTargetGranulesReply {
+  uint64 reclaimed_granules = 1;
+}
+
+message ReserveRebuildPlacementRequest {
+  string reservation_id = 1;
+  string failed_target_id = 2;
+  FailureDomain failure_domain = 3;
+  repeated string occupied_target_ids = 4;
+}
+
+message ReserveRebuildPlacementReply {
+  PlacementReservationRecord reservation = 1;
+}
+
+message ReserveReplacementPlacementRequest {
+  string reservation_id = 1;
+  uint32 replacement_count = 2;
+  FailureDomain failure_domain = 3;
+  repeated string excluded_target_ids = 4;
+  uint64 reservation_ttl_ms = 5;
+  repeated string required_target_ids = 6;
+}
+
+message ReserveReplacementPlacementReply {
+  PlacementReservationRecord reservation = 1;
+}
+
+service Kms {
+  rpc CreateNamespace(CreateNamespaceRequest) returns (CreateNamespaceReply);
+  rpc ListNamespaces(ListNamespacesRequest) returns (ListNamespacesReply);
+  rpc GetNamespace(GetNamespaceRequest) returns (GetNamespaceReply);
+  rpc CreateNamespaceEntry(CreateNamespaceEntryRequest) returns (CreateNamespaceEntryReply);
+  rpc DeleteNamespaceEntry(DeleteNamespaceEntryRequest) returns (DeleteNamespaceEntryReply);
+  rpc CreateEcProfile(CreateEcProfileRequest) returns (CreateEcProfileReply);
+  rpc ListEcProfiles(ListEcProfilesRequest) returns (ListEcProfilesReply);
+  rpc CreateBucket(CreateBucketRequest) returns (CreateBucketReply);
+  rpc GetBucket(GetBucketRequest) returns (GetBucketReply);
+  rpc ListBuckets(ListBucketsRequest) returns (ListBucketsReply);
+  rpc ResolvePath(ResolvePathRequest) returns (ResolvePathReply);
+  rpc ListChildren(ListChildrenRequest) returns (ListChildrenReply);
+  rpc WatchEntry(WatchEntryRequest) returns (stream WatchEntryReply);
+  rpc WatchPrefix(WatchPrefixRequest) returns (stream WatchPrefixReply);
+  rpc ResolveShard(ResolveShardRequest) returns (ResolveShardReply);
+  rpc InitiateObjectWrite(InitiateObjectWriteRequest) returns (InitiateObjectWriteReply);
+  rpc ReserveObjectWriteWindow(ReserveObjectWriteWindowRequest) returns (ReserveObjectWriteWindowReply);
+  rpc CommitObjectWriteWindow(CommitObjectWriteWindowRequest) returns (CommitObjectWriteWindowReply);
+  rpc CommitObjectWrite(CommitObjectWriteRequest) returns (CommitObjectWriteReply);
+  rpc AbortObjectWrite(AbortObjectWriteRequest) returns (AbortObjectWriteReply);
+  rpc RepairObjectWrite(RepairObjectWriteRequest) returns (RepairObjectWriteReply);
+  rpc ListWriteIntents(ListWriteIntentsRequest) returns (ListWriteIntentsReply);
+  rpc GetWriteIntent(GetWriteIntentRequest) returns (GetWriteIntentReply);
+  rpc ResolveObjectRead(ResolveObjectReadRequest) returns (ResolveObjectReadReply);
+  rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectReply);
+  rpc LeaseRebuildTasks(LeaseRebuildTasksRequest) returns (LeaseRebuildTasksReply);
+  rpc CommitRebuild(CommitRebuildRequest) returns (CommitRebuildReply);
+  rpc LeasePlacementTasks(LeasePlacementTasksRequest) returns (LeasePlacementTasksReply);
+  rpc CommitPlacementTask(CommitPlacementTaskRequest) returns (CommitPlacementTaskReply);
+  rpc FailPlacementTask(FailPlacementTaskRequest) returns (FailPlacementTaskReply);
+  rpc ListPlacementTasks(ListPlacementTasksRequest) returns (ListPlacementTasksReply);
+  rpc GetPlacementTask(GetPlacementTaskRequest) returns (GetPlacementTaskReply);
+  rpc ReportTargetFailure(ReportTargetFailureRequest) returns (ReportTargetFailureReply);
+  rpc DrainTarget(DrainTargetRequest) returns (DrainTargetReply);
+  rpc PreviewTargetRebalance(PreviewTargetRebalanceRequest) returns (PreviewTargetRebalanceReply);
+  rpc EnqueueTargetRebalance(EnqueueTargetRebalanceRequest) returns (EnqueueTargetRebalanceReply);
+  rpc RecoverTarget(RecoverTargetRequest) returns (RecoverTargetReply);
+  rpc RetireTarget(RetireTargetRequest) returns (RetireTargetReply);
+  rpc GetTargetPlacementStatus(GetTargetPlacementStatusRequest) returns (GetTargetPlacementStatusReply);
+  rpc ListMetadataEvents(ListMetadataEventsRequest) returns (ListMetadataEventsReply);
+}
+
+service Kas {
+  rpc UpsertServiceInstance(UpsertServiceInstanceRequest) returns (UpsertServiceInstanceReply);
+  rpc ListServiceInstances(ListServiceInstancesRequest) returns (ListServiceInstancesReply);
+  rpc GetServiceInstance(GetServiceInstanceRequest) returns (GetServiceInstanceReply);
+  rpc RegisterTarget(RegisterTargetRequest) returns (RegisterTargetReply);
+  rpc HeartbeatTarget(HeartbeatTargetRequest) returns (HeartbeatTargetReply);
+  rpc ListTargets(ListTargetsRequest) returns (ListTargetsReply);
+  rpc SetTargetState(SetTargetStateRequest) returns (SetTargetStateReply);
+  rpc ListReservations(ListReservationsRequest) returns (ListReservationsReply);
+  rpc GetReservation(GetReservationRequest) returns (GetReservationReply);
+  rpc ReserveStripePlacement(ReserveStripePlacementRequest) returns (ReserveStripePlacementReply);
+  rpc ReserveStripeBatch(ReserveStripeBatchRequest) returns (ReserveStripeBatchReply);
+  rpc FinalizeReservations(FinalizeReservationsRequest) returns (FinalizeReservationsReply);
+  rpc FinalizeReservationsBatch(FinalizeReservationsBatchRequest) returns (FinalizeReservationsBatchReply);
+  rpc ReleaseReservations(ReleaseReservationsRequest) returns (ReleaseReservationsReply);
+  rpc ReleaseReservationsBatch(ReleaseReservationsBatchRequest) returns (ReleaseReservationsBatchReply);
+  rpc ReclaimTargetGranules(ReclaimTargetGranulesRequest) returns (ReclaimTargetGranulesReply);
+  rpc ReserveRebuildPlacement(ReserveRebuildPlacementRequest) returns (ReserveRebuildPlacementReply);
+  rpc ReserveReplacementPlacement(ReserveReplacementPlacementRequest) returns (ReserveReplacementPlacementReply);
+}

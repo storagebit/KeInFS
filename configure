@@ -1,0 +1,1283 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andreas Krause / storagebit
+#
+# KeInFS ./configure -- writes build/config.{mk,env,toml} and runs a
+# comprehensive Linux backend dependency preflight before you build.
+#
+# This is a strict drop-in for the original configure: every CLI flag,
+# default, and generated config variable is preserved, and the three
+# generated files stay format-compatible with the Makefile + tooling
+# contract. The only additions are the Linux-only guard, the dependency
+# check, the distro-aware install hints, and the human-facing UX layer.
+set -euo pipefail
+
+CONFIGURE_VERSION="0.9.0"
+
+ROOT_DIR=$(cd "$(dirname "$0")" && pwd)
+BUILD_DIR="${ROOT_DIR}/build"
+
+PREFIX="/usr/local"
+SYSCONFDIR="/etc"
+LOCALSTATEDIR="/var"
+RUNSTATEDIR="/run"
+BINDIR=""
+LIBEXECDIR=""
+DATADIR=""
+SYSTEMD_UNIT_DIR=""
+
+CARGO_BIN="${CARGO:-cargo}"
+CARGO_TARGET_DIR="${BUILD_DIR}/cargo-target"
+BUILD_PROFILE="release"
+ENABLE_FUSE=1
+ENABLE_ISA_L=1
+ENABLE_KIX_BENCH=0
+
+SERVICE_USER="root"
+SERVICE_GROUP="root"
+FOUNDATIONDB_CLUSTER_FILE="/etc/foundationdb/fdb.cluster"
+NOTIFICATION_NATS_URL="nats://127.0.0.1:4222"
+NOTIFICATION_SUBJECT="keinfs.kms.events"
+
+SKIP_DEPS=0
+
+# Field separator for the dependency-row buffer. A literal tab never appears in
+# any component/name/status/detail string (the SEP glyph can be "|" in ASCII
+# mode, so it must NOT be the field delimiter), keeping IFS reads unambiguous.
+FS=$'\t'
+
+usage() {
+  cat <<'EOF'
+usage: ./configure [options]
+
+Filesystem layout:
+  --prefix PATH                  install prefix (default /usr/local)
+  --bindir PATH                  binary install dir (default PREFIX/bin)
+  --libexecdir PATH              helper script dir (default PREFIX/libexec/keinfs)
+  --datadir PATH                 shared data dir (default PREFIX/share/keinfs)
+  --sysconfdir PATH              config root (default /etc)
+  --localstatedir PATH           local state root (default /var)
+  --runstatedir PATH             runtime root (default /run)
+  --systemd-unit-dir PATH        systemd unit dir (default PREFIX/lib/systemd/system)
+
+Build options:
+  --cargo PATH                   cargo executable (default from \$CARGO or cargo)
+  --cargo-target-dir PATH        cargo target dir (default build/cargo-target)
+  --build-profile debug|release  cargo profile (default release)
+  --enable-fuse                  build KFC with the fuse feature
+  --disable-fuse                 skip the KFC fuse feature
+  --enable-isa-l                 build with the Intel ISA-L EC backend (default)
+  --disable-isa-l                use the slow software Reed-Solomon fallback (not for production)
+  --enable-kix-bench             build kix-bench
+  --disable-kix-bench            skip kix-bench (default)
+
+Runtime defaults for rendered assets:
+  --service-user USER            service user for KMS/KAS/KRS units (default root)
+  --service-group GROUP          service group for KMS/KAS/KRS units (default root)
+  --foundationdb-cluster-file PATH
+                                default FDB cluster file for rendered configs
+  --notification-nats-url URL    default NATS URL for rendered configs
+  --notification-subject VALUE   default metadata invalidation subject
+
+Dependency check:
+  --skip-deps                    skip the dependency preflight entirely
+
+Misc:
+  --help                         show this help
+EOF
+}
+
+resolve_tool() {
+  local value=$1
+  if [[ "${value}" != */* && -x "${HOME}/.cargo/bin/${value}" ]]; then
+    printf '%s\n' "${HOME}/.cargo/bin/${value}"
+  elif command -v "${value}" >/dev/null 2>&1; then
+    command -v "${value}"
+  else
+    printf '%s\n' "${value}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# UI layer -- color/glyph handling. init_ui() runs once. Under set -euo
+# pipefail every color/glyph var MUST be declared (here, with the ASCII/empty
+# fallback) before it is referenced, or -u aborts the whole run.
+# ---------------------------------------------------------------------------
+C_RESET='' C_DIM='' C_BOLD='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
+G_OK='[+]' G_NO='[x]' G_OPT='[-]' G_ARROW='->'
+BX_TL='+' BX_TR='+' BX_BL='+' BX_BR='+' BX_H='-' BX_V='|'
+SEP='|'
+USE_COLOR=0
+USE_UNICODE=0
+
+init_ui() {
+  # STEP 2 -- decide whether color is on.
+  local want_color=0
+  if [[ -n "${CLICOLOR_FORCE:-}" && "${CLICOLOR_FORCE:-}" != "0" ]]; then
+    want_color=1
+  elif [[ -n "${KEINFS_FORCE_COLOR:-}" && "${KEINFS_FORCE_COLOR:-}" != "0" ]]; then
+    want_color=1
+  elif [[ -t 1 && -n "${TERM:-}" && "${TERM:-}" != "dumb" ]] \
+       && command -v tput >/dev/null 2>&1; then
+    local ncolors
+    ncolors=$(tput colors 2>/dev/null || echo 0)
+    if [[ "${ncolors}" =~ ^[0-9]+$ ]] && (( ncolors >= 8 )); then
+      want_color=1
+    fi
+  fi
+  # NO_COLOR (any value) always wins -- https://no-color.org
+  if [[ -n "${NO_COLOR:-}" ]]; then
+    want_color=0
+  fi
+
+  if (( want_color )); then
+    USE_COLOR=1
+    C_RESET=$'\e[0m'  C_DIM=$'\e[2m'    C_BOLD=$'\e[1m'
+    C_RED=$'\e[31m'   C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m' C_CYAN=$'\e[36m'
+  fi
+
+  # STEP 4 -- glyphs/box, orthogonal to color. KEINFS_ASCII=1 forces ASCII.
+  # Unicode is only safe under a UTF-8 locale: a non-UTF-8 LC_CTYPE renders the
+  # box-drawing/glyph code points as multibyte garbage and miscounts widths, so
+  # gate on the effective locale (LC_ALL > LC_CTYPE > LANG) matching *UTF*/*utf*.
+  local lc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+  local utf8=0
+  case "${lc}" in
+    *UTF*|*utf*) utf8=1 ;;
+  esac
+  if (( utf8 )) && [[ -z "${KEINFS_ASCII:-}" || "${KEINFS_ASCII:-}" == "0" ]]; then
+    USE_UNICODE=1
+    G_OK='✓'  G_NO='✗'  G_OPT='○'  G_ARROW='➜'
+    BX_TL='╭' BX_TR='╮' BX_BL='╰' BX_BR='╯' BX_H='─' BX_V='│'
+    SEP='·'
+  fi
+}
+
+# Visible-width-aware padding. Measure the PLAIN cell ($2), emit the COLORED
+# cell ($1), then pad with the difference to the target visible width ($3).
+# ${#2} counts characters (not bytes) in a UTF-8 locale.
+pad() {
+  local fill=$(( $3 - ${#2} ))
+  (( fill < 0 )) && fill=0
+  printf '%s%*s' "$1" "${fill}" ""
+}
+
+# A horizontal rule of a given visible width.
+rule() {
+  local width=$1 i out=''
+  for (( i = 0; i < width; i++ )); do
+    out+="${BX_H}"
+  done
+  printf '%s' "${out}"
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing -- identical semantics to the original. Two-argument flags
+# consume the next argv (shift 2); boolean enable/disable flags shift 1.
+# Unknown flags print "unknown option: X", dump usage to stderr, exit 1.
+#
+# A value-taking flag given as the final argv (e.g. "./configure --prefix")
+# errors cleanly instead of tripping over an unbound "$2" under set -u. The
+# "--flag=value" form is also accepted by splitting on the first "=".
+# ---------------------------------------------------------------------------
+require_value() {
+  # $1 = flag name, $2 = remaining argc. Guards "$2" reads on value flags.
+  [[ "$2" -ge 2 ]] || { echo "configure: $1 requires an argument" >&2; exit 1; }
+}
+
+while [[ $# -gt 0 ]]; do
+  # Accept --flag=value by splitting the leading argv on the first "=" into
+  # the flag and its value, then re-injecting them as separate positionals.
+  if [[ "$1" == --*=* ]]; then
+    set -- "${1%%=*}" "${1#*=}" "${@:2}"
+  fi
+  case "$1" in
+    --prefix)
+      require_value "$1" "$#"
+      PREFIX=$2
+      shift 2
+      ;;
+    --bindir)
+      require_value "$1" "$#"
+      BINDIR=$2
+      shift 2
+      ;;
+    --libexecdir)
+      require_value "$1" "$#"
+      LIBEXECDIR=$2
+      shift 2
+      ;;
+    --datadir)
+      require_value "$1" "$#"
+      DATADIR=$2
+      shift 2
+      ;;
+    --sysconfdir)
+      require_value "$1" "$#"
+      SYSCONFDIR=$2
+      shift 2
+      ;;
+    --localstatedir)
+      require_value "$1" "$#"
+      LOCALSTATEDIR=$2
+      shift 2
+      ;;
+    --runstatedir)
+      require_value "$1" "$#"
+      RUNSTATEDIR=$2
+      shift 2
+      ;;
+    --systemd-unit-dir)
+      require_value "$1" "$#"
+      SYSTEMD_UNIT_DIR=$2
+      shift 2
+      ;;
+    --cargo)
+      require_value "$1" "$#"
+      CARGO_BIN=$2
+      shift 2
+      ;;
+    --cargo-target-dir)
+      require_value "$1" "$#"
+      CARGO_TARGET_DIR=$2
+      shift 2
+      ;;
+    --build-profile)
+      require_value "$1" "$#"
+      BUILD_PROFILE=$2
+      shift 2
+      ;;
+    --enable-fuse)
+      ENABLE_FUSE=1
+      shift
+      ;;
+    --disable-fuse)
+      ENABLE_FUSE=0
+      shift
+      ;;
+    --enable-isa-l)
+      ENABLE_ISA_L=1
+      shift
+      ;;
+    --disable-isa-l)
+      ENABLE_ISA_L=0
+      shift
+      ;;
+    --enable-kix-bench)
+      ENABLE_KIX_BENCH=1
+      shift
+      ;;
+    --disable-kix-bench)
+      ENABLE_KIX_BENCH=0
+      shift
+      ;;
+    --service-user)
+      require_value "$1" "$#"
+      SERVICE_USER=$2
+      shift 2
+      ;;
+    --service-group)
+      require_value "$1" "$#"
+      SERVICE_GROUP=$2
+      shift 2
+      ;;
+    --foundationdb-cluster-file)
+      require_value "$1" "$#"
+      FOUNDATIONDB_CLUSTER_FILE=$2
+      shift 2
+      ;;
+    --notification-nats-url)
+      require_value "$1" "$#"
+      NOTIFICATION_NATS_URL=$2
+      shift 2
+      ;;
+    --notification-subject)
+      require_value "$1" "$#"
+      NOTIFICATION_SUBJECT=$2
+      shift 2
+      ;;
+    --skip-deps)
+      SKIP_DEPS=1
+      shift
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+case "${BUILD_PROFILE}" in
+  debug|release)
+    ;;
+  *)
+    echo "--build-profile must be debug or release, got ${BUILD_PROFILE}" >&2
+    exit 1
+    ;;
+esac
+
+if [[ -z "${BINDIR}" ]]; then
+  BINDIR="${PREFIX}/bin"
+fi
+if [[ -z "${LIBEXECDIR}" ]]; then
+  LIBEXECDIR="${PREFIX}/libexec/keinfs"
+fi
+if [[ -z "${DATADIR}" ]]; then
+  DATADIR="${PREFIX}/share/keinfs"
+fi
+if [[ -z "${SYSTEMD_UNIT_DIR}" ]]; then
+  SYSTEMD_UNIT_DIR="${PREFIX}/lib/systemd/system"
+fi
+
+CARGO_BIN=$(resolve_tool "${CARGO_BIN}")
+
+init_ui
+
+# ---------------------------------------------------------------------------
+# Platform / distro detection
+# ---------------------------------------------------------------------------
+HOST_OS=$(uname -s 2>/dev/null || echo unknown)
+HOST_KERNEL=$(uname -r 2>/dev/null || echo unknown)
+HOST_ARCH=$(uname -m 2>/dev/null || echo unknown)
+
+DISTRO_ID="unknown"
+DISTRO_NAME="unknown"
+DISTRO_VERSION_ID=""
+DISTRO_FAMILY="unknown"   # rhel | debian | unknown
+PKG_MGR=""                # dnf | yum | apt-get
+
+DISTRO_ID_LIKE=""
+
+# Source /etc/os-release and bucket into a family by ID, then ID_LIKE.
+detect_distro() {
+  if [[ -r /etc/os-release ]]; then
+    # Source in a subshell and re-export only the keys we need, so a stray
+    # variable or `set`-hostile line in /etc/os-release can't perturb this
+    # configure shell under `set -euo pipefail`.
+    # shellcheck disable=SC1091
+    eval "$( . /etc/os-release 2>/dev/null; printf 'DISTRO_ID=%q DISTRO_NAME=%q DISTRO_VERSION_ID=%q DISTRO_ID_LIKE=%q\n' "${ID:-unknown}" "${NAME:-${ID:-unknown}}" "${VERSION_ID:-}" "${ID_LIKE:-}" )"
+    local like="${DISTRO_ID_LIKE:-}"
+    case "${DISTRO_ID}" in
+      rhel|fedora|centos|rocky|almalinux|ol|oracle)
+        DISTRO_FAMILY="rhel" ;;
+      debian|ubuntu|linuxmint|pop|raspbian)
+        DISTRO_FAMILY="debian" ;;
+      *)
+        case " ${like} " in
+          *" rhel "*|*" fedora "*|*" centos "*) DISTRO_FAMILY="rhel" ;;
+          *" debian "*|*" ubuntu "*)            DISTRO_FAMILY="debian" ;;
+          *)                                    DISTRO_FAMILY="unknown" ;;
+        esac
+        ;;
+    esac
+  fi
+
+  case "${DISTRO_FAMILY}" in
+    rhel)
+      if command -v dnf >/dev/null 2>&1; then
+        PKG_MGR="dnf"
+      elif command -v yum >/dev/null 2>&1; then
+        PKG_MGR="yum"
+      else
+        PKG_MGR="dnf"
+      fi
+      ;;
+    debian)
+      PKG_MGR="apt-get"
+      ;;
+    *)
+      PKG_MGR=""
+      ;;
+  esac
+}
+
+# A short human label like "ubuntu (debian-like)".
+distro_label() {
+  case "${DISTRO_FAMILY}" in
+    rhel)    printf '%s (rhel-like)' "${DISTRO_ID}" ;;
+    debian)  printf '%s (debian-like)' "${DISTRO_ID}" ;;
+    *)       printf '%s (unknown family)' "${DISTRO_ID}" ;;
+  esac
+}
+
+detect_distro
+
+# ---------------------------------------------------------------------------
+# Linux-only guard (FIRST_PRINCIPLES Sec.1). The KeInFS backend -- the only
+# thing this configure provisions a build for today -- runs on Linux and
+# nothing else. The client stack is intended to be portable, but that is
+# future work; refuse on non-Linux with a clear message.
+# ---------------------------------------------------------------------------
+if [[ "${HOST_OS}" != "Linux" ]]; then
+  {
+    printf '%b\n' "${C_RED}${G_NO} configure: the KeInFS backend is Linux-only.${C_RESET}"
+    printf '%b\n' "${C_DIM}  Detected host OS: ${HOST_OS} (${HOST_ARCH}).${C_RESET}"
+    printf '%b\n' "  KMS, KAS, KST, KIX, and KRS depend on Linux-only primitives"
+    printf '%b\n' "  (raw block devices, O_DIRECT, io_uring, NUMA/IRQ steering, the"
+    printf '%b\n' "  FoundationDB C client). See FIRST_PRINCIPLES.md \xc2\xa71."
+    printf '%b\n' ""
+    printf '%b\n' "  Portable client builds (KSC/libkeinfs, KFC FUSE, S3/HTTP tooling)"
+    printf '%b\n' "  are intended direction but not wired into this build yet."
+    printf '%b\n' ""
+    printf '%b\n' "  Run ./configure on a Linux host (the KVM lab host, a VM, or a"
+    printf '%b\n' "  container) to build the backend."
+  } >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Dependency probing
+#
+# Probe helpers each emit a "version/detail" string on stdout when the dep is
+# present and return 0; otherwise return non-zero. Probes mirror the Makefile
+# preflight (ldconfig greps for libfdb_c.so / libisal.so) so configure never
+# green-lights something `make build` will reject.
+# ---------------------------------------------------------------------------
+
+# probe a binary on PATH; echo a short version line.
+probe_binary_version() {
+  local bin=$1 ver
+  command -v "${bin}" >/dev/null 2>&1 || return 1
+  case "${bin}" in
+    rustc)
+      ver=$(rustc --version 2>/dev/null | awk '{print $2}') || true
+      printf '%s\n' "${ver:-present}"
+      ;;
+    cargo)
+      ver=$(cargo --version 2>/dev/null | awk '{print $2}') || true
+      printf '%s\n' "${ver:-present}"
+      ;;
+    pkg-config|pkgconf)
+      ver=$("${bin}" --version 2>/dev/null | head -n1) || true
+      printf '%s\n' "${ver:-present}"
+      ;;
+    git)
+      ver=$(git --version 2>/dev/null | awk '{print $3}') || true
+      printf '%s\n' "${ver:-present}"
+      ;;
+    *)
+      printf '%s\n' "present"
+      ;;
+  esac
+  return 0
+}
+
+# probe a C compiler driver: cc, then gcc, then clang.
+probe_cc() {
+  local c
+  for c in cc gcc clang; do
+    if command -v "${c}" >/dev/null 2>&1; then
+      local line
+      line=$("${c}" --version 2>/dev/null | head -n1) || true
+      if [[ -z "${line}" ]]; then
+        printf '%s\n' "${c} present"
+      else
+        printf '%s\n' "${line}"
+      fi
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Resolve the ldconfig binary. ldconfig lives in /sbin or /usr/sbin and is
+# frequently OFF a non-login PATH (confirmed on Ubuntu: `command -v ldconfig`
+# returns nothing yet /sbin/ldconfig exists). Echo a usable path or nothing.
+find_ldconfig() {
+  local p
+  if p=$(command -v ldconfig 2>/dev/null) && [[ -n "${p}" ]]; then
+    printf '%s\n' "${p}"
+    return 0
+  fi
+  if [[ -x /sbin/ldconfig ]]; then
+    printf '%s\n' "/sbin/ldconfig"
+    return 0
+  fi
+  if [[ -x /usr/sbin/ldconfig ]]; then
+    printf '%s\n' "/usr/sbin/ldconfig"
+    return 0
+  fi
+  return 1
+}
+
+# Standard library directories searched by the direct filesystem fallback.
+LIB_DIRS=(/usr/lib64 /lib64 /usr/lib /lib /usr/lib/x86_64-linux-gnu \
+          /usr/lib/aarch64-linux-gnu /usr/local/lib /usr/local/lib64)
+
+# Direct filesystem probe for a soname prefix across the standard lib dirs.
+# Echoes the first match on success (used when ldconfig is genuinely absent).
+probe_lib_filesystem() {
+  local pat=$1 d hit
+  for d in "${LIB_DIRS[@]}"; do
+    [[ -d "${d}" ]] || continue
+    hit=$(ls -1 "${d}/${pat}"* 2>/dev/null | head -n1) || true
+    if [[ -n "${hit}" ]]; then
+      printf '%s\n' "${hit}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# probe a shared library via ldconfig (mirrors Makefile preflight). Echoes the
+# resolved path on success. If ldconfig cannot be located at all, return 2
+# (unknown) so the caller can fall back to a direct filesystem probe.
+probe_lib_ldconfig() {
+  local soname=$1 ldc line path
+  ldc=$(find_ldconfig) || return 2
+  line=$("${ldc}" -p 2>/dev/null | grep -F "${soname}" | head -n1) || true
+  [[ -n "${line}" ]] || return 1
+  path=$(printf '%s' "${line}" | awk '{print $NF}')
+  printf '%s\n' "${path}"
+  return 0
+}
+
+# version_lt A B -> success (0) if dotted version A is older than B, comparing
+# major then minor. Used to gate cargo against the lockfile-v4 floor (1.78).
+version_lt() {
+  local a=$1 b=$2 amaj amin bmaj bmin
+  amaj=${a%%.*}; amin=${a#*.}; amin=${amin%%.*}
+  bmaj=${b%%.*}; bmin=${b#*.}; bmin=${bmin%%.*}
+  [[ "${amaj}" =~ ^[0-9]+$ ]] || return 1
+  [[ "${amin}" =~ ^[0-9]+$ ]] || amin=0
+  (( amaj < bmaj )) && return 0
+  (( amaj > bmaj )) && return 1
+  (( amin < bmin )) && return 0
+  return 1
+}
+
+# Detect libclang for foundationdb-sys' bindgen step. clang-sys resolves
+# libclang from the clang install -- the clang binary, llvm-config, LIBCLANG_PATH,
+# or a *versioned* libclang-NN.so -- so a plain `grep libclang.so` false-negatives
+# a host that only carries e.g. libclang-18.so.18 (Ubuntu's libclang1-18), which
+# is exactly what builds the project. Probe broadly; echo a detail on success.
+detect_libclang() {
+  local ldc hit d
+  if [[ -n "${LIBCLANG_PATH:-}" && -e "${LIBCLANG_PATH}" ]]; then
+    printf 'LIBCLANG_PATH=%s\n' "${LIBCLANG_PATH}"
+    return 0
+  fi
+  if command -v clang >/dev/null 2>&1; then
+    local cver
+    cver=$(clang --version 2>/dev/null | sed -nE '1s/.*version ([0-9][0-9.]*).*/\1/p')
+    printf 'clang %s\n' "${cver:-present}"
+    return 0
+  fi
+  if command -v llvm-config >/dev/null 2>&1; then
+    printf 'llvm-config %s\n' "$(llvm-config --version 2>/dev/null)"
+    return 0
+  fi
+  if ldc=$(find_ldconfig); then
+    hit=$("${ldc}" -p 2>/dev/null | grep -iE 'libclang(-[0-9]+)?\.so' | head -n1) || true
+    if [[ -n "${hit}" ]]; then
+      printf '%s\n' "$(printf '%s' "${hit}" | awk '{print $NF}')"
+      return 0
+    fi
+  fi
+  for d in "${LIB_DIRS[@]}" /usr/lib/llvm*/lib /usr/lib64/llvm*/lib; do
+    hit=$(ls -1 "${d}"/libclang*.so* 2>/dev/null | head -n1) || true
+    if [[ -n "${hit}" ]]; then
+      printf '%s\n' "${hit}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Detect the libisal DEV artifact (not just the runtime SONAME). The build
+# needs the unversioned libisal.so symlink + pkg-config, so a host carrying
+# only libisal.so.2 must NOT report FOUND. Prefer pkg-config (isal/libisal),
+# else look for an unversioned libisal.so in the standard lib dirs. Echoes a
+# detail string on success.
+probe_libisal_dev() {
+  local ver d
+  if ver=$(probe_pkgconfig_module isal); then
+    printf '%s\n' "pkg-config isal ${ver}"
+    return 0
+  fi
+  if ver=$(probe_pkgconfig_module libisal); then
+    printf '%s\n' "pkg-config libisal ${ver}"
+    return 0
+  fi
+  # Unversioned libisal.so symlink == the dev artifact. libisal.so.2 alone
+  # (runtime only) is deliberately rejected.
+  for d in "${LIB_DIRS[@]}"; do
+    if [[ -e "${d}/libisal.so" ]]; then
+      printf '%s\n' "${d}/libisal.so"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# probe a module via pkg-config; echo its modversion.
+probe_pkgconfig_module() {
+  local mod=$1 ver pc
+  pc=""
+  if command -v pkg-config >/dev/null 2>&1; then
+    pc="pkg-config"
+  elif command -v pkgconf >/dev/null 2>&1; then
+    pc="pkgconf"
+  else
+    return 2
+  fi
+  ver=$("${pc}" --modversion "${mod}" 2>/dev/null | head -n1) || true
+  [[ -n "${ver}" ]] || return 1
+  printf '%s\n' "${ver}"
+  return 0
+}
+
+# Status accounting and the row buffer. Each row is "component|name|status|detail".
+FOUND_COUNT=0
+MISSING_REQUIRED_COUNT=0
+MISSING_OPTIONAL_COUNT=0
+OPTIONAL_SKIPPED_COUNT=0
+declare -a DEP_ROWS=()
+declare -a MISSING_REQUIRED_PKGS=()
+declare -a MISSING_OPTIONAL_PKGS=()
+NEED_FDB_NOTE=0
+
+# status tokens: FOUND | MISSING | OPT | OPT-MISSING
+record_row() {
+  DEP_ROWS+=("$1${FS}$2${FS}$3${FS}$4")
+  case "$3" in
+    FOUND)        FOUND_COUNT=$(( FOUND_COUNT + 1 )) ;;
+    MISSING)      MISSING_REQUIRED_COUNT=$(( MISSING_REQUIRED_COUNT + 1 )) ;;
+    OPT-MISSING)  MISSING_OPTIONAL_COUNT=$(( MISSING_OPTIONAL_COUNT + 1 )) ;;
+    OPT)          OPTIONAL_SKIPPED_COUNT=$(( OPTIONAL_SKIPPED_COUNT + 1 )) ;;
+  esac
+}
+
+# Register a per-family install package for a missing dep. kind = req | opt.
+register_pkg() {
+  local kind=$1 rhel_pkg=$2 deb_pkg=$3 pkg=''
+  case "${DISTRO_FAMILY}" in
+    rhel)   pkg="${rhel_pkg}" ;;
+    debian) pkg="${deb_pkg}" ;;
+    *)      pkg="" ;;
+  esac
+  [[ -n "${pkg}" ]] || return 0
+  if [[ "${kind}" == "req" ]]; then
+    MISSING_REQUIRED_PKGS+=("${pkg}")
+  else
+    MISSING_OPTIONAL_PKGS+=("${pkg}")
+  fi
+}
+
+# Collapse a space-separated package list into unique, order-preserving words.
+dedup_words() {
+  local seen=" " w out=''
+  for w in $1; do
+    case "${seen}" in
+      *" ${w} "*) ;;
+      *) out+="${w} "; seen+="${w} " ;;
+    esac
+  done
+  printf '%s' "${out% }"
+}
+
+run_dependency_checks() {
+  local detail rc
+
+  # --- Rust toolchain (required; the repo Cargo.lock is v4 -> needs cargo
+  # >= 1.78). Probe the binaries the BUILD will use: CARGO_BIN is already
+  # resolved to ~/.cargo/bin (rustup) when present, so we report the build's
+  # actual cargo, not a stale distro cargo earlier on PATH. ---
+  local rustc_bin cv
+  rustc_bin=$(resolve_tool rustc)
+  if detail=$("${rustc_bin}" --version 2>/dev/null | awk '{print $2}') && [[ -n "${detail}" ]]; then
+    record_row "toolchain" "rustc" "FOUND" "${detail}"
+  else
+    record_row "toolchain" "rustc" "MISSING" "required: install via rustup (>= 1.78)"
+  fi
+  if cv=$("${CARGO_BIN}" --version 2>/dev/null | awk '{print $2}') && [[ -n "${cv}" ]]; then
+    if version_lt "${cv}" "1.78"; then
+      record_row "toolchain" "cargo" "MISSING" \
+        "${cv} too old: Cargo.lock is v4, need >= 1.78 (install via rustup)"
+    else
+      record_row "toolchain" "cargo" "FOUND" "${cv}"
+    fi
+  else
+    record_row "toolchain" "cargo" "MISSING" "required: install via rustup (>= 1.78)"
+  fi
+
+  # --- Native C toolchain (required) ---
+  if detail=$(probe_cc); then
+    record_row "native" "cc (gcc/clang)" "FOUND" "${detail}"
+  else
+    record_row "native" "cc (gcc/clang)" "MISSING" "required: native crates link via cc/ld"
+    register_pkg req "gcc make" "build-essential"
+  fi
+
+  # --- pkg-config -- required ONLY when ENABLE_FUSE=1 (the fuser crate's
+  # build.rs needs it to locate libfuse3). keisal merely uses it as a fallback,
+  # so it is optional when fuse is off. ---
+  if command -v pkg-config >/dev/null 2>&1; then
+    detail=$(pkg-config --version 2>/dev/null | head -n1) || detail="present"
+    record_row "native" "pkg-config" "FOUND" "${detail}"
+  elif command -v pkgconf >/dev/null 2>&1; then
+    detail=$(pkgconf --version 2>/dev/null | head -n1) || detail="present"
+    record_row "native" "pkg-config" "FOUND" "${detail} (pkgconf)"
+  else
+    if (( ENABLE_FUSE )); then
+      record_row "native" "pkg-config" "MISSING" \
+        "required: fuser build.rs needs it (or ./configure --disable-fuse)"
+      register_pkg req "pkgconf-pkg-config" "pkg-config"
+    else
+      record_row "native" "pkg-config" "OPT-MISSING" \
+        "optional: keisal uses it as a fallback only"
+      register_pkg opt "pkgconf-pkg-config" "pkg-config"
+    fi
+  fi
+
+  # --- protoc (vendored: keinctl ships its own via protoc-bin-vendored) ---
+  if command -v protoc >/dev/null 2>&1; then
+    detail=$(protoc --version 2>/dev/null | awk '{print $2}') || detail="present"
+    record_row "keinctl" "protoc" "FOUND" "vendored (system ${detail})"
+  else
+    record_row "keinctl" "protoc" "FOUND" "vendored (protoc-bin-vendored)"
+  fi
+
+  # --- FoundationDB client (libfdb_c) -- required to link kms/kas on Linux ---
+  if detail=$(probe_lib_ldconfig "libfdb_c.so"); then
+    record_row "kms ${SEP} kas" "libfdb_c (FoundationDB)" "FOUND" "${detail}"
+  else
+    rc=$?
+    if (( rc == 2 )) && detail=$(probe_lib_filesystem "libfdb_c.so"); then
+      # ldconfig absent but the soname is on disk -- trust the filesystem.
+      record_row "kms ${SEP} kas" "libfdb_c (FoundationDB)" "FOUND" "${detail} (filesystem probe)"
+    else
+      # Genuinely missing (or ldconfig absent AND no on-disk soname). A required
+      # lib is NEVER downgraded to a soft optional pass: record MISSING and emit
+      # the FoundationDB install guidance regardless of which branch we took.
+      record_row "kms ${SEP} kas" "libfdb_c (FoundationDB)" "MISSING" \
+        "required to link kms/kas on Linux"
+      NEED_FDB_NOTE=1
+    fi
+  fi
+
+  # --- FoundationDB cluster file (runtime prerequisite) ---
+  if [[ -e "${FOUNDATIONDB_CLUSTER_FILE}" ]]; then
+    record_row "kms ${SEP} kas" "fdb.cluster" "FOUND" "${FOUNDATIONDB_CLUSTER_FILE}"
+  else
+    record_row "kms ${SEP} kas" "fdb.cluster" "OPT" \
+      "runtime: ${FOUNDATIONDB_CLUSTER_FILE} (reachable FDB cluster needed)"
+  fi
+
+  # --- libclang (required at build time: foundationdb-sys bindgen) ---
+  if detail=$(detect_libclang); then
+    record_row "kms ${SEP} kas" "libclang" "FOUND" "${detail}"
+  else
+    record_row "kms ${SEP} kas" "libclang" "MISSING" \
+      "required: foundationdb-sys bindgen needs libclang"
+    register_pkg req "clang-libs" "libclang-dev"
+  fi
+
+  # --- Intel ISA-L (libisal) -- required-if ENABLE_ISA_L=1 else optional ---
+  # Detection requires the DEV artifact (pkg-config isal/libisal or an
+  # unversioned libisal.so symlink), NOT just the runtime libisal.so.2 -- the
+  # build links against the dev artifact, so a runtime-only host must report
+  # MISSING. probe_libisal_dev does its own pkg-config + filesystem search and
+  # never depends on ldconfig, so there is no "unverifiable" branch here.
+  if detail=$(probe_libisal_dev); then
+    if (( ENABLE_ISA_L )); then
+      record_row "ksc ${SEP} krs" "libisal (ISA-L)" "FOUND" "${detail} (EC backend on)"
+    else
+      record_row "ksc ${SEP} krs" "libisal (ISA-L)" "FOUND" "${detail} (EC backend off)"
+    fi
+  else
+    if (( ENABLE_ISA_L )); then
+      record_row "ksc ${SEP} krs" "libisal (ISA-L)" "MISSING" \
+        "required: ISA-L backend is enabled (dev artifact; or ./configure --disable-isa-l)"
+      register_pkg req "isa-l isa-l-devel" "libisal2 libisal-dev"
+    else
+      record_row "ksc ${SEP} krs" "libisal (ISA-L)" "OPT" \
+        "not needed: --disable-isa-l selected software Reed-Solomon"
+    fi
+  fi
+
+  # --- libfuse3 -- required-if ENABLE_FUSE=1 (optional) ---
+  if detail=$(probe_pkgconfig_module "fuse3"); then
+    if (( ENABLE_FUSE )); then
+      record_row "kfc" "libfuse3" "FOUND" "${detail}"
+    else
+      record_row "kfc" "libfuse3" "FOUND" "${detail} (fuse feature off)"
+    fi
+  else
+    rc=$?
+    if (( ENABLE_FUSE )); then
+      record_row "kfc" "libfuse3" "OPT-MISSING" \
+        "optional: kfc fuse feature is on (or ./configure --disable-fuse)"
+      register_pkg opt "fuse3 fuse3-libs fuse3-devel" "fuse3 libfuse3-3 libfuse3-dev"
+    else
+      record_row "kfc" "libfuse3" "OPT" "not needed: --disable-fuse selected"
+    fi
+  fi
+
+  # --- fusermount3 (runtime FUSE mount helper, optional) ---
+  if (( ENABLE_FUSE )); then
+    if command -v fusermount3 >/dev/null 2>&1; then
+      record_row "kfc" "fusermount3" "FOUND" "$(command -v fusermount3)"
+    elif command -v fusermount >/dev/null 2>&1; then
+      record_row "kfc" "fusermount3" "FOUND" "$(command -v fusermount) (legacy fusermount)"
+    else
+      record_row "kfc" "fusermount3" "OPT-MISSING" "runtime: needed to mount kfc"
+      register_pkg opt "fuse3" "fuse3"
+    fi
+  fi
+
+  # --- /dev/fuse (runtime FUSE device, optional) ---
+  if (( ENABLE_FUSE )); then
+    if [[ -e /dev/fuse ]]; then
+      record_row "kfc" "/dev/fuse" "FOUND" "kernel FUSE device present"
+    else
+      record_row "kfc" "/dev/fuse" "OPT" "runtime: load the kernel FUSE module to mount"
+    fi
+  fi
+
+  # --- io_uring kernel support (runtime, required for kst data path) ---
+  if [[ -e /proc/sys/kernel/io_uring_disabled ]]; then
+    local iou
+    iou=$(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo "?")
+    if [[ "${iou}" == "0" ]]; then
+      record_row "kix ${SEP} kst" "io_uring" "FOUND" "kernel io_uring enabled"
+    else
+      record_row "kix ${SEP} kst" "io_uring" "OPT-MISSING" \
+        "runtime: io_uring_disabled=${iou} (kst data path needs it)"
+    fi
+  elif [[ -d /sys/kernel ]]; then
+    # No sysctl knob -> older kernel without the disable switch; io_uring is
+    # gated only by kernel config. Treat as present-ish but note it.
+    record_row "kix ${SEP} kst" "io_uring" "OPT" \
+      "runtime: no io_uring_disabled knob; relies on kernel config"
+  else
+    record_row "kix ${SEP} kst" "io_uring" "OPT" "runtime: verify kernel io_uring support"
+  fi
+
+  # --- NUMA sysfs topology (runtime, required for kst) ---
+  if [[ -e /sys/devices/system/node/online ]]; then
+    record_row "kix ${SEP} kst" "NUMA sysfs" "FOUND" "$(cat /sys/devices/system/node/online 2>/dev/null || echo present)"
+  else
+    record_row "kix ${SEP} kst" "NUMA sysfs" "OPT" "runtime: NUMA topology read from sysfs"
+  fi
+
+  # --- raw block device class (runtime, required for kst/kix) ---
+  if [[ -d /sys/class/block ]]; then
+    record_row "kix ${SEP} kst" "block devices" "FOUND" "/sys/class/block present"
+  else
+    record_row "kix ${SEP} kst" "block devices" "OPT" "runtime: needs a raw block device"
+  fi
+
+  # --- NATS server (runtime, optional to build) ---
+  if command -v nats-server >/dev/null 2>&1; then
+    record_row "runtime" "nats-server" "FOUND" "$(command -v nats-server)"
+  else
+    record_row "runtime" "nats-server" "OPT" "not needed to build (runtime only)"
+  fi
+
+  # --- systemd (runtime supervision, optional) ---
+  if command -v systemctl >/dev/null 2>&1; then
+    record_row "runtime" "systemctl" "FOUND" "$(command -v systemctl)"
+  else
+    record_row "runtime" "systemctl" "OPT" "runtime: units can be launched directly"
+  fi
+
+  # --- git (build identity, optional; degrades to "unknown") ---
+  if detail=$(probe_binary_version git); then
+    record_row "runtime" "git" "FOUND" "${detail}"
+  else
+    record_row "runtime" "git" "OPT" "optional: build identity falls back to \"unknown\""
+    register_pkg opt "git" "git"
+  fi
+
+  # --- ldconfig (build preflight + loader cache, optional) ---
+  # Resolve via find_ldconfig so a /sbin/ldconfig off the non-login PATH still
+  # reports FOUND.
+  local ldc_path
+  if ldc_path=$(find_ldconfig); then
+    record_row "runtime" "ldconfig" "FOUND" "${ldc_path}"
+  else
+    record_row "runtime" "ldconfig" "OPT" "optional: Makefile lib preflight degrades to a warning"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Rendering: banner, environment line, dependency table, missing-deps block,
+# summary box.
+# ---------------------------------------------------------------------------
+
+print_banner() {
+  if (( USE_UNICODE )); then
+    printf '\n'
+    printf '%b\n' "    ${C_CYAN}${C_BOLD}██╗  ██╗███████╗██╗███╗   ██╗███████╗███████╗${C_RESET}"
+    printf '%b\n' "    ${C_CYAN}${C_BOLD}██║ ██╔╝██╔════╝██║████╗  ██║██╔════╝██╔════╝${C_RESET}"
+    printf '%b\n' "    ${C_CYAN}${C_BOLD}█████╔╝ █████╗  ██║██╔██╗ ██║█████╗  ███████╗${C_RESET}"
+    printf '%b\n' "    ${C_CYAN}${C_BOLD}██╔═██╗ ██╔══╝  ██║██║╚██╗██║██╔══╝  ╚════██║${C_RESET}"
+    printf '%b\n' "    ${C_CYAN}${C_BOLD}██║  ██╗███████╗██║██║ ╚████║██║     ███████║${C_RESET}"
+    printf '%b\n' "    ${C_CYAN}${C_BOLD}╚═╝  ╚═╝╚══════╝╚═╝╚═╝  ╚═══╝╚═╝     ╚══════╝${C_RESET}"
+    printf '%b\n' "    ${C_DIM}direct-to-target object storage for AI/HPC   ${SEP}   configure v${CONFIGURE_VERSION}${C_RESET}"
+    printf '\n'
+  else
+    printf '\n'
+    printf '%b\n' "    KeInFS  ::  direct-to-target object storage for AI/HPC  ::  configure v${CONFIGURE_VERSION}"
+    printf '\n'
+  fi
+}
+
+print_env_line() {
+  printf '%b\n' "  ${C_DIM}host: ${HOST_OS} ${HOST_KERNEL} ${HOST_ARCH}  ${SEP}  distro: $(distro_label)  ${SEP}  profile: ${BUILD_PROFILE}${C_RESET}"
+  printf '\n'
+}
+
+# Column widths (visible). component | dependency | status | detail
+COL_COMP=14
+COL_DEP=24
+COL_STATUS=15
+
+status_cell() {
+  # $1 = status token. Emits "<color><glyph> WORD<reset>" and sets PLAIN_CELL.
+  local token=$1 glyph word color
+  case "${token}" in
+    FOUND)       glyph="${G_OK}";  word="FOUND";       color="${C_GREEN}" ;;
+    MISSING)     glyph="${G_NO}";  word="MISSING";     color="${C_RED}" ;;
+    OPT-MISSING) glyph="${G_OPT}"; word="OPT-MISSING"; color="${C_YELLOW}" ;;
+    OPT)         glyph="${G_OPT}"; word="OPT";         color="${C_YELLOW}" ;;
+    *)           glyph="${G_OPT}"; word="${token}";    color="${C_DIM}" ;;
+  esac
+  # PLAIN width is measured against a single-cell glyph placeholder plus the
+  # ASCII word ("X WORD"), never the multibyte glyph itself, so columns stay
+  # correct even under a non-UTF-8 LC_CTYPE where ${#glyph} could miscount.
+  STATUS_PLAIN="X ${word}"            # glyph counts as 1 visible cell
+  STATUS_COLORED="${color}${glyph} ${word}${C_RESET}"
+}
+
+print_dep_table() {
+  printf '%b\n' "  ${C_DIM}Probing build dependencies ...${C_RESET}"
+  printf '\n'
+
+  # Header row (bold), then a horizontal rule.
+  local hc hd hs
+  hc=$(pad "${C_BOLD}COMPONENT${C_RESET}" "COMPONENT" "${COL_COMP}")
+  hd=$(pad "${C_BOLD}DEPENDENCY${C_RESET}" "DEPENDENCY" "${COL_DEP}")
+  hs=$(pad "${C_BOLD}STATUS${C_RESET}" "STATUS" "${COL_STATUS}")
+  printf '  %s%s%s%b\n' "${hc}" "${hd}" "${hs}" "${C_BOLD}DETAIL${C_RESET}"
+  printf '  %b%s%b\n' "${C_DIM}" "$(rule 74)" "${C_RESET}"
+
+  local row comp name status detail
+  local cell_comp cell_dep
+  for row in "${DEP_ROWS[@]}"; do
+    IFS="${FS}" read -r comp name status detail <<<"${row}"
+    cell_comp=$(pad "${comp}" "${comp}" "${COL_COMP}")
+    cell_dep=$(pad "${name}" "${name}" "${COL_DEP}")
+    status_cell "${status}"
+    local cell_status
+    cell_status=$(pad "${STATUS_COLORED}" "${STATUS_PLAIN}" "${COL_STATUS}")
+    printf '  %s%s%s%b\n' "${cell_comp}" "${cell_dep}" "${cell_status}" "${C_DIM}${detail}${C_RESET}"
+  done
+  printf '\n'
+}
+
+print_missing_block() {
+  (( MISSING_REQUIRED_COUNT > 0 || MISSING_OPTIONAL_COUNT > 0 || NEED_FDB_NOTE )) || return 0
+
+  printf '  %b%s%b\n' "${C_DIM}" "$(rule 76)" "${C_RESET}"
+  printf '%b\n' "  ${C_RED}${G_NO} ${MISSING_REQUIRED_COUNT} required dependencies missing, ${MISSING_OPTIONAL_COUNT} optional missing.${C_RESET}"
+  printf '\n'
+
+  if [[ "${DISTRO_FAMILY}" == "unknown" || -z "${PKG_MGR}" ]]; then
+    printf '%b\n' "  ${C_YELLOW}Could not map an install command: unrecognized distro (${DISTRO_ID}).${C_RESET}"
+    printf '%b\n' "  ${C_DIM}Install the missing libraries/binaries shown above with your package manager.${C_RESET}"
+  else
+    printf '%b\n' "  ${C_CYAN}Detected distro family: ${DISTRO_FAMILY}  ${SEP}  installing the missing pieces:${C_RESET}"
+    printf '\n'
+
+    # Repo-enablement prerequisites for the rhel family (EPEL/CRB), shown when
+    # an EPEL-only dep (ISA-L) is among the missing required/optional packages.
+    local need_epel=0 p
+    for p in "${MISSING_REQUIRED_PKGS[@]:-}" "${MISSING_OPTIONAL_PKGS[@]:-}"; do
+      [[ -n "${p}" ]] || continue
+      case "${p}" in *isa-l*|*isal*) need_epel=1 ;; esac
+    done
+
+    if (( ${#MISSING_REQUIRED_PKGS[@]} > 0 )); then
+      printf '%b\n' "    ${C_DIM}# required - copy/paste:${C_RESET}"
+      if [[ "${DISTRO_FAMILY}" == "rhel" ]]; then
+        if (( need_epel )); then
+          printf '    %s\n' "sudo ${PKG_MGR} install -y epel-release"
+          # The CRB/PowerTools/CodeReady repo is enabled differently per distro:
+          # RHEL proper uses subscription-manager; the rebuilds use dnf
+          # config-manager. EL8 still names the repo "powertools".
+          case "${DISTRO_VERSION_ID%%.*}" in
+            8)
+              printf '    %s\n' "sudo ${PKG_MGR} config-manager --set-enabled powertools"
+              ;;
+            *)
+              if [[ "${DISTRO_ID}" == "rhel" ]]; then
+                printf '    %s\n' "sudo subscription-manager repos --enable codeready-builder-for-rhel-\$(rpm -E %rhel)-\$(arch)-rpms"
+              else
+                printf '    %s\n' "sudo ${PKG_MGR} config-manager --set-enabled crb"
+              fi
+              ;;
+          esac
+        fi
+        printf '    %s\n' "sudo ${PKG_MGR} install -y $(dedup_words "${MISSING_REQUIRED_PKGS[*]}")"
+      else
+        if (( need_epel )); then
+          # add-apt-repository universe is an Ubuntu construct; gate it on
+          # Ubuntu (by ID or ID_LIKE), not the whole debian family.
+          case " ${DISTRO_ID} ${DISTRO_ID_LIKE} " in
+            *" ubuntu "*)
+              printf '    %s\n' "sudo add-apt-repository -y universe   # Ubuntu only (enables libisal*)"
+              ;;
+          esac
+          printf '    %s\n' "sudo ${PKG_MGR} update"
+        fi
+        printf '    %s\n' "sudo ${PKG_MGR} install -y $(dedup_words "${MISSING_REQUIRED_PKGS[*]}")"
+      fi
+      printf '\n'
+    fi
+
+    if (( ${#MISSING_OPTIONAL_PKGS[@]} > 0 )); then
+      printf '%b\n' "    ${C_DIM}# optional - enables the kfc fuse client / build identity:${C_RESET}"
+      printf '    %s\n' "sudo ${PKG_MGR} install -y $(dedup_words "${MISSING_OPTIONAL_PKGS[*]}")"
+      printf '\n'
+    fi
+  fi
+
+  # Rust toolchain hint when cargo/rustc were missing.
+  local need_rust=0 row st nm
+  for row in "${DEP_ROWS[@]}"; do
+    IFS="${FS}" read -r _ nm st _ <<<"${row}"
+    if [[ "${st}" == "MISSING" && ( "${nm}" == "rustc" || "${nm}" == "cargo" ) ]]; then
+      need_rust=1
+    fi
+  done
+  if (( need_rust )); then
+    printf '%b\n' "    ${C_DIM}# Rust toolchain (distro packages are often < 1.78 - prefer rustup):${C_RESET}"
+    printf '    %s\n' "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable"
+    printf '    %s\n' ". \"\$HOME/.cargo/env\"   # configure resolves cargo from ~/.cargo/bin first"
+    printf '\n'
+  fi
+
+  # FoundationDB client: never in distro repos -- honest vendor note.
+  if (( NEED_FDB_NOTE )); then
+    printf '%b\n' "    ${C_DIM}# FoundationDB client is NOT in distro repos. Install the vendor package:${C_RESET}"
+    printf '    %s\n' "#   https://github.com/apple/foundationdb/releases  (foundationdb-clients)"
+    if [[ "${DISTRO_FAMILY}" == "rhel" ]]; then
+      printf '    %s\n' "#   FDB_VER=6.3.25; ARCH=${HOST_ARCH}"
+      printf '    %s\n' "#   curl -fsSLO https://github.com/apple/foundationdb/releases/download/\${FDB_VER}/foundationdb-clients-\${FDB_VER}-1.el7.\${ARCH}.rpm"
+      printf '    %s\n' "#   sudo ${PKG_MGR} install -y ./foundationdb-clients-\${FDB_VER}-1.el7.\${ARCH}.rpm && sudo ldconfig"
+    elif [[ "${DISTRO_FAMILY}" == "debian" ]]; then
+      printf '    %s\n' "#   FDB_VER=6.3.25; ARCH=amd64   # or arm64"
+      printf '    %s\n' "#   curl -fsSLO https://github.com/apple/foundationdb/releases/download/\${FDB_VER}/foundationdb-clients_\${FDB_VER}-1_\${ARCH}.deb"
+      printf '    %s\n' "#   sudo ${PKG_MGR} install -y ./foundationdb-clients_\${FDB_VER}-1_\${ARCH}.deb && sudo ldconfig"
+    fi
+    printf '    %s\n' "#   then re-run ./configure"
+    printf '\n'
+  fi
+
+  # Opt-out hints, always shown when something is missing.
+  printf '%b\n' "    ${C_DIM}# ...or build without the Linux deps you don't need:${C_RESET}"
+  printf '    %s\n' "#   ./configure --disable-isa-l    # slow software Reed-Solomon (not for prod)"
+  printf '    %s\n' "#   ./configure --disable-fuse     # skip the kfc fuse client"
+  printf '\n'
+}
+
+print_summary_box() {
+  # Inner content width (visible chars between the side borders, incl. the
+  # leading two spaces of padding inside the box).
+  local inner=72
+  local top bot
+  top="${BX_TL}$(rule "${inner}")${BX_TR}"
+  bot="${BX_BL}$(rule "${inner}")${BX_BR}"
+
+  # box line helper: render a left-justified visible string inside the box.
+  # Measure the PLAIN width with any multibyte status/arrow glyph replaced by a
+  # single ASCII placeholder cell (exactly as status_cell does), so the right
+  # border still aligns under a non-UTF-8 LC_CTYPE where ${#plain} would
+  # miscount the multibyte code points.
+  box_line() {
+    local plain=$1 colored=$2
+    local measure="${plain}"
+    measure="${measure//${G_OK}/X}"
+    measure="${measure//${G_NO}/X}"
+    measure="${measure//${G_OPT}/X}"
+    measure="${measure//${G_ARROW}/X}"
+    local fill=$(( inner - ${#measure} ))
+    (( fill < 0 )) && fill=0
+    printf '  %b%s%b%s%*s%b%s%b\n' \
+      "${C_CYAN}" "${BX_V}" "${C_RESET}" \
+      "${colored}" "${fill}" "" \
+      "${C_CYAN}" "${BX_V}" "${C_RESET}"
+  }
+
+  local fuse_s isa_s bench_s
+  fuse_s=$([[ "${ENABLE_FUSE}" == "1" ]] && echo on || echo off)
+  isa_s=$([[ "${ENABLE_ISA_L}" == "1" ]] && echo on || echo off)
+  bench_s=$([[ "${ENABLE_KIX_BENCH}" == "1" ]] && echo on || echo off)
+
+  printf '\n'
+  printf '  %b%s%b\n' "${C_CYAN}" "${top}" "${C_RESET}"
+
+  box_line "  KeInFS configure summary" \
+           "  ${C_BOLD}KeInFS configure summary${C_RESET}"
+  box_line "" ""
+
+  local deps_plain deps_colored
+  deps_plain="   deps:     ${FOUND_COUNT} found    ${MISSING_REQUIRED_COUNT} missing    $(( MISSING_OPTIONAL_COUNT + OPTIONAL_SKIPPED_COUNT )) optional"
+  deps_colored="   deps:     ${C_GREEN}${FOUND_COUNT} found${C_RESET}    ${C_RED}${MISSING_REQUIRED_COUNT} missing${C_RESET}    ${C_YELLOW}$(( MISSING_OPTIONAL_COUNT + OPTIONAL_SKIPPED_COUNT )) optional${C_RESET}"
+  box_line "${deps_plain}" "${deps_colored}"
+
+  box_line "   profile:  ${BUILD_PROFILE}          fuse: ${fuse_s}    isa-l: ${isa_s}    kix-bench: ${bench_s}" \
+           "   profile:  ${BUILD_PROFILE}          fuse: ${fuse_s}    isa-l: ${isa_s}    kix-bench: ${bench_s}"
+  box_line "   prefix:   ${PREFIX}       bindir: ${BINDIR}" \
+           "   prefix:   ${PREFIX}       bindir: ${BINDIR}"
+  box_line "   wrote:    build/config.mk  build/config.env  build/config.toml" \
+           "   wrote:    build/config.mk  build/config.env  build/config.toml"
+  box_line "" ""
+
+  if (( MISSING_REQUIRED_COUNT > 0 )); then
+    box_line "   ${G_NO} next:   resolve the dependencies above, then re-run ./configure" \
+             "   ${C_RED}${G_NO} next:   resolve the dependencies above, then re-run ./configure${C_RESET}"
+  else
+    box_line "   ${G_ARROW} next:   make build" \
+             "   ${C_GREEN}${G_ARROW} next:${C_RESET}   make build"
+  fi
+
+  printf '  %b%s%b\n' "${C_CYAN}" "${bot}" "${C_RESET}"
+  printf '\n'
+}
+
+# ---------------------------------------------------------------------------
+# Run the configuration: write the three config files (drop-in identical
+# format), then render the dependency report.
+# ---------------------------------------------------------------------------
+
+mkdir -p "${BUILD_DIR}"
+
+CONFIG_MK="${BUILD_DIR}/config.mk"
+CONFIG_ENV="${BUILD_DIR}/config.env"
+CONFIG_TOML="${BUILD_DIR}/config.toml"
+
+cat >"${CONFIG_MK}.tmp" <<EOF
+# Generated by ./configure. Edit by re-running configure, not by hand.
+ROOT_DIR := ${ROOT_DIR}
+BUILD_DIR := ${BUILD_DIR}
+PREFIX := ${PREFIX}
+BINDIR := ${BINDIR}
+LIBEXECDIR := ${LIBEXECDIR}
+DATADIR := ${DATADIR}
+SYSCONFDIR := ${SYSCONFDIR}
+LOCALSTATEDIR := ${LOCALSTATEDIR}
+RUNSTATEDIR := ${RUNSTATEDIR}
+SYSTEMD_UNIT_DIR := ${SYSTEMD_UNIT_DIR}
+CARGO := ${CARGO_BIN}
+CARGO_TARGET_DIR := ${CARGO_TARGET_DIR}
+BUILD_PROFILE := ${BUILD_PROFILE}
+ENABLE_FUSE := ${ENABLE_FUSE}
+ENABLE_ISA_L := ${ENABLE_ISA_L}
+ENABLE_KIX_BENCH := ${ENABLE_KIX_BENCH}
+SERVICE_USER := ${SERVICE_USER}
+SERVICE_GROUP := ${SERVICE_GROUP}
+FOUNDATIONDB_CLUSTER_FILE := ${FOUNDATIONDB_CLUSTER_FILE}
+NOTIFICATION_NATS_URL := ${NOTIFICATION_NATS_URL}
+NOTIFICATION_SUBJECT := ${NOTIFICATION_SUBJECT}
+EOF
+mv -f "${CONFIG_MK}.tmp" "${CONFIG_MK}"
+
+cat >"${CONFIG_ENV}.tmp" <<EOF
+# Generated by ./configure. Source from Bash tooling, do not edit by hand.
+ROOT_DIR=$(printf '%q' "${ROOT_DIR}")
+BUILD_DIR=$(printf '%q' "${BUILD_DIR}")
+PREFIX=$(printf '%q' "${PREFIX}")
+BINDIR=$(printf '%q' "${BINDIR}")
+LIBEXECDIR=$(printf '%q' "${LIBEXECDIR}")
+DATADIR=$(printf '%q' "${DATADIR}")
+SYSCONFDIR=$(printf '%q' "${SYSCONFDIR}")
+LOCALSTATEDIR=$(printf '%q' "${LOCALSTATEDIR}")
+RUNSTATEDIR=$(printf '%q' "${RUNSTATEDIR}")
+SYSTEMD_UNIT_DIR=$(printf '%q' "${SYSTEMD_UNIT_DIR}")
+CARGO=$(printf '%q' "${CARGO_BIN}")
+CARGO_TARGET_DIR=$(printf '%q' "${CARGO_TARGET_DIR}")
+BUILD_PROFILE=$(printf '%q' "${BUILD_PROFILE}")
+ENABLE_FUSE=${ENABLE_FUSE}
+ENABLE_ISA_L=${ENABLE_ISA_L}
+ENABLE_KIX_BENCH=${ENABLE_KIX_BENCH}
+SERVICE_USER=$(printf '%q' "${SERVICE_USER}")
+SERVICE_GROUP=$(printf '%q' "${SERVICE_GROUP}")
+FOUNDATIONDB_CLUSTER_FILE=$(printf '%q' "${FOUNDATIONDB_CLUSTER_FILE}")
+NOTIFICATION_NATS_URL=$(printf '%q' "${NOTIFICATION_NATS_URL}")
+NOTIFICATION_SUBJECT=$(printf '%q' "${NOTIFICATION_SUBJECT}")
+EOF
+mv -f "${CONFIG_ENV}.tmp" "${CONFIG_ENV}"
+
+cat >"${CONFIG_TOML}.tmp" <<EOF
+# Generated by ./configure. Edit by re-running configure, not by hand.
+[paths]
+root_dir = "${ROOT_DIR}"
+build_dir = "${BUILD_DIR}"
+prefix = "${PREFIX}"
+bindir = "${BINDIR}"
+libexecdir = "${LIBEXECDIR}"
+datadir = "${DATADIR}"
+sysconfdir = "${SYSCONFDIR}"
+localstatedir = "${LOCALSTATEDIR}"
+runstatedir = "${RUNSTATEDIR}"
+systemd_unit_dir = "${SYSTEMD_UNIT_DIR}"
+
+[build]
+cargo = "${CARGO_BIN}"
+cargo_target_dir = "${CARGO_TARGET_DIR}"
+profile = "${BUILD_PROFILE}"
+enable_fuse = ${ENABLE_FUSE}
+enable_isa_l = ${ENABLE_ISA_L}
+enable_kix_bench = ${ENABLE_KIX_BENCH}
+
+[runtime]
+service_user = "${SERVICE_USER}"
+service_group = "${SERVICE_GROUP}"
+foundationdb_cluster_file = "${FOUNDATIONDB_CLUSTER_FILE}"
+notification_nats_url = "${NOTIFICATION_NATS_URL}"
+notification_subject = "${NOTIFICATION_SUBJECT}"
+EOF
+mv -f "${CONFIG_TOML}.tmp" "${CONFIG_TOML}"
+
+# ---------------------------------------------------------------------------
+# Human-facing report
+# ---------------------------------------------------------------------------
+print_banner
+print_env_line
+
+if (( SKIP_DEPS )); then
+  printf '%b\n' "  ${C_YELLOW}${G_OPT} dependency preflight skipped (--skip-deps).${C_RESET}"
+  printf '%b\n' "  ${C_DIM}make build will still run its own libfdb_c / libisal preflight on Linux.${C_RESET}"
+  printf '\n'
+  print_summary_box
+  printf '%b\n' "  ${C_DIM}Config written. Dependency check skipped at your request.${C_RESET}"
+  printf '\n'
+  exit 0
+fi
+
+run_dependency_checks
+print_dep_table
+print_missing_block
+print_summary_box
+
+if (( MISSING_REQUIRED_COUNT > 0 )); then
+  printf '%b\n' "  ${C_RED}configure failed: unmet required dependencies (exit 1)${C_RESET}"
+  printf '\n'
+  exit 1
+fi
+
+if (( MISSING_OPTIONAL_COUNT > 0 )); then
+  printf '%b\n' "  ${C_YELLOW}All required dependencies satisfied; ${MISSING_OPTIONAL_COUNT} optional missing (warnings only).${C_RESET}"
+else
+  printf '%b\n' "  ${C_GREEN}All required dependencies satisfied. You're clear to build.${C_RESET}"
+fi
+printf '\n'
+exit 0

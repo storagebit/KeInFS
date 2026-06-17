@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/kix",
+    "crates/kix-bench",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "GPL-2.0-or-later"
+version = "0.1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

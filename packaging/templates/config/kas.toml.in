@@ -1,0 +1,21 @@
+# Baseline KAS config rendered by the root toolchain.
+# The allocation shard id is not decoration. It is the boundary that keeps
+# multiple allocators from freelancing on the same target set.
+
+listen_addr = {{KAS_LISTEN_ADDR}}
+public_endpoint = {{KAS_PUBLIC_ENDPOINT}}
+allocation_shard_id = {{KAS_ALLOCATION_SHARD_ID}}
+foundationdb_cluster_file = {{FOUNDATIONDB_CLUSTER_FILE}}
+service_heartbeat_ms = 30000
+stats_root = {{KAS_STATS_ROOT}}
+stats_publish_ms = 250
+reservation_ttl_ms = 120000
+reservation_reap_ms = 1000
+reservation_reap_limit = 4096
+reserve_batch_size = 65536
+reservation_bin_refill_ms = 100
+reservation_bin_low_watermark = 131072
+reservation_bin_high_watermark = 524288
+reservation_bin_top_up_chunk = 65536
+reservation_bin_bypass_batch_size = 2048
+reset_allocator_state_and_exit = false

@@ -1,0 +1,41 @@
+# Baseline KMS config rendered by the root toolchain.
+# Copy this into an active KMS config dir and then adjust endpoints to fit the
+# real topology instead of expecting loopback to become a cluster by force.
+
+listen_addr = {{KMS_LISTEN_ADDR}}
+kas_endpoints = {{KMS_KAS_ENDPOINTS}}
+foundationdb_cluster_file = {{FOUNDATIONDB_CLUSTER_FILE}}
+service_heartbeat_ms = 30000
+shard_id = {{KMS_SHARD_ID}}
+public_endpoint = {{KMS_PUBLIC_ENDPOINT}}
+replica_endpoints = {{KMS_REPLICA_ENDPOINTS}}
+notification_subject = {{NOTIFICATION_SUBJECT}}
+notification_mode = "nats"
+notification_nats_url = {{NOTIFICATION_NATS_URL}}
+notification_poll_ms = 500
+stats_root = {{KMS_STATS_ROOT}}
+stats_publish_ms = 250
+write_intent_ttl_ms = 900000
+expiry_reap_ms = 1000
+reservation_cache_high_watermark = 524288
+reservation_cache_low_watermark = 131072
+reservation_cache_refill_batch = 131072
+reservation_cache_ttl_ms = 120000
+reservation_cache_min_usable_ttl_ms = 30000
+reservation_cache_refill_concurrency = 32
+reservation_cache_wait_timeout_ms = 30000
+reservation_cache_stale_refill_ms = 180000
+reservation_cache_small_object_max_stripes = 64
+reservation_cache_single_window_seed_batch = 4096
+initiate_write_window_max_stripes = 4
+large_write_initiate_max_concurrency = 1
+write_profile_max_stripes = 8
+write_profile_min_fragment_bytes = 131072
+reservation_mutation_batch_size = 1024
+reservation_mutation_dispatch_batch_size = 512
+reservation_mutation_dispatch_flush_ms = 2
+kas_rpc_timeout_ms = 20000
+kas_reserve_attempt_timeout_ms = 10000
+read_cache_max_entries = 65536
+read_cache_ttl_ms = 30000
+target_current_fragment_backfill_on_startup = true
