@@ -29,6 +29,7 @@ mod core;
 mod error;
 mod metadata;
 mod object;
+mod persistent_stripe_store;
 mod state;
 mod stripe_cache;
 mod types;
@@ -36,6 +37,8 @@ mod types;
 pub use crate::coherence::{CoherenceSink, NoopSink};
 pub use crate::core::{FsConfig, FsCore};
 pub use crate::error::FsErrno;
+pub use crate::persistent_stripe_store::DEFAULT_TIER_C_BUDGET_BYTES;
+pub use crate::stripe_cache::DEFAULT_STRIPE_CACHE_BUDGET_BYTES;
 pub use crate::metadata::{boxed_error, DynError};
 pub use crate::types::{
     Attr, Capabilities, DesiredKernelConfig, DirEntry, FileKind, OpenedFile, ROOT_INO,

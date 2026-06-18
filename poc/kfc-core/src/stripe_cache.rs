@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 /// Default RAM budget for cached stripes. Holds a healthy working set of 8 MiB
 /// stripes (~32 of them) without unbounded growth; eviction is approximate-LRU.
-pub(crate) const DEFAULT_STRIPE_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+pub const DEFAULT_STRIPE_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Unit separator — cannot appear in an object key path component, so it makes a
 /// safe, prefix-scannable composite key (`<key>\u{1f}<stripe_index>`).
@@ -133,9 +133,21 @@ impl StripeCache {
     /// the field comment). Empty payloads are not cached — a 0-byte stripe (a
     /// read at/past EOF) only churns ticks and eviction without ever serving
     /// useful bytes.
-    pub(crate) fn put(&self, key: &str, stripe_index: u64, bytes: Arc<Vec<u8>>) {
+    ///
+    /// Returns the stripes that eviction dropped to stay within budget, as
+    /// `(object key, stripe_index, bytes)`, so the caller can WRITE THEM BACK to
+    /// the Tier-C disk victim cache **outside** `size_lock` (the eviction itself
+    /// runs under the lock; the slow disk write must not). Tier-B alone ignores
+    /// the return value. The victim's `Arc<Vec<u8>>` is preserved (not dropped)
+    /// across the eviction precisely so it can be handed to Tier-C.
+    pub(crate) fn put(
+        &self,
+        key: &str,
+        stripe_index: u64,
+        bytes: Arc<Vec<u8>>,
+    ) -> Vec<(String, u64, Arc<Vec<u8>>)> {
         if bytes.is_empty() {
-            return;
+            return Vec::new();
         }
         let composed = Self::compose_key(key, stripe_index);
         let len = bytes.len();
@@ -152,7 +164,7 @@ impl StripeCache {
                 .fetch_sub(prev.bytes.len(), Ordering::Relaxed);
         }
         self.total_bytes.fetch_add(len, Ordering::Relaxed);
-        self.evict_to_budget_locked();
+        self.evict_to_budget_locked()
     }
 
     /// Drop every cached stripe for `key` — a new object version invalidates them
@@ -199,7 +211,14 @@ impl StripeCache {
     /// (centuries away at any realistic access rate); after a wrap the
     /// approximate-LRU ordering would no longer track true age, but correctness
     /// (never over budget) is unaffected.
-    fn evict_to_budget_locked(&self) {
+    ///
+    /// Returns each evicted stripe as `(object key, stripe_index, bytes)` so the
+    /// caller can write it back to Tier-C. The composite map key is split on the
+    /// trailing `KEY_SEP<index>` to recover the object key + stripe index; if a
+    /// key somehow fails to parse it is simply not forwarded (Tier-C is
+    /// best-effort), never panicked on.
+    fn evict_to_budget_locked(&self) -> Vec<(String, u64, Arc<Vec<u8>>)> {
+        let mut evicted = Vec::new();
         while self.total_bytes.load(Ordering::Relaxed) > self.budget_bytes {
             let mut victim: Option<(String, u64)> = None;
             for entry in self.map.iter() {
@@ -210,13 +229,26 @@ impl StripeCache {
                 }
             }
             let Some((victim_key, _)) = victim else { break };
-            if let Some((_, removed)) = self.map.remove(&victim_key) {
+            if let Some((composed, removed)) = self.map.remove(&victim_key) {
                 self.total_bytes
                     .fetch_sub(removed.bytes.len(), Ordering::Relaxed);
+                if let Some((key, idx)) = Self::split_key(&composed) {
+                    evicted.push((key, idx, removed.bytes));
+                }
             } else {
                 break;
             }
         }
+        evicted
+    }
+
+    /// Split a composite `"<key>\u{1f}<stripe_index>"` back into its parts. The
+    /// separator cannot appear in an object key, so the LAST one delimits the
+    /// numeric stripe index unambiguously.
+    fn split_key(composed: &str) -> Option<(String, u64)> {
+        let (key, idx) = composed.rsplit_once(KEY_SEP)?;
+        let idx: u64 = idx.parse().ok()?;
+        Some((key.to_string(), idx))
     }
 
     #[cfg(test)]
@@ -300,6 +332,34 @@ mod tests {
         assert!(cache.get("k", 2).is_some(), "newest kept");
         assert!(cache.get("k", 1).is_none(), "coldest evicted");
         assert!(cache.total_bytes() <= 2000);
+    }
+
+    #[test]
+    fn put_returns_evicted_victims_for_tier_c_writeback() {
+        // The victim cache wiring depends on put() handing the evicted stripes
+        // back (key, stripe_index, bytes) so core.rs can write them to Tier-C.
+        let cache = StripeCache::new(2000); // 2 x 1000-byte stripes
+        assert!(cache.put("obj/a", 0, stripe(0, 1000)).is_empty(), "no evict");
+        assert!(cache.put("obj/a", 1, stripe(1, 1000)).is_empty(), "no evict");
+        let _ = cache.get("obj/a", 1); // make stripe 0 the coldest
+        let evicted = cache.put("obj/a", 2, stripe(2, 1000)); // evicts stripe 0
+        assert_eq!(evicted.len(), 1, "exactly one victim");
+        let (vkey, vidx, vbytes) = &evicted[0];
+        assert_eq!(vkey, "obj/a", "object key recovered from composite key");
+        assert_eq!(*vidx, 0, "stripe index recovered (the coldest)");
+        assert_eq!(vbytes.len(), 1000);
+        assert_eq!(vbytes[0], 0, "victim bytes preserved, not dropped");
+    }
+
+    #[test]
+    fn split_key_roundtrips_and_rejects_garbage() {
+        let composed = StripeCache::compose_key("a/b/c", 42);
+        assert_eq!(
+            StripeCache::split_key(&composed),
+            Some(("a/b/c".to_string(), 42))
+        );
+        // No separator at all -> None (not forwarded to Tier-C).
+        assert_eq!(StripeCache::split_key("no-sep"), None);
     }
 
     #[test]

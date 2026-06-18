@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andreas Krause / storagebit
 
+use kfc_core::{DEFAULT_STRIPE_CACHE_BUDGET_BYTES, DEFAULT_TIER_C_BUDGET_BYTES};
 use ksc::client::CompletionMode;
 use ksc::object::DEFAULT_METADATA_NOTIFICATION_SUBJECT;
 use std::error::Error;
@@ -36,6 +37,9 @@ pub(crate) struct MountConfig {
     pub(crate) write_completion_mode: CompletionMode,
     pub(crate) metadata_notification_nats_url: Option<String>,
     pub(crate) metadata_notification_subject: String,
+    pub(crate) tier_c_cache_dir: Option<PathBuf>,
+    pub(crate) tier_c_budget_bytes: u64,
+    pub(crate) stripe_cache_budget_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +84,9 @@ fn parse_mount_args(args: &[String]) -> Result<MountConfig, Box<dyn Error>> {
     let mut write_completion_mode = DEFAULT_MOUNT_WRITE_COMPLETION_MODE;
     let mut metadata_notification_nats_url = None;
     let mut metadata_notification_subject = DEFAULT_METADATA_NOTIFICATION_SUBJECT.to_string();
+    let mut tier_c_cache_dir = None;
+    let mut tier_c_budget_bytes = DEFAULT_TIER_C_BUDGET_BYTES;
+    let mut stripe_cache_budget_bytes = DEFAULT_STRIPE_CACHE_BUDGET_BYTES as u64;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -139,6 +146,29 @@ fn parse_mount_args(args: &[String]) -> Result<MountConfig, Box<dyn Error>> {
                     .ok_or_else(|| missing_value("--metadata-notification-subject"))?
                     .clone();
             }
+            "--tier-c-cache-dir" => {
+                i += 1;
+                tier_c_cache_dir = Some(PathBuf::from(
+                    args.get(i)
+                        .ok_or_else(|| missing_value("--tier-c-cache-dir"))?,
+                ));
+            }
+            "--tier-c-budget-mib" => {
+                i += 1;
+                let mib: u64 = args
+                    .get(i)
+                    .ok_or_else(|| missing_value("--tier-c-budget-mib"))?
+                    .parse()?;
+                tier_c_budget_bytes = mib * 1024 * 1024;
+            }
+            "--stripe-cache-budget-mib" => {
+                i += 1;
+                let mib: u64 = args
+                    .get(i)
+                    .ok_or_else(|| missing_value("--stripe-cache-budget-mib"))?
+                    .parse()?;
+                stripe_cache_budget_bytes = mib * 1024 * 1024;
+            }
             "--help" | "-h" => return Err(arg_error(mount_usage())),
             other => return Err(arg_error(format!("unknown KFC mount argument `{other}`"))),
         }
@@ -159,6 +189,9 @@ fn parse_mount_args(args: &[String]) -> Result<MountConfig, Box<dyn Error>> {
         write_completion_mode,
         metadata_notification_nats_url,
         metadata_notification_subject,
+        tier_c_cache_dir,
+        tier_c_budget_bytes,
+        stripe_cache_budget_bytes,
     })
 }
 
@@ -352,10 +385,12 @@ fn arg_error(message: impl Into<String>) -> Box<dyn Error> {
 
 fn mount_usage() -> String {
     format!(
-        "kfc mount [options]\n  --kms-endpoint <uri[,uri...]>  KMS gRPC endpoint(s), default {DEFAULT_KMS_ENDPOINT}\n  --namespace-id <id>            namespace id that owns the bucket\n  --bucket <id>                  bucket id to mount as the filesystem root\n  --bucket-id <id>               alias for --bucket, matches the rest of the CLI surface\n  --mountpoint <path>            mountpoint path\n  --read-completion-mode <mode>  interrupt|hot-poll, default {}\n  --write-completion-mode <mode> interrupt|hot-poll, default {}\n  --metadata-notification-nats-url <uri> subscribe to KMS invalidation events via NATS\n  --metadata-notification-subject <name> invalidation subject, default {}\n",
+        "kfc mount [options]\n  --kms-endpoint <uri[,uri...]>  KMS gRPC endpoint(s), default {DEFAULT_KMS_ENDPOINT}\n  --namespace-id <id>            namespace id that owns the bucket\n  --bucket <id>                  bucket id to mount as the filesystem root\n  --bucket-id <id>               alias for --bucket, matches the rest of the CLI surface\n  --mountpoint <path>            mountpoint path\n  --read-completion-mode <mode>  interrupt|hot-poll, default {}\n  --write-completion-mode <mode> interrupt|hot-poll, default {}\n  --metadata-notification-nats-url <uri> subscribe to KMS invalidation events via NATS\n  --metadata-notification-subject <name> invalidation subject, default {}\n  --tier-c-cache-dir <path>      enable the Tier-C disk stripe cache in this dir (default off)\n  --tier-c-budget-mib <n>        Tier-C disk cache budget in MiB, default {}\n  --stripe-cache-budget-mib <n>  Tier-B RAM stripe-cache budget in MiB, default {}\n",
         DEFAULT_MOUNT_READ_COMPLETION_MODE.as_str(),
         DEFAULT_MOUNT_WRITE_COMPLETION_MODE.as_str(),
         DEFAULT_METADATA_NOTIFICATION_SUBJECT,
+        DEFAULT_TIER_C_BUDGET_BYTES / (1024 * 1024),
+        DEFAULT_STRIPE_CACHE_BUDGET_BYTES / (1024 * 1024),
     )
 }
 

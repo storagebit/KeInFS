@@ -14,13 +14,17 @@ use crate::coherence::{decode_event, CoherenceSink, NoopSink};
 use crate::error::FsErrno;
 use crate::metadata::{DynError, MetadataClient};
 use crate::object::ObjectEngine;
+use crate::persistent_stripe_store::PersistentStripeStore;
 use crate::state::{FileHandle, FsTables, Inode, InodeState};
+use crate::persistent_stripe_store::DEFAULT_TIER_C_BUDGET_BYTES;
 use crate::stripe_cache::{StripeCache, DEFAULT_STRIPE_CACHE_BUDGET_BYTES};
 use crate::types::{Attr, Capabilities, DesiredKernelConfig, DirEntry, FileKind, OpenedFile, ROOT_INO};
 use keinctl::proto::{MetadataInvalidationEvent, NamespaceDomainEntry, NamespaceEntryKind};
 use ksc::client::CompletionMode;
 use ksc::object::ObjectClientOptions;
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -47,6 +51,34 @@ pub struct FsConfig {
     pub write_completion_mode: CompletionMode,
     pub metadata_notification_nats_url: Option<String>,
     pub metadata_notification_subject: String,
+    /// Tier-C disk stripe-cache directory. `None` (the default) DISABLES Tier-C
+    /// entirely: the RAM Tier-B behaves exactly as before and no disk cache is
+    /// created. When set, a cleared-on-mount disk victim cache is created below
+    /// Tier-B in this directory (wiped fresh on every `connect()`).
+    pub tier_c_cache_dir: Option<PathBuf>,
+    /// Byte budget for the Tier-C disk cache when `tier_c_cache_dir` is set.
+    pub tier_c_budget_bytes: u64,
+    /// RAM byte budget for the Tier-B stripe cache (see [`StripeCache`]).
+    /// Defaults to [`DEFAULT_STRIPE_CACHE_BUDGET_BYTES`].
+    pub stripe_cache_budget_bytes: u64,
+}
+
+impl Default for FsConfig {
+    fn default() -> Self {
+        Self {
+            kms_endpoints: Vec::new(),
+            namespace_id: String::new(),
+            bucket_id: String::new(),
+            read_completion_mode: CompletionMode::Interrupt,
+            write_completion_mode: CompletionMode::Interrupt,
+            metadata_notification_nats_url: None,
+            metadata_notification_subject: String::new(),
+            // Tier-C OFF by default — opt-in only.
+            tier_c_cache_dir: None,
+            tier_c_budget_bytes: DEFAULT_TIER_C_BUDGET_BYTES,
+            stripe_cache_budget_bytes: DEFAULT_STRIPE_CACHE_BUDGET_BYTES as u64,
+        }
+    }
 }
 
 /// The portable filesystem core.
@@ -67,7 +99,46 @@ pub struct FsCore {
     /// Tier-B RAM stripe cache for the ranged read path (kills sequential-read
     /// re-fetch amplification; see [`StripeCache`]).
     stripe_cache: StripeCache,
+    /// Tier-C disk victim cache below Tier-B. `None` when disabled (the default):
+    /// every Tier-C call site short-circuits and behavior is exactly as before.
+    /// When present it is a cleared-on-mount disk extension of Tier-B — Tier-B
+    /// eviction writes back here, and a Tier-B miss checks here before the
+    /// network (a hit promotes the stripe back into Tier-B). See
+    /// [`PersistentStripeStore`].
+    tier_c: Option<Arc<PersistentStripeStore>>,
+    /// Monotonic cache-invalidation generation, bumped by EVERY invalidation
+    /// (`invalidate_key` on commit/unlink/NATS and the namespace-wide `clear`).
+    ///
+    /// This is the ordering primitive that closes the lost-invalidation races
+    /// between a slow stripe fetch/promote and a concurrent overwrite: a fetch
+    /// snapshots this counter BEFORE it reads (from Tier-C or the network), and
+    /// the subsequent `put_tier_b` only inserts into either tier if the counter
+    /// is UNCHANGED. If any invalidation landed during the fetch window the
+    /// stripe is potentially stale, so it is dropped rather than (re)inserted —
+    /// a fetch that began before an invalidation can never complete after it.
+    /// Conservative (an unrelated key's invalidation also skips the insert), but
+    /// both tiers are best-effort, so a skipped insert only costs a future
+    /// re-fetch, never correctness. Bumped under the same logical step that drops
+    /// the entries, so an invalidation is never observed before its effect.
+    ///
+    /// `Arc` so the (bounded) detached Tier-C write-back task can hold a clone
+    /// and re-check the generation immediately before it writes to disk.
+    cache_invalidation_gen: Arc<AtomicU64>,
+    /// Caps the number of concurrently in-flight Tier-C write-back tasks (and
+    /// thus the evicted-stripe `Arc<Vec<u8>>`s they retain). Without a bound,
+    /// sustained cold reads that outrun disk throughput would accumulate
+    /// detached write-back tasks unboundedly, each holding ~`W` bytes — inflating
+    /// memory past the very RAM budget Tier-B exists to enforce. `None` when
+    /// Tier-C is disabled. Write-back is best-effort, so when no permit is
+    /// available the victim is simply dropped (a future read re-fetches it).
+    tier_c_writeback_permits: Option<Arc<tokio::sync::Semaphore>>,
 }
+
+/// Upper bound on concurrent Tier-C write-back tasks. Small: write-back is a
+/// best-effort disk extension, not a correctness path, so a handful of permits
+/// is enough to keep the disk busy without letting evicted stripes pile up in
+/// RAM.
+const TIER_C_WRITEBACK_CONCURRENCY: usize = 8;
 
 impl FsCore {
     /// Connect to KMS + the KSC object engine, seed the root inode, and return a
@@ -104,6 +175,26 @@ impl FsCore {
         // SAFETY: getuid/getgid are always-succeed syscalls with no preconditions.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
 
+        // Tier-C disk victim cache: only built when a directory was configured.
+        // `new()` WIPES the directory (cleared-on-mount). A failure to prepare
+        // the dir is non-fatal — Tier-C is best-effort, so we log and run with
+        // Tier-B only rather than failing the whole mount.
+        let tier_c = match config.tier_c_cache_dir {
+            Some(dir) => {
+                match PersistentStripeStore::new(dir.clone(), config.tier_c_budget_bytes).await {
+                    Ok(store) => Some(store),
+                    Err(err) => {
+                        eprintln!(
+                            "KFC Tier-C: disabling disk stripe cache at {}: {err}",
+                            dir.display()
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         Ok(Arc::new(Self {
             coherent_data_cache: config.metadata_notification_nats_url.is_some(),
             namespace_id: config.namespace_id,
@@ -118,7 +209,15 @@ impl FsCore {
             sink: RwLock::new(Arc::new(NoopSink)),
             nats_url: config.metadata_notification_nats_url,
             nats_subject: config.metadata_notification_subject,
-            stripe_cache: StripeCache::new(DEFAULT_STRIPE_CACHE_BUDGET_BYTES),
+            stripe_cache: StripeCache::new(
+                usize::try_from(config.stripe_cache_budget_bytes)
+                    .unwrap_or(DEFAULT_STRIPE_CACHE_BUDGET_BYTES),
+            ),
+            tier_c_writeback_permits: tier_c
+                .is_some()
+                .then(|| Arc::new(tokio::sync::Semaphore::new(TIER_C_WRITEBACK_CONCURRENCY))),
+            tier_c,
+            cache_invalidation_gen: Arc::new(AtomicU64::new(0)),
         }))
     }
 
@@ -753,22 +852,181 @@ impl FsCore {
         width: u64,
     ) -> Result<Arc<Vec<u8>>, FsErrno> {
         let gate = self.stripe_cache.in_flight_gate(key, stripe_index);
+        // The single-flight gate covers the WHOLE Tier-C-then-network miss path,
+        // not just the network fetch: a leader holds it across the Tier-C lookup,
+        // promote-into-Tier-B, AND (on a Tier-C miss) the network fetch, so the
+        // de-dup of `N` concurrent missers of the same stripe still issues at most
+        // one network fetch + EC decode. Followers wake, re-check Tier-B, and
+        // share the leader's `Arc<Vec<u8>>`.
         let _permit = gate.lock().await;
-        // A leader may have populated the cache while we waited for the gate.
+        // A leader may have populated Tier-B while we waited for the gate.
         if let Some(bytes) = self.stripe_cache.get(key, stripe_index) {
+            self.stripe_cache.clear_in_flight(key, stripe_index);
             return Ok(bytes);
         }
-        let (payload, learned) = self
+        // Snapshot the invalidation generation BEFORE any read. If an overwrite
+        // invalidates this stripe while we are reading the OLD version (from
+        // Tier-C or the network), the generation changes and `put_tier_b` below
+        // refuses to (re)insert the now-stale bytes into either tier — closing
+        // the lost-invalidation race the single-flight gate alone cannot
+        // (invalidation does not take the gate). The fetched bytes are still
+        // returned to THIS caller (it asked before the overwrite; serving the
+        // version it was reading is fine), they just are not cached.
+        let gen_at_fetch = self.cache_invalidation_gen.load(Ordering::Acquire);
+        // Tier-C check BEFORE the network. On a hit, PROMOTE back into Tier-B
+        // (which may itself evict cold stripes down to Tier-C) and return it as a
+        // cache hit — no network, no EC decode.
+        if let Some(store) = &self.tier_c {
+            if let Some(bytes) = store.get(key, stripe_index).await {
+                self.put_tier_b(key, stripe_index, Arc::clone(&bytes), gen_at_fetch)
+                    .await;
+                self.stripe_cache.clear_in_flight(key, stripe_index);
+                return Ok(bytes);
+            }
+        }
+        // Tier-C miss (or disabled): fetch from the network as before. On a
+        // network error, ALWAYS clear the single-flight gate first so the
+        // in_flight entry never leaks (a transient fetch failure must not strand
+        // a stale gate that serializes — and is never reclaimed for — future
+        // missers of this stripe).
+        let (payload, learned) = match self
             .objects
             .get_object_range(&self.bucket_id, key, stripe_start, width)
-            .await?;
+            .await
+        {
+            Ok(ok) => ok,
+            Err(err) => {
+                self.stripe_cache.clear_in_flight(key, stripe_index);
+                return Err(err);
+            }
+        };
         self.stripe_cache.observe_stripe_width(learned);
         let bytes = Arc::new(payload);
-        // put() skips empty payloads (reads at/past EOF), so a 0-byte stripe is
-        // returned to the caller but never pollutes the cache.
-        self.stripe_cache.put(key, stripe_index, Arc::clone(&bytes));
+        // put_tier_b() skips empty payloads (reads at/past EOF), so a 0-byte
+        // stripe is returned to the caller but never pollutes either tier. The
+        // Tier-B insert may evict cold stripes — those are written back to Tier-C.
+        // The generation guard inside put_tier_b drops the insert if an
+        // invalidation raced the network fetch.
+        self.put_tier_b(key, stripe_index, Arc::clone(&bytes), gen_at_fetch)
+            .await;
         self.stripe_cache.clear_in_flight(key, stripe_index);
         Ok(bytes)
+    }
+
+    /// Insert a stripe into Tier-B and write any stripes Tier-B evicted (to stay
+    /// within its RAM budget) back to the Tier-C disk victim cache.
+    ///
+    /// `gen_at_fetch` is the invalidation generation snapshotted by the caller
+    /// BEFORE it read these bytes. If the live generation has moved on, an
+    /// overwrite invalidated this key while the fetch was in flight, so the bytes
+    /// are potentially stale: NEITHER tier is touched (no Tier-B insert, no
+    /// Tier-C write-back). This is what makes the cache coherent against a
+    /// concurrent overwrite — a stripe fetched before an invalidation can never
+    /// be (re)inserted after it. See [`Self::cache_invalidation_gen`].
+    ///
+    /// On the in-generation path: the Tier-B `put` returns its eviction victims
+    /// (collected under, then handed out from outside, its `size_lock`); the
+    /// Tier-C writes happen OUTSIDE that lock on a spawned task so the read path
+    /// is never blocked on disk I/O. The write-back is bounded by a semaphore
+    /// (caps both task count and retained-stripe memory) and re-checks the
+    /// generation immediately before each disk write so a write-back that began
+    /// before an invalidation cannot land stale bytes after it. When Tier-C is
+    /// disabled the victims are simply dropped (Tier-B alone, as before).
+    async fn put_tier_b(&self, key: &str, stripe_index: u64, bytes: Arc<Vec<u8>>, gen_at_fetch: u64) {
+        // Generation guard: if anything invalidated since the fetch began, drop
+        // the bytes from BOTH tiers (do not insert into Tier-B, do not write back
+        // to Tier-C). `Acquire` pairs with the `Release` bump in `bump_*` so the
+        // invalidation's cache drop is visible before we decide.
+        if self.cache_invalidation_gen.load(Ordering::Acquire) != gen_at_fetch {
+            return;
+        }
+        let evicted = self.stripe_cache.put(key, stripe_index, bytes);
+        let (Some(store), Some(permits)) = (&self.tier_c, &self.tier_c_writeback_permits) else {
+            return;
+        };
+        if evicted.is_empty() {
+            return;
+        }
+        let store = Arc::clone(store);
+        // Bound concurrency: take a permit BEFORE spawning. Best-effort — if none
+        // is available the victims are dropped rather than buffered unboundedly.
+        let Ok(permit) = Arc::clone(permits).try_acquire_owned() else {
+            return;
+        };
+        let gen_handle = Arc::clone(&self.cache_invalidation_gen);
+        tokio::spawn(async move {
+            let _permit = permit; // released on task completion
+            for (vkey, vidx, vbytes) in evicted {
+                // Re-check immediately before the disk write: an invalidation
+                // that raced the eviction must win, so a stale victim never
+                // persists to disk after the key was invalidated.
+                if gen_handle.load(Ordering::Acquire) != gen_at_fetch {
+                    break;
+                }
+                // Best-effort write-back; a failure just means a future read of
+                // that stripe re-fetches from the network.
+                let _ = store.put(&vkey, vidx, vbytes).await;
+            }
+        });
+    }
+
+    /// Bump the invalidation generation. MUST be called as the FIRST step of
+    /// every per-key/namespace invalidation, BEFORE dropping any cache entries:
+    /// a concurrent fetch that has already snapshotted the old generation and is
+    /// mid-flight will then see the bump in its post-fetch re-check and refuse to
+    /// (re)insert the stale stripe it was reading. `Release` so the bump is
+    /// ordered before the cache mutations that follow (paired with the `Acquire`
+    /// load in `put_tier_b` / the write-back task).
+    fn bump_invalidation_gen(&self) {
+        self.cache_invalidation_gen.fetch_add(1, Ordering::Release);
+    }
+
+    /// Coherent per-key invalidation across BOTH tiers, awaited inline. Bumps the
+    /// invalidation generation FIRST (so a racing in-flight fetch cannot reinsert
+    /// the old version), drops Tier-B synchronously, then drops Tier-C. Used on
+    /// the async commit/unlink paths that already drop Tier-B in line.
+    async fn invalidate_key_both_tiers(&self, key: &str) {
+        self.bump_invalidation_gen();
+        self.stripe_cache.invalidate_key(key);
+        if let Some(store) = &self.tier_c {
+            store.invalidate_key(key).await;
+        }
+    }
+
+    /// Coherent per-key invalidation for the synchronous `apply_invalidation`
+    /// coherence path (which cannot await). Bumps the generation and drops Tier-B
+    /// synchronously; the Tier-C file unlink is deferred to a spawned task. The
+    /// generation bump + Tier-B drop are synchronous, so the cross-tier window
+    /// the reviewer flagged (miss Tier-B / hit stale Tier-C / promote back) is
+    /// closed: a racing reader that snapshotted the OLD generation before this
+    /// runs will fail its post-fetch generation re-check and NOT promote, and a
+    /// reader that snapshots AFTER this runs sees the new generation (the stale
+    /// Tier-C entry, if its unlink has not landed yet, is still gated out of
+    /// re-insertion by the generation guard, and a direct Tier-C hit of it is
+    /// promoted only if the generation is unchanged).
+    fn invalidate_key_both_tiers_detached(&self, key: &str) {
+        self.bump_invalidation_gen();
+        self.stripe_cache.invalidate_key(key);
+        let Some(store) = &self.tier_c else { return };
+        let store = Arc::clone(store);
+        let key = key.to_string();
+        tokio::spawn(async move {
+            store.invalidate_key(&key).await;
+        });
+    }
+
+    /// Coherent namespace-wide wipe across BOTH tiers for the synchronous
+    /// coherence path. Bumps the generation and clears Tier-B synchronously; the
+    /// Tier-C directory wipe is deferred to a spawned task. No-op for Tier-C when
+    /// disabled.
+    fn clear_both_tiers_detached(&self) {
+        self.bump_invalidation_gen();
+        self.stripe_cache.clear();
+        let Some(store) = &self.tier_c else { return };
+        let store = Arc::clone(store);
+        tokio::spawn(async move {
+            store.clear().await;
+        });
     }
 
     pub async fn write(
@@ -822,8 +1080,9 @@ impl FsCore {
         // independent of inode lifecycle) cannot keep serving the deleted bytes,
         // and a delete-then-recreate at the same key has a local backstop rather
         // than relying solely on the NATS coherence event landing. Mirrors
-        // commit_handle()'s invalidate_key(&handle.key).
-        self.stripe_cache.invalidate_key(&key);
+        // commit_handle()'s invalidate_key(&handle.key). Bumps the invalidation
+        // generation so an in-flight fetch of the old bytes cannot reinsert them.
+        self.invalidate_key_both_tiers(&key).await;
         if let Some(ino) = self.tables.by_key.get(&key).map(|e| *e) {
             self.tables.remove_inode(ino);
         }
@@ -900,8 +1159,10 @@ impl FsCore {
             .await?;
         handle.set_dirty(false);
         // A commit is a new immutable object version — drop any cached stripes
-        // for this key so subsequent ranged reads see the new bytes.
-        self.stripe_cache.invalidate_key(&handle.key);
+        // for this key so subsequent ranged reads see the new bytes (both tiers).
+        // Bumps the invalidation generation so a concurrent ranged read still
+        // fetching the OLD version cannot reinsert it after this commit.
+        self.invalidate_key_both_tiers(&handle.key).await;
         if let Some(inode) = self.tables.inode(handle.ino) {
             let mut s = inode.state.write().expect("inode lock poisoned");
             s.size = payload.len() as u64;
@@ -950,8 +1211,10 @@ impl FsCore {
                 && event.entry_id.is_empty()
                 && event.parent_entry_id.is_empty())
         {
-            // Namespace-wide event: every cached stripe is suspect.
-            self.stripe_cache.clear();
+            // Namespace-wide event: every cached stripe is suspect — both tiers.
+            // Bumps the generation + clears Tier-B synchronously (Tier-C wipe is
+            // deferred) so no in-flight fetch can reinsert a stale stripe.
+            self.clear_both_tiers_detached();
             for entry in self.tables.by_ino.iter() {
                 let mut s = entry.value().state.write().expect("inode lock poisoned");
                 s.size_loaded_at = None;
@@ -962,8 +1225,11 @@ impl FsCore {
         }
 
         if !event.key.is_empty() {
-            // Out-of-band mutation of this object: drop its cached stripes.
-            self.stripe_cache.invalidate_key(&event.key);
+            // Out-of-band mutation of this object: drop its cached stripes from
+            // BOTH tiers. Bumps the generation + drops Tier-B synchronously
+            // (Tier-C unlink deferred) so a racing reader cannot promote a stale
+            // Tier-C stripe back into Tier-B.
+            self.invalidate_key_both_tiers_detached(&event.key);
             if let Some(ino) = self.tables.by_key.get(&event.key).map(|e| *e) {
                 if let Some(inode) = self.tables.inode(ino) {
                     inode

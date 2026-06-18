@@ -39,6 +39,10 @@ fn run_mount(config: MountConfig) -> Result<(), DynError> {
         write_completion_mode: config.write_completion_mode,
         metadata_notification_nats_url: config.metadata_notification_nats_url,
         metadata_notification_subject: config.metadata_notification_subject,
+        // Tier-C disk stripe cache: opt-in via --tier-c-cache-dir, off by default.
+        tier_c_cache_dir: config.tier_c_cache_dir,
+        tier_c_budget_bytes: config.tier_c_budget_bytes,
+        stripe_cache_budget_bytes: config.stripe_cache_budget_bytes,
     };
     kfc_transport::run_mount(fs_config, mountpoint, kfc_transport::MountOpts::default())
         .map_err(|err| boxed_error(err.to_string()))
