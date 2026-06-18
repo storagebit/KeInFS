@@ -14,7 +14,10 @@ use keinctl::proto::{
     RepairObjectWriteRequest, ReserveObjectWriteWindowRequest, ResolveObjectReadRequest,
     WriteIntent,
 };
-use kp2::{ChunkId, PackedReadQuery, PackedWriteEntry, PackedWriteRequest, MAX_PACK_PAYLOAD_BYTES};
+use kp2::{
+    ChunkId, ChunkRange, PackedReadQuery, PackedWriteEntry, PackedWriteRequest,
+    MAX_PACK_PAYLOAD_BYTES,
+};
 use prost::Message;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -1096,6 +1099,106 @@ impl ObjectClient {
     /// offset+len)` (clamped to the object length) by reading only the stripes
     /// the range touches, rather than materializing the whole object. Built on
     /// `read_single_stripe` + the uniform stripe geometry; no protocol change.
+    /// Byte-granular fast path for a clamped window `[start, end)`: when the
+    /// window lies entirely inside ONE present data fragment, fetch just those
+    /// bytes with a single ranged KP2 packed read (one chunk, one sub-range)
+    /// instead of reading the whole stripe. Returns `Ok(None)` — so the caller
+    /// falls back to the full stripe loop (with reconstruction) — when the
+    /// window spans fragments/stripes, lands in the parity-padded tail, or the
+    /// fragment read does not return exactly the requested bytes (e.g. missing).
+    async fn try_byte_granular_read(
+        &mut self,
+        manifest: &ObjectVersionManifest,
+        ec_profile: &EcProfile,
+        object_len: u64,
+        start: u64,
+        end: u64,
+        phases: &mut ObjectPhaseTimes,
+    ) -> Result<Option<RangedGetResult>, ObjectError> {
+        let fragment_bytes = ec_profile.fragment_bytes as u64;
+        let data_fragments = ec_profile.data_fragments as usize;
+        if fragment_bytes == 0 || data_fragments == 0 || end <= start {
+            return Ok(None);
+        }
+        let stripe_width = fragment_bytes * data_fragments as u64;
+        // Single stripe?
+        if start / stripe_width != (end - 1) / stripe_width {
+            return Ok(None);
+        }
+        let stripe_index = (start / stripe_width) as usize;
+        let stripe_local_start = start - stripe_index as u64 * stripe_width;
+        let stripe_local_end = end - stripe_index as u64 * stripe_width;
+        // Single data fragment?
+        if stripe_local_start / fragment_bytes != (stripe_local_end - 1) / fragment_bytes {
+            return Ok(None);
+        }
+        let fragment_index = (stripe_local_start / fragment_bytes) as usize;
+        // Must be a real data fragment for this (possibly partial) stripe.
+        let stripe_logical_bytes =
+            stripe_logical_length_bytes(manifest, ec_profile, stripe_index as u32);
+        if fragment_index >= needed_data_fragment_count(ec_profile, stripe_logical_bytes) {
+            return Ok(None);
+        }
+        let Some(stripe) = manifest.stripes.get(stripe_index) else {
+            return Ok(None);
+        };
+        let Some(plan) = stripe.fragments.get(fragment_index) else {
+            return Ok(None);
+        };
+        let chunk_id = chunk_id_from_proto(&plan.chunk_id)?;
+        let fragment_offset = stripe_local_start - fragment_index as u64 * fragment_bytes;
+        let fragment_len = (end - start) as u32;
+
+        let plans = std::slice::from_ref(plan);
+        let (connect_elapsed, _connect_failures) = self.ensure_read_target_sessions(plans).await;
+        phases.target_connect += connect_elapsed;
+        let Some(session) = self.target_sessions.get(&plan.endpoint).cloned() else {
+            return Ok(None);
+        };
+
+        let query = PackedReadQuery {
+            chunk_ids: vec![chunk_id],
+            ranges: Some(vec![ChunkRange {
+                offset: fragment_offset,
+                length: fragment_len,
+            }]),
+        };
+        let read_started = Instant::now();
+        let reply = match data_rpc(
+            "target ranged read",
+            TARGET_IO_TIMEOUT,
+            session.packed_read(&query, fragment_len as usize),
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            // Any RPC failure: fall back to the proven full-stripe path.
+            Err(_) => return Ok(None),
+        };
+        phases.target_read += read_started.elapsed();
+        accumulate_target_request_phases(phases, &reply.phases);
+        let Some(entry) = reply.value.entries.into_iter().next() else {
+            return Ok(None);
+        };
+        // 200 with exactly the requested bytes, or fall back (missing fragment,
+        // short read, or anything unexpected).
+        if entry.status_code != 200 || entry.payload.len() != fragment_len as usize {
+            return Ok(None);
+        }
+        Ok(Some(RangedGetResult {
+            payload: entry.payload,
+            offset: start,
+            object_length_bytes: object_len,
+            manifest: manifest.clone(),
+            ec_profile: ec_profile.clone(),
+            phases: *phases,
+            missing_fragments: 0,
+            data_fragment_reads: 1,
+            parity_fragment_reads: 0,
+            reconstructed: false,
+        }))
+    }
+
     pub async fn get_object_range(
         &mut self,
         bucket_id: &str,
@@ -1167,6 +1270,16 @@ impl ObjectClient {
             return Err(ObjectError::Metadata(
                 "manifest has no stripes for a non-empty ranged read".to_string(),
             ));
+        }
+
+        // Byte-granular fast path: a window inside one present data fragment is
+        // served by a single ranged KP2 packed read (~the asked bytes), not the
+        // whole stripe. Falls through to the full stripe loop on any miss.
+        if let Some(result) = self
+            .try_byte_granular_read(&manifest, &ec_profile, object_len, start, end, &mut phases)
+            .await?
+        {
+            return Ok(result);
         }
 
         // read_single_stripe's reconstruct path needs the encoder prepared.
@@ -2563,6 +2676,7 @@ async fn read_plans_batched_with_sessions(
             } else {
                 let query = PackedReadQuery {
                     chunk_ids: batch.iter().map(|item| item.chunk_id).collect(),
+                    ranges: None,
                 };
                 match data_rpc(
                     "target packed read",

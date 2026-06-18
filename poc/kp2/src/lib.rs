@@ -27,6 +27,10 @@ pub const LIMIT_SCOPE_CONNECTION: &str = "connection";
 pub const LIMIT_CLASS_ALL: &str = "all";
 pub const LIMIT_CLASS_READ: &str = "read";
 pub const LIMIT_CLASS_WRITE: &str = "write";
+/// Common-header flag (KP2Q only): query entries carry a per-chunk
+/// (offset:u64, length:u32) sub-range, so a reader fetches a slice of a chunk
+/// instead of the whole chunk. Entries are `QUERY_ENTRY_RANGED_BYTES` wide.
+pub const FLAG_QUERY_RANGED: u16 = 0x0001;
 
 const MAGIC_WRITE: &[u8; 4] = b"KP2W";
 const MAGIC_QUERY: &[u8; 4] = b"KP2Q";
@@ -35,6 +39,8 @@ const MAGIC_ACK: &[u8; 4] = b"KP2A";
 const COMMON_HEADER_BYTES: usize = 24;
 const WRITE_ENTRY_BYTES: usize = 52;
 const QUERY_ENTRY_BYTES: usize = 32;
+/// Ranged query entry: chunk_id[32] + offset:u64 + length:u32 + reserved:u32.
+const QUERY_ENTRY_RANGED_BYTES: usize = 48;
 const READ_ENTRY_BYTES: usize = 80;
 const ACK_ENTRY_BYTES: usize = 80;
 
@@ -95,9 +101,20 @@ pub struct PackedWriteRequest {
     pub entries: Vec<PackedWriteEntry>,
 }
 
+/// A byte sub-range within a chunk's logical payload (byte-granular reads).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChunkRange {
+    pub offset: u64,
+    pub length: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedReadQuery {
     pub chunk_ids: Vec<ChunkId>,
+    /// `None` fetches each chunk whole (legacy, 32-byte entries). `Some(ranges)`
+    /// (len must equal `chunk_ids`) fetches only `ranges[i]` of `chunk_ids[i]`,
+    /// setting `FLAG_QUERY_RANGED` on the wire (48-byte entries).
+    pub ranges: Option<Vec<ChunkRange>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -448,34 +465,66 @@ pub fn encode_read_query(query: &PackedReadQuery) -> io::Result<Vec<u8>> {
             "KP2 packed read query requires at least one chunk id",
         ));
     }
+    let ranged = match &query.ranges {
+        Some(ranges) => {
+            if ranges.len() != query.chunk_ids.len() {
+                return Err(invalid_input(
+                    "KP2 ranged read query: ranges length must equal chunk_ids length",
+                ));
+            }
+            true
+        }
+        None => false,
+    };
+    let entry_bytes = if ranged {
+        QUERY_ENTRY_RANGED_BYTES
+    } else {
+        QUERY_ENTRY_BYTES
+    };
     let entry_table_bytes = query
         .chunk_ids
         .len()
-        .checked_mul(QUERY_ENTRY_BYTES)
+        .checked_mul(entry_bytes)
         .ok_or_else(|| invalid_input("KP2 query entry table size overflow"))?;
+    let flags = if ranged { FLAG_QUERY_RANGED } else { 0 };
     let mut out = Vec::with_capacity(COMMON_HEADER_BYTES + entry_table_bytes);
-    encode_common_header(
+    encode_common_header_with_flags(
         &mut out,
         MAGIC_QUERY,
+        flags,
         query.chunk_ids.len() as u32,
         0,
         entry_table_bytes as u32,
     );
-    for chunk_id in &query.chunk_ids {
+    for (index, chunk_id) in query.chunk_ids.iter().enumerate() {
         out.extend_from_slice(&chunk_id.0);
+        if ranged {
+            // SAFETY: `ranged` implies `query.ranges` is `Some` with matching len.
+            let range = query.ranges.as_ref().unwrap()[index];
+            put_u64(&mut out, range.offset);
+            put_u32(&mut out, range.length);
+            put_u32(&mut out, 0); // reserved
+        }
     }
     Ok(out)
 }
 
 pub fn decode_read_query(body: &[u8]) -> io::Result<PackedReadQuery> {
-    let header = decode_common_header(body, MAGIC_QUERY)?;
+    let header = decode_common_header_with_flags(body, MAGIC_QUERY, FLAG_QUERY_RANGED)?;
+    let ranged = header.flags & FLAG_QUERY_RANGED != 0;
+    let entry_bytes = if ranged {
+        QUERY_ENTRY_RANGED_BYTES
+    } else {
+        QUERY_ENTRY_BYTES
+    };
     let entry_table_bytes = header.entry_table_bytes as usize;
-    if entry_table_bytes != header.chunk_count as usize * QUERY_ENTRY_BYTES {
+    if entry_table_bytes != header.chunk_count as usize * entry_bytes {
         return Err(invalid_data(format!(
-            "KP2 read-query entry table is {} bytes but {} entries require {} bytes",
+            "KP2 read-query entry table is {} bytes but {} {} entries require {} bytes",
             entry_table_bytes,
             header.chunk_count,
-            header.chunk_count as usize * QUERY_ENTRY_BYTES
+            if ranged { "ranged" } else { "plain" },
+            header.chunk_count as usize * entry_bytes
         )));
     }
     let expected_len = COMMON_HEADER_BYTES + entry_table_bytes;
@@ -487,11 +536,25 @@ pub fn decode_read_query(body: &[u8]) -> io::Result<PackedReadQuery> {
         )));
     }
     let mut chunk_ids = Vec::with_capacity(header.chunk_count as usize);
+    let mut ranges = if ranged {
+        Some(Vec::with_capacity(header.chunk_count as usize))
+    } else {
+        None
+    };
     for index in 0..header.chunk_count as usize {
-        let base = COMMON_HEADER_BYTES + index * QUERY_ENTRY_BYTES;
+        let base = COMMON_HEADER_BYTES + index * entry_bytes;
         chunk_ids.push(read_chunk_id(body, base)?);
+        if ranged {
+            let offset = read_u64(body, base + 32)?;
+            let length = read_u32(body, base + 40)?;
+            // bytes [base+44, base+48) are reserved; ignored for forward-compat.
+            ranges
+                .as_mut()
+                .expect("ranged implies ranges is Some")
+                .push(ChunkRange { offset, length });
+        }
     }
-    Ok(PackedReadQuery { chunk_ids })
+    Ok(PackedReadQuery { chunk_ids, ranges })
 }
 
 pub fn encode_read_response(pack: &PackedReadResponse) -> io::Result<Vec<u8>> {
@@ -845,9 +908,27 @@ fn encode_common_header(
     total_payload_bytes: u32,
     entry_table_bytes: u32,
 ) {
+    encode_common_header_with_flags(
+        out,
+        magic,
+        0,
+        chunk_count,
+        total_payload_bytes,
+        entry_table_bytes,
+    );
+}
+
+fn encode_common_header_with_flags(
+    out: &mut Vec<u8>,
+    magic: &[u8; 4],
+    flags: u16,
+    chunk_count: u32,
+    total_payload_bytes: u32,
+    entry_table_bytes: u32,
+) {
     out.extend_from_slice(magic);
     put_u16(out, VERSION);
-    put_u16(out, 0);
+    put_u16(out, flags);
     put_u32(out, chunk_count);
     put_u32(out, total_payload_bytes);
     put_u32(out, entry_table_bytes);
@@ -855,12 +936,24 @@ fn encode_common_header(
 }
 
 struct CommonHeader {
+    flags: u16,
     chunk_count: u32,
     total_payload_bytes: u32,
     entry_table_bytes: u32,
 }
 
 fn decode_common_header(body: &[u8], expected_magic: &[u8; 4]) -> io::Result<CommonHeader> {
+    decode_common_header_with_flags(body, expected_magic, 0)
+}
+
+/// Like [`decode_common_header`] but tolerates the bits set in `allowed_flags`
+/// (any flag outside the mask is still rejected). The accepted flags are
+/// returned in `CommonHeader::flags` for the message decoder to act on.
+fn decode_common_header_with_flags(
+    body: &[u8],
+    expected_magic: &[u8; 4],
+    allowed_flags: u16,
+) -> io::Result<CommonHeader> {
     if body.len() < COMMON_HEADER_BYTES {
         return Err(invalid_data(format!(
             "KP2 body is {} bytes long but the common header requires {} bytes",
@@ -883,10 +976,10 @@ fn decode_common_header(body: &[u8], expected_magic: &[u8; 4]) -> io::Result<Com
         )));
     }
     let flags = read_u16(body, 6)?;
-    if flags != 0 {
+    if flags & !allowed_flags != 0 {
         return Err(invalid_data(format!(
-            "KP2 flags must be zero in version 1 and got {}",
-            flags
+            "KP2 flags {} set bits outside the allowed mask {} for this message",
+            flags, allowed_flags
         )));
     }
     let chunk_count = read_u32(body, 8)?;
@@ -903,6 +996,7 @@ fn decode_common_header(body: &[u8], expected_magic: &[u8; 4]) -> io::Result<Com
         ));
     }
     Ok(CommonHeader {
+        flags,
         chunk_count,
         total_payload_bytes,
         entry_table_bytes,
@@ -1081,10 +1175,63 @@ mod tests {
     fn read_query_round_trips() {
         let query = PackedReadQuery {
             chunk_ids: vec![chunk(9), chunk(10)],
+            ranges: None,
         };
         let encoded = encode_read_query(&query).unwrap();
         let decoded = decode_read_query(&encoded).unwrap();
         assert_eq!(decoded, query);
+    }
+
+    #[test]
+    fn ranged_read_query_round_trips() {
+        let query = PackedReadQuery {
+            chunk_ids: vec![chunk(9), chunk(10)],
+            ranges: Some(vec![
+                ChunkRange {
+                    offset: 4096,
+                    length: 4096,
+                },
+                ChunkRange {
+                    offset: 0,
+                    length: 1024,
+                },
+            ]),
+        };
+        let encoded = encode_read_query(&query).unwrap();
+        // The ranged flag is set on the wire and entries are 48 bytes wide.
+        assert_eq!(
+            read_u16(&encoded, 6).unwrap() & FLAG_QUERY_RANGED,
+            FLAG_QUERY_RANGED
+        );
+        assert_eq!(encoded.len(), COMMON_HEADER_BYTES + 2 * QUERY_ENTRY_RANGED_BYTES);
+        let decoded = decode_read_query(&encoded).unwrap();
+        assert_eq!(decoded, query);
+    }
+
+    #[test]
+    fn ranged_query_length_mismatch_is_rejected() {
+        let query = PackedReadQuery {
+            chunk_ids: vec![chunk(1), chunk(2)],
+            ranges: Some(vec![ChunkRange {
+                offset: 0,
+                length: 8,
+            }]),
+        };
+        assert!(encode_read_query(&query).is_err());
+    }
+
+    #[test]
+    fn ranged_flag_rejected_when_not_allowed() {
+        // A non-query decoder (allowed_flags = 0) must reject the ranged flag.
+        let query = PackedReadQuery {
+            chunk_ids: vec![chunk(3)],
+            ranges: Some(vec![ChunkRange {
+                offset: 0,
+                length: 4,
+            }]),
+        };
+        let encoded = encode_read_query(&query).unwrap();
+        assert!(decode_common_header(&encoded, MAGIC_QUERY).is_err());
     }
 
     #[test]

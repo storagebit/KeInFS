@@ -936,8 +936,11 @@ impl TargetRouter {
         let mut media_payload_copy = std::time::Duration::ZERO;
         let mut media_crc = std::time::Duration::ZERO;
         let mut location_map = std::time::Duration::ZERO;
-        for query_chunk_id in query.chunk_ids {
+        for (index, query_chunk_id) in query.chunk_ids.iter().enumerate() {
+            let query_chunk_id = *query_chunk_id;
             let chunk_id = ChunkId(query_chunk_id.0);
+            // Byte-granular: the sub-range (if any) the reader wants of this chunk.
+            let chunk_range = query.ranges.as_ref().and_then(|r| r.get(index).copied());
             let lookup_started = Instant::now();
             let maybe_record = self.kix_lookup(chunk_id)?;
             kix_lookup += lookup_started.elapsed();
@@ -956,7 +959,20 @@ impl TargetRouter {
                     media_payload_read += payload.timing.payload_read;
                     media_payload_copy += payload.timing.payload_copy;
                     media_crc += payload.timing.crc;
-                    total_payload_bytes += payload.payload.len();
+                    // Byte-granular: serve only the requested sub-range of the
+                    // chunk's logical payload. KST still read + CRC-validated the
+                    // whole chunk; this trims the KP2 transfer to the asked bytes.
+                    let served = match chunk_range {
+                        Some(r) => {
+                            let start = (r.offset as usize).min(payload.payload.len());
+                            let end = start
+                                .saturating_add(r.length as usize)
+                                .min(payload.payload.len());
+                            payload.payload[start..end].to_vec()
+                        }
+                        None => payload.payload,
+                    };
+                    total_payload_bytes += served.len();
                     let map_started = Instant::now();
                     let slot_index = chunk_media_slot_index_for_record(self.media.layout(), record)
                         .map_err(|err| {
@@ -986,7 +1002,7 @@ impl TargetRouter {
                             checksum: record.checksum,
                             slot_index,
                         }),
-                        payload: payload.payload,
+                        payload: served,
                     });
                 }
                 Ok(None) => entries.push(PackedReadEntry {

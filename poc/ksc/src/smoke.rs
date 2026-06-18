@@ -41,6 +41,7 @@ pub(crate) async fn run_smoke(config: SmokeConfig) -> Result<(), ClientError> {
 
     let read_query = PackedReadQuery {
         chunk_ids: query_chunk_ids,
+        ranges: None,
     };
     let expected_payload_bytes = expected_payloads
         .iter()

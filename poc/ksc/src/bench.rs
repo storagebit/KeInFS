@@ -634,7 +634,7 @@ async fn issue_read_pack(
         .map(|key| key.chunk_id)
         .collect::<Vec<_>>();
     let mut timed_reply = session
-        .packed_read(&PackedReadQuery { chunk_ids }, selected.payload_bytes)
+        .packed_read(&PackedReadQuery { chunk_ids, ranges: None }, selected.payload_bytes)
         .await?;
     if timed_reply.value.entries.len() != selected.keys.len() {
         return Err(ClientError::Protocol(

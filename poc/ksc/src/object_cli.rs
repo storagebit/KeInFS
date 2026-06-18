@@ -6,8 +6,9 @@ use crate::config::{
 };
 use ksc::client::CompletionMode as ClientCompletionMode;
 use ksc::object::{
-    delete_object_with_options, get_object_single_stripe_with_options,
-    put_object_from_path_with_options, ObjectClientOptions, ObjectPhaseTimes,
+    delete_object_with_options, get_object_range_with_options,
+    get_object_single_stripe_with_options, put_object_from_path_with_options, ObjectClientOptions,
+    ObjectPhaseTimes,
 };
 
 pub(crate) async fn run_put_object(
@@ -53,6 +54,40 @@ pub(crate) async fn run_put_object(
 pub(crate) async fn run_get_object(
     config: ObjectGetConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if config.range_offset.is_some() != config.range_length.is_some() {
+        return Err("ksc get-object: pass both --offset and --length, or neither".into());
+    }
+    if let (Some(offset), Some(length)) = (config.range_offset, config.range_length) {
+        let result = get_object_range_with_options(
+            &config.kms_endpoints,
+            &config.bucket_id,
+            &config.key,
+            offset,
+            length,
+            ObjectClientOptions {
+                read_completion_mode: client_mode(config.read_completion_mode),
+                write_completion_mode: client_mode(config.read_completion_mode),
+                kms_grpc_max_message_bytes: config.kms_grpc_max_message_bytes,
+                metadata_notification_nats_url: config.metadata_notification_nats_url.clone(),
+                metadata_notification_subject: config.metadata_notification_subject.clone(),
+                ..ObjectClientOptions::default()
+            },
+        )
+        .await?;
+        std::fs::write(&config.output_path, &result.payload)?;
+        println!(
+            "ksc_object_get_range bucket={} key={} offset={} length={} payload_bytes={} version_id={} output={}",
+            config.bucket_id,
+            config.key,
+            offset,
+            length,
+            result.payload.len(),
+            result.manifest.version_id,
+            config.output_path.display()
+        );
+        print_phase_line("ksc_object_get_phases_us", result.phases);
+        return Ok(());
+    }
     let result = get_object_single_stripe_with_options(
         &config.kms_endpoints,
         &config.bucket_id,

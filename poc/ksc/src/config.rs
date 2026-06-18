@@ -86,6 +86,9 @@ pub(crate) struct ObjectGetConfig {
     pub(crate) kms_grpc_max_message_bytes: usize,
     pub(crate) metadata_notification_nats_url: Option<String>,
     pub(crate) metadata_notification_subject: String,
+    /// Byte-granular range read: fetch only `[range_offset, range_offset+range_length)`.
+    pub(crate) range_offset: Option<u64>,
+    pub(crate) range_length: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -670,6 +673,8 @@ fn parse_get_object_args(args: &[String]) -> Result<ObjectGetConfig, Box<dyn Err
     let mut key = String::new();
     let mut output_path = None;
     let mut read_completion_mode = CompletionMode::Interrupt;
+    let mut range_offset: Option<u64> = None;
+    let mut range_length: Option<u64> = None;
     let mut kms_grpc_max_message_bytes = DEFAULT_KMS_GRPC_MAX_MESSAGE_BYTES;
     let mut metadata_notification_nats_url = None;
     let mut metadata_notification_subject = DEFAULT_METADATA_NOTIFICATION_SUBJECT.to_string();
@@ -682,6 +687,22 @@ fn parse_get_object_args(args: &[String]) -> Result<ObjectGetConfig, Box<dyn Err
                     &mut kms_endpoints,
                     args.get(i).ok_or_else(|| missing_value("--kms-endpoint"))?,
                     "http://127.0.0.1:50060",
+                );
+            }
+            "--offset" => {
+                i += 1;
+                range_offset = Some(
+                    args.get(i)
+                        .ok_or_else(|| missing_value("--offset"))?
+                        .parse()?,
+                );
+            }
+            "--length" => {
+                i += 1;
+                range_length = Some(
+                    args.get(i)
+                        .ok_or_else(|| missing_value("--length"))?
+                        .parse()?,
                 );
             }
             "--bucket" => {
@@ -758,6 +779,8 @@ fn parse_get_object_args(args: &[String]) -> Result<ObjectGetConfig, Box<dyn Err
         kms_grpc_max_message_bytes,
         metadata_notification_nats_url,
         metadata_notification_subject,
+        range_offset,
+        range_length,
     })
 }
 
