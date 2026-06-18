@@ -13,6 +13,7 @@
 use crate::error::{classify, FsErrno};
 use crate::metadata::DynError;
 use ksc::object::{ObjectClient, ObjectClientOptions};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -59,8 +60,14 @@ impl ObjectEngine {
         Arc::clone(&pool[index])
     }
 
-    /// Whole-object read. Used for writable-handle read-modify-write staging;
-    /// read-only handles use [`ObjectEngine::get_object_range`].
+    /// Whole-object read. Retained as the in-RAM symmetric counterpart to
+    /// [`ObjectEngine::put_object`]; NOT used on any hot path. The read-only
+    /// reads use [`ObjectEngine::get_object_range`], and the RMW-open seed now
+    /// streams via `get_object_range` in bounded chunks (see
+    /// `core.rs::seed_rmw_buffer`) rather than loading the whole object — keep
+    /// this scoped so a future caller does not reintroduce a whole-object RAM
+    /// load on a hot path.
+    #[allow(dead_code)]
     pub async fn get_object(&self, bucket_id: &str, key: &str) -> Result<Vec<u8>, FsErrno> {
         let client = Self::select(&self.read_clients, &self.read_next);
         let mut client = client.lock().await;
@@ -97,8 +104,14 @@ impl ObjectEngine {
             .map_err(|err| classify(&err))
     }
 
-    /// Whole-object write (a put = a new immutable version, FIRST_PRINCIPLES
-    /// §12). Phase 3 replaces this with streaming writeback.
+    /// Whole-object write from an in-RAM payload (a put = a new immutable
+    /// version, FIRST_PRINCIPLES §12). Retained for the small/in-RAM callers and
+    /// tests; the writable-handle commit path uses [`ObjectEngine::put_object_from_path`]
+    /// so a multi-GB object is never resident in RAM.
+    ///
+    /// Currently unused by the commit path (which streams from the temp file) but
+    /// kept as the small/in-RAM symmetric counterpart to `get_object`.
+    #[allow(dead_code)]
     pub async fn put_object(
         &self,
         bucket_id: &str,
@@ -109,6 +122,42 @@ impl ObjectEngine {
         let mut client = client.lock().await;
         client
             .put_object_single_stripe(bucket_id, key, payload)
+            .await
+            .map(|_| ())
+            .map_err(|err| classify(&err))
+    }
+
+    /// Streaming-writeback v1 commit: write an object whose payload lives in a
+    /// temp file at `path` (the staged writable handle). KSC's
+    /// `put_object_from_path` reads each EC stripe range from the file via a
+    /// bounded `seek`+`read` per stripe — so the whole object is never resident
+    /// in RAM on the commit path either.
+    ///
+    /// `logical_len` is AUTHORITATIVE: the caller snapshots `(path, logical_len)`
+    /// atomically under the handle lock and passes the length here, and KSC keys
+    /// the stripe loop / `initiate_object_write` off THIS value rather than
+    /// re-stat'ing the file. That closes the commit-vs-concurrent-write TOCTOU
+    /// (a write extending or shrinking the temp file between snapshot and stream
+    /// cannot change the committed length, and a racing shrink can no longer
+    /// EOF-fail a per-stripe read — short reads zero-fill to the snapshot length).
+    ///
+    /// NOTE (v1 tradeoff): KSC's per-stripe `read_range` closure is a synchronous
+    /// `FnMut`, so the per-stripe `pread` runs as blocking file I/O on the async
+    /// task that drives the put. For v1 this is acceptable — the reads are
+    /// bounded (one stripe at a time) and interleave with the network/EC work; a
+    /// fully async (spawn_blocking) per-stripe producer is the documented
+    /// follow-up alongside true stream-as-you-write.
+    pub async fn put_object_from_path(
+        &self,
+        bucket_id: &str,
+        key: &str,
+        path: &Path,
+        logical_len: u64,
+    ) -> Result<(), FsErrno> {
+        let client = Self::select(&self.write_clients, &self.write_next);
+        let mut client = client.lock().await;
+        client
+            .put_object_from_path(bucket_id, key, path, logical_len)
             .await
             .map(|_| ())
             .map_err(|err| classify(&err))

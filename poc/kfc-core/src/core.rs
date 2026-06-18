@@ -15,7 +15,7 @@ use crate::error::FsErrno;
 use crate::metadata::{DynError, MetadataClient};
 use crate::object::ObjectEngine;
 use crate::persistent_stripe_store::PersistentStripeStore;
-use crate::state::{FileHandle, FsTables, Inode, InodeState};
+use crate::state::{FileHandle, FsTables, HandleBuffer, Inode, InodeState};
 use crate::persistent_stripe_store::DEFAULT_TIER_C_BUDGET_BYTES;
 use crate::stripe_cache::{StripeCache, DEFAULT_STRIPE_CACHE_BUDGET_BYTES};
 use crate::types::{Attr, Capabilities, DesiredKernelConfig, DirEntry, FileKind, OpenedFile, ROOT_INO};
@@ -634,8 +634,9 @@ impl FsCore {
             .staged_buffer()
             .ok_or(FsErrno::BadHandle)?
             .lock()
-            .expect("handle lock poisoned")
-            .set_len(size);
+            .unwrap_or_else(|e| e.into_inner())
+            .set_len(size)
+            .map_err(|_| FsErrno::Io)?;
         handle.set_dirty(true);
         if let Some(inode) = self.tables.inode(ino) {
             let mut s = inode.state.write().expect("inode lock poisoned");
@@ -760,20 +761,26 @@ impl FsCore {
         self.tables.insert_inode(Inode::new(state));
         self.touch_children(parent);
         let fh = self.tables.alloc_fh();
-        self.tables
-            .handles
-            .insert(fh, FileHandle::new_staged(ino, key, true, Vec::new(), true));
+        let handle = FileHandle::new_staged(ino, key, true, Vec::new(), true)
+            .map_err(|_| FsErrno::Io)?;
+        self.tables.handles.insert(fh, handle);
         Ok((attr, self.opened(fh)))
     }
 
     pub async fn read(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>, FsErrno> {
         let handle = self.tables.handle(fh).ok_or(FsErrno::BadHandle)?;
         match handle.staged_buffer() {
-            // Writable/truncate handle: serve from the staged in-memory buffer.
-            Some(buffer) => Ok(buffer
+            // Writable/truncate handle: serve from the staged temp file (a
+            // bounded seek+read), so read-after-write within the same handle
+            // still returns the written bytes. A genuine I/O error on the staged
+            // temp file surfaces as EIO rather than a silent zero-filled short
+            // read. Recover from a poisoned lock (a prior panic under the lock)
+            // instead of cascading the panic, mirroring the Tier-C store.
+            Some(buffer) => buffer
                 .lock()
-                .expect("handle lock poisoned")
-                .read_range(offset as usize, size as usize)),
+                .unwrap_or_else(|e| e.into_inner())
+                .read_range(offset as usize, size as usize)
+                .map_err(|_| FsErrno::Io),
             // Read-only handle: stripe-granular ranged read — no whole-object
             // fetch. The Phase 2 win: a 4 KiB pread of a 10 GiB object reads
             // only the touched stripe(s).
@@ -1043,8 +1050,8 @@ impl FsCore {
             return Err(FsErrno::BadHandle);
         }
         let new_len = {
-            let mut buf = buffer.lock().expect("handle lock poisoned");
-            buf.write_at(offset as usize, data);
+            let mut buf = buffer.lock().unwrap_or_else(|e| e.into_inner());
+            buf.write_at(offset as usize, data).map_err(|_| FsErrno::Io)?;
             buf.len() as u64
         };
         handle.set_dirty(true);
@@ -1114,33 +1121,82 @@ impl FsCore {
     // ----- handle internals -------------------------------------------------
 
     /// Open a writable staged handle for `node`. `truncate` => empty dirty
-    /// buffer; otherwise the whole object is loaded for read-modify-write
-    /// staging (Phase 3 will stream this instead of buffering whole objects).
+    /// buffer; otherwise the existing object is staged for read-modify-write.
+    ///
+    /// RAM-bounded RMW seed: the existing object is copied into the staged temp
+    /// file in bounded stripe-width-sized chunks via `get_object_range` (peak RAM
+    /// = one chunk), NOT loaded whole into a `Vec`. A multi-GB existing file
+    /// opened for append/edit therefore never materializes the whole object in
+    /// client RAM — only one window at a time, written straight to disk.
     async fn open_staged_handle(&self, node: &InodeState, truncate: bool) -> Result<u64, FsErrno> {
-        let data = if truncate {
-            Vec::new()
+        let fh = self.tables.alloc_fh();
+        let handle = if truncate {
+            FileHandle::new_staged(node.ino, node.key.clone(), true, Vec::new(), true)
+                .map_err(|_| FsErrno::Io)?
         } else {
-            match self.objects.get_object(&self.bucket_id, &node.key).await {
-                Ok(payload) => {
+            match self.seed_rmw_buffer(&node.key).await {
+                Ok((buffer, seeded_len)) => {
                     if let Some(inode) = self.tables.inode(node.ino) {
                         let mut s = inode.state.write().expect("inode lock poisoned");
-                        s.size = payload.len() as u64;
+                        s.size = seeded_len;
                         s.size_loaded_at = Some(Instant::now());
                     }
-                    payload
+                    // RMW seed is the on-disk prefix, not yet dirty — only an
+                    // actual write/truncate marks it dirty for commit.
+                    FileHandle::from_buffer(node.ino, node.key.clone(), true, buffer, false)
+                        .map_err(|_| FsErrno::Io)?
                 }
                 // A freshly-created-but-uncommitted object has no manifest yet;
                 // treat as empty rather than failing the open.
-                Err(FsErrno::NoEntry) => Vec::new(),
+                Err(FsErrno::NoEntry) => {
+                    FileHandle::new_staged(node.ino, node.key.clone(), true, Vec::new(), false)
+                        .map_err(|_| FsErrno::Io)?
+                }
                 Err(other) => return Err(other),
             }
         };
-        let fh = self.tables.alloc_fh();
-        self.tables.handles.insert(
-            fh,
-            FileHandle::new_staged(node.ino, node.key.clone(), true, data, truncate),
-        );
+        self.tables.handles.insert(fh, handle);
         Ok(fh)
+    }
+
+    /// Copy the existing object at `key` into a fresh staged temp file in bounded
+    /// stripe-width-sized chunks (RAM-bounded RMW seed). Returns the seeded buffer
+    /// and its logical length. Peak RAM is one chunk, never the whole object.
+    async fn seed_rmw_buffer(&self, key: &str) -> Result<(HandleBuffer, u64), FsErrno> {
+        // Bounded copy window. `get_object_range` reports the EC stripe width on
+        // the first fetch; we use it (clamped) as the per-iteration window so each
+        // fetch is a whole number of stripes. Until it is known, use a sane
+        // bounded default so a tiny object still fetches in one shot.
+        const DEFAULT_WINDOW: u64 = 4 * 1024 * 1024;
+        let mut buffer = HandleBuffer::new_empty().map_err(|_| FsErrno::Io)?;
+        let mut offset: u64 = 0;
+        let mut window = DEFAULT_WINDOW;
+        loop {
+            let (chunk, stripe_width) = self
+                .objects
+                .get_object_range(&self.bucket_id, key, offset, window)
+                .await?;
+            if chunk.is_empty() {
+                break; // reached object end (ranged read clamps to logical length)
+            }
+            let read = chunk.len() as u64;
+            buffer.seed_chunk(&chunk).map_err(|_| FsErrno::Io)?;
+            offset = offset.saturating_add(read);
+            // Align subsequent windows to the stripe width once known so each
+            // fetch is stripe-aligned; keep RAM bounded to a few stripes.
+            if stripe_width > 0 {
+                window = stripe_width
+                    .saturating_mul(4)
+                    .clamp(stripe_width, DEFAULT_WINDOW.max(stripe_width));
+            }
+            // A short read (< requested window) means we hit the clamped end.
+            if read < window {
+                break;
+            }
+        }
+        buffer.seed_finish().map_err(|_| FsErrno::Io)?;
+        let seeded_len = buffer.len() as u64;
+        Ok((buffer, seeded_len))
     }
 
     async fn commit_handle(&self, fh: u64) -> Result<(), FsErrno> {
@@ -1152,10 +1208,34 @@ impl FsCore {
         let Some(buffer) = handle.staged_buffer() else {
             return Ok(());
         };
-        // Clone bytes out under the lock, then await the upload with no lock held.
-        let payload = buffer.lock().expect("handle lock poisoned").data.clone();
+        // Streaming-writeback v1: read only the temp-file PATH + logical length
+        // out under the lock (no whole-object clone), then stream from the temp
+        // file in stripe-sized chunks with NO handle lock held. The put path
+        // reads each stripe range from the file via a bounded pread, so at no
+        // point is the whole object resident in RAM on the commit path. An empty
+        // file (logical length 0) commits an empty object.
+        //
+        // TODO(streaming-writeback v2 / follow-up): overlap the network upload
+        // WITH the user's write() calls — true stream-as-you-write — so flush is
+        // not where the whole object is shipped. That dirty-stripe re-stream is a
+        // larger distributed change (write-window backpressure + re-stream of
+        // stripes dirtied after they were sent) and is explicitly out of scope
+        // here; v1 streams from the staged temp file at flush.
+        // Snapshot the temp-file PATH + authoritative logical length together,
+        // under one lock acquisition, so they describe the SAME atomically-read
+        // state. KSC keys the whole stripe loop off this `logical_len` (it does
+        // NOT re-stat the file), so a concurrent write() that extends or shrinks
+        // the temp file between this snapshot and the stream cannot change the
+        // committed object length: the commit always writes exactly `logical_len`
+        // bytes (short reads at a racing-shrink tail zero-fill rather than fail),
+        // and the inode size set below agrees with it. Recover from a poisoned
+        // lock rather than cascading a panic into the FUSE worker.
+        let (path, logical_len) = buffer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .commit_source();
         self.objects
-            .put_object(&self.bucket_id, &handle.key, &payload)
+            .put_object_from_path(&self.bucket_id, &handle.key, &path, logical_len)
             .await?;
         handle.set_dirty(false);
         // A commit is a new immutable object version — drop any cached stripes
@@ -1165,7 +1245,7 @@ impl FsCore {
         self.invalidate_key_both_tiers(&handle.key).await;
         if let Some(inode) = self.tables.inode(handle.ino) {
             let mut s = inode.state.write().expect("inode lock poisoned");
-            s.size = payload.len() as u64;
+            s.size = logical_len;
             s.size_loaded_at = Some(Instant::now());
         }
         Ok(())

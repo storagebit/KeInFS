@@ -805,20 +805,26 @@ impl ObjectClient {
         Ok(result)
     }
 
+    /// Stream an object whose payload lives in `path`, treating `logical_length`
+    /// as the AUTHORITATIVE object length rather than re-stat'ing the file.
+    ///
+    /// The caller (kfc commit) snapshots `(path, logical_length)` atomically under
+    /// the handle lock; passing that length in (instead of `std::fs::metadata`)
+    /// removes the commit-vs-concurrent-write TOCTOU: a concurrent extend of the
+    /// temp file cannot make the committed object longer than the snapshot, and a
+    /// concurrent shrink cannot make a per-stripe read hit EOF. Every per-stripe
+    /// read is clamped to `[0, logical_length)`; any short read at the tail (a
+    /// sparse hole or a racing truncate) is zero-filled rather than erroring, so
+    /// the streamed length always equals the snapshot length.
     pub async fn put_object_from_path(
         &mut self,
         bucket_id: &str,
         key: &str,
         path: &Path,
+        logical_length: u64,
     ) -> Result<ObjectPutResult, ObjectError> {
         self.invalidate_resolved_read(bucket_id, key);
-        let metadata = std::fs::metadata(path).map_err(|err| {
-            ObjectError::Metadata(format!(
-                "failed to stat object payload path {}: {err}",
-                path.display()
-            ))
-        })?;
-        let logical_length_bytes = metadata.len();
+        let logical_length_bytes = logical_length;
         let mut file = File::open(path).map_err(|err| {
             ObjectError::Metadata(format!(
                 "failed to open object payload path {}: {err}",
@@ -826,6 +832,12 @@ impl ObjectClient {
             ))
         })?;
         self.put_object_stream(bucket_id, key, logical_length_bytes, move |offset, len| {
+            // The per-stripe range is already clamped to the logical length by
+            // stripe_payload_range (it keys off logical_length_bytes), so `len`
+            // never exceeds the authoritative length. A short physical read here
+            // means the temp file is sparse or was concurrently truncated — fill
+            // the remainder with zeros so the streamed byte count matches the
+            // snapshot length instead of failing the whole commit.
             file.seek(SeekFrom::Start(offset)).map_err(|err| {
                 ObjectError::Metadata(format!(
                     "failed to seek object payload path {} to {}: {err}",
@@ -834,14 +846,22 @@ impl ObjectClient {
                 ))
             })?;
             let mut chunk = vec![0u8; len];
-            file.read_exact(&mut chunk).map_err(|err| {
-                ObjectError::Metadata(format!(
-                    "failed to read {} bytes from object payload path {} at {}: {err}",
-                    len,
-                    path.display(),
-                    offset
-                ))
-            })?;
+            let mut filled = 0usize;
+            while filled < len {
+                match file.read(&mut chunk[filled..]) {
+                    Ok(0) => break, // physical EOF before logical EOF => zero-fill tail
+                    Ok(n) => filled += n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        return Err(ObjectError::Metadata(format!(
+                            "failed to read {} bytes from object payload path {} at {}: {err}",
+                            len,
+                            path.display(),
+                            offset
+                        )));
+                    }
+                }
+            }
             Ok(chunk)
         })
         .await
@@ -3359,8 +3379,21 @@ pub async fn put_object_from_path_with_options(
     path: &Path,
     options: ObjectClientOptions,
 ) -> Result<ObjectPutResult, ObjectError> {
+    // Standalone CLI/test caller: there is no externally-held handle lock, so the
+    // file's on-disk length IS the authoritative length. Stat once here and pass
+    // it through the length-bounded path.
+    let logical_length = std::fs::metadata(path)
+        .map_err(|err| {
+            ObjectError::Metadata(format!(
+                "failed to stat object payload path {}: {err}",
+                path.display()
+            ))
+        })?
+        .len();
     let mut client = ObjectClient::connect_with_options(kms_endpoints, options).await?;
-    client.put_object_from_path(bucket_id, key, path).await
+    client
+        .put_object_from_path(bucket_id, key, path, logical_length)
+        .await
 }
 
 pub async fn get_object_single_stripe(
