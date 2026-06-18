@@ -17,8 +17,8 @@ QUICKSTART_TARGET_NETWORK_NAME="keinfs-target-fabric"
 QUICKSTART_MGMT_BRIDGE_NAME="keinfsmgmt0"
 QUICKSTART_TARGET_BRIDGE_NAME="keinfstgt0"
 QUICKSTART_CLOUD_IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
-QUICKSTART_FDB_CLIENT_DEB_URL="https://github.com/apple/foundationdb/releases/download/6.3.23/foundationdb-clients_6.3.23-1_amd64.deb"
-QUICKSTART_FDB_SERVER_DEB_URL="https://github.com/apple/foundationdb/releases/download/6.3.23/foundationdb-server_6.3.23-1_amd64.deb"
+QUICKSTART_FDB_CLIENT_DEB_URL="https://github.com/apple/foundationdb/releases/download/7.3.77/foundationdb-clients_7.3.77-1_amd64.deb"
+QUICKSTART_FDB_SERVER_DEB_URL="https://github.com/apple/foundationdb/releases/download/7.3.77/foundationdb-server_7.3.77-1_amd64.deb"
 
 die() {
   printf '%s\n' "$*" >&2
