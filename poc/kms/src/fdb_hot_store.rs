@@ -11,13 +11,13 @@ mod imp {
     };
     use crate::hot_store::HotMetadataStore;
     use crate::store::{
-        apply_fragment_repair, build_finalize_plans, clear_target_current_fragment_index,
-        decode_manifest_bytes, decode_write_intent_bytes, encode_manifest, encode_write_intent,
-        expected_fragment_count, fragment_plans_for_window, join_path, mark_successful_fragments,
-        normalize_object_key, normalize_write_intent, random_chunk_id,
-        write_target_current_fragment_index, BucketWriteContext, CommittedObjectWrite,
-        CommittedObjectWriteWindow, DeletedObject, DeletedObjectVersion, ReservedObjectWriteWindow,
-        StoredBucketWriteContext, TimedStoreResult,
+        apply_fragment_repair, auto_create_levels, build_finalize_plans,
+        clear_target_current_fragment_index, decode_manifest_bytes, decode_write_intent_bytes,
+        encode_manifest, encode_write_intent, expected_fragment_count, fragment_plans_for_window,
+        join_path, mark_successful_fragments, normalize_object_key, normalize_write_intent,
+        random_chunk_id, write_target_current_fragment_index, AutoCreateLevel, BucketWriteContext,
+        CommittedObjectWrite, CommittedObjectWriteWindow, DeletedObject, DeletedObjectVersion,
+        ReservedObjectWriteWindow, StoredBucketWriteContext, TimedStoreResult,
     };
     use foundationdb::{api::NetworkAutoStop, Database, FdbBindingError, RetryableTransaction};
     use futures_util::StreamExt;
@@ -204,23 +204,83 @@ mod imp {
                         let object_name = normalized_key.rsplit('/').next().ok_or_else(|| {
                             status_to_fdb(Status::invalid_argument("object key must not be empty"))
                         })?;
+                        // Self-heal a stale parent hint. The hint is sourced
+                        // from an in-memory cache in the service layer that is
+                        // NOT invalidated when the parent collection is deleted.
+                        // Trusting it blindly would commit the object under a
+                        // dangling parent id (the very orphaning the auto-create
+                        // walk exists to prevent). Re-validate IN THIS
+                        // TRANSACTION that the hinted parent's path still maps to
+                        // the hinted id via the path index (one point get); if it
+                        // does not, drop the hint and fall through to the
+                        // auto-create walk so the parent is re-materialized.
+                        let parent_hint = if let Some((parent_entry_id, parent_path)) = parent_hint {
+                            let index_id = trx
+                                .get(
+                                    &namespace_path_key(&intent.namespace_id, &parent_path),
+                                    false,
+                                )
+                                .await
+                                .map_err(FdbBindingError::from)?
+                                .map(|bytes| {
+                                    String::from_utf8(bytes.as_ref().to_vec()).map_err(|err| {
+                                        status_to_fdb(Status::internal(format!(
+                                            "namespace path index value is not valid utf-8: {err}"
+                                        )))
+                                    })
+                                })
+                                .transpose()?;
+                            if index_id.as_deref() == Some(parent_entry_id.as_str()) {
+                                Some((parent_entry_id, parent_path))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
                         let parent_context =
                             if let Some((parent_entry_id, parent_path)) = parent_hint {
                                 (parent_entry_id, parent_path)
                             } else if let Some((parent_key, _)) = normalized_key.rsplit_once('/') {
+                                // Slashed key (e.g. "a/b/c.txt"): the parent is a
+                                // collection "a/b" that may not exist yet. Walk
+                                // every path segment from the bucket root down and
+                                // auto-create (mkdir -p) any missing collection
+                                // entry IN THIS SAME TRANSACTION, so the object is
+                                // never orphaned under a phantom parent id. The
+                                // deepest collection becomes the parent.
+                                //
+                                // Each level is resolved via the namespace path
+                                // index with a single point get() (no range scan,
+                                // minimal read-conflict footprint; the index is
+                                // maintained in the same transactions that mutate
+                                // namespace entries — see namespace_path_key in
+                                // fdb_schema.rs). Walk shallow->deep so parents
+                                // exist before their children.
+                                let mut parent_id = bucket_entry_id.clone();
+                                let mut parent_path = bucket_path.clone();
+                                // Pure level synthesis (prefix accumulation,
+                                // level_path, deterministic id) lives in
+                                // store::auto_create_levels and is unit-tested;
+                                // the FDB reads/writes per level stay here.
+                                for level in
+                                    auto_create_levels(&bucket_entry_id, &bucket_path, parent_key)
                                 {
-                                    let parent_path = join_path(&bucket_path, parent_key);
-                                    // Resolve the parent via the namespace path
-                                    // index with a single point get(), instead
-                                    // of a full-namespace range scan that would
-                                    // dump every entry into the read-conflict
-                                    // set. The index is maintained in the same
-                                    // transactions that mutate namespace entries
-                                    // (see namespace_path_key in fdb_schema.rs).
-                                    let parent_index_key =
-                                        namespace_path_key(&intent.namespace_id, &parent_path);
-                                    let parent_entry_id = trx
-                                        .get(&parent_index_key, false)
+                                    let AutoCreateLevel {
+                                        segment,
+                                        prefix: _,
+                                        level_path,
+                                        deterministic_id,
+                                    } = level;
+                                    // `segment` is the bare directory-component
+                                    // name used below for the collection entry.
+                                    let level_index_key =
+                                        namespace_path_key(&intent.namespace_id, &level_path);
+                                    // Idempotency: reuse an existing collection id
+                                    // if the path index already maps this level;
+                                    // never overwrite an established entry.
+                                    let existing_id = trx
+                                        .get(&level_index_key, false)
                                         .await
                                         .map_err(FdbBindingError::from)?
                                         .map(|bytes| {
@@ -233,13 +293,78 @@ mod imp {
                                             )
                                         })
                                         .transpose()?;
-                                    (
-                                        parent_entry_id.unwrap_or_else(|| {
-                                            format!("{bucket_entry_id}::{parent_key}")
-                                        }),
-                                        parent_path,
-                                    )
+                                    let level_id = if let Some(id) = existing_id {
+                                        // Idempotent reuse is only safe if the
+                                        // resolved entry is directory-like. The
+                                        // path index is shared across bucket,
+                                        // collection AND object entries, so a
+                                        // prior object committed at this exact
+                                        // path (a file named like a directory
+                                        // component) would otherwise be reused
+                                        // as a parent, nesting an object under
+                                        // another object. Load the owning entry
+                                        // (one extra point get per reused level,
+                                        // still bounded by path depth) and
+                                        // reject if it is an Object.
+                                        let entry_bytes = trx
+                                            .get(
+                                                &namespace_entry_key(&intent.namespace_id, &id),
+                                                false,
+                                            )
+                                            .await
+                                            .map_err(FdbBindingError::from)?;
+                                        if let Some(entry_bytes) = entry_bytes {
+                                            let entry = serde_json::from_slice::<NamespaceDomainEntry>(
+                                                entry_bytes.as_ref(),
+                                            )
+                                            .map_err(|err| {
+                                                status_to_fdb(Status::internal(format!(
+                                                    "failed to decode namespace entry JSON payload: {err}"
+                                                )))
+                                            })?;
+                                            if entry.kind == NamespaceEntryKind::Object as i32 {
+                                                return Err(status_to_fdb(
+                                                    Status::failed_precondition(format!(
+                                                        "cannot create object under non-directory path component {level_path}"
+                                                    )),
+                                                ));
+                                            }
+                                        }
+                                        id
+                                    } else {
+                                        // Deterministic id consistent with the
+                                        // previous synthesis: {bucket}::<prefix>.
+                                        let id = deterministic_id;
+                                        let collection = NamespaceDomainEntry {
+                                            entry_id: id.clone(),
+                                            namespace_id: intent.namespace_id.clone(),
+                                            parent_entry_id: parent_id.clone(),
+                                            name: segment,
+                                            // Collection is the directory-kind
+                                            // entry; kfc maps any non-Object kind
+                                            // to a directory.
+                                            kind: NamespaceEntryKind::Collection as i32,
+                                            path: level_path.clone(),
+                                            size_bytes: 0,
+                                        };
+                                        trx.set(
+                                            &namespace_entry_key(&intent.namespace_id, &id),
+                                            &serde_json::to_vec(&collection).map_err(|err| {
+                                                status_to_fdb(Status::internal(format!(
+                                                    "failed to encode namespace entry JSON payload: {err}"
+                                                )))
+                                            })?,
+                                        );
+                                        // Maintain the path -> entry_id index in
+                                        // the same transaction (mirrors the object
+                                        // entry persistence below).
+                                        trx.set(&level_index_key, id.as_bytes());
+                                        id
+                                    };
+                                    parent_id = level_id;
+                                    parent_path = level_path;
                                 }
+                                (parent_id, parent_path)
                             } else {
                                 (bucket_entry_id.clone(), bucket_path.clone())
                             };
@@ -703,6 +828,12 @@ mod imp {
                             name: object_name.clone(),
                             kind: NamespaceEntryKind::Object as i32,
                             path: join_path(&intent.parent_path, &object_name),
+                            // Denormalize at commit: the entry is persisted as
+                            // JSON and range-read by list_children, so the size
+                            // round-trips with no resolve-at-list. Overwrite (a
+                            // new committed version) re-runs this commit and
+                            // re-sets namespace_entry_key, refreshing size_bytes.
+                            size_bytes: manifest.logical_length_bytes,
                         };
                         let manifest_bytes = encode_manifest(&manifest);
                         store_blob(

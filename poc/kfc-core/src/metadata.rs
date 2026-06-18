@@ -132,6 +132,9 @@ impl MetadataClient {
         Ok(entries)
     }
 
+    /// Create a collection (directory) namespace entry as a child of
+    /// `parent_entry_id`. The recursive child listing surfaces it naturally on
+    /// the next `list_children`.
     pub async fn create_collection(
         &self,
         namespace_id: &str,
@@ -149,6 +152,7 @@ impl MetadataClient {
                     name: name.to_string(),
                     kind: NamespaceEntryKind::Collection as i32,
                     path: String::new(),
+                    size_bytes: 0,
                 }),
             },
         )))

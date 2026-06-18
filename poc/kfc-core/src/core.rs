@@ -263,30 +263,97 @@ impl FsCore {
         };
         let key = Self::child_key(&parent.key, &entry.name);
 
-        // Already known by entry_id?
+        // Already known by entry_id? This is the dominant steady-state path:
+        // once a directory is listed, every child has a by_entry mapping, so
+        // re-listings after the meta-cache TTL expires land here. It must adopt
+        // the denormalized listing size exactly like the by_key branch below,
+        // otherwise the freshly listed size_bytes is silently discarded and
+        // readdirplus keeps reporting a stale (or zero) size for the child.
         if let Some(existing) = self.tables.by_entry.get(&entry.entry_id).map(|e| *e) {
             if let Some(inode) = self.tables.inode(existing) {
-                return inode.snapshot();
+                let mut s = inode.state.write().expect("inode lock poisoned");
+                // Adopt the denormalized listing size when present; a nonzero
+                // object size is authoritative (skip the lazy resolve).
+                if matches!(kind, FileKind::RegularFile) && entry.size_bytes > 0 {
+                    s.size = entry.size_bytes;
+                    s.size_loaded_at = Some(Instant::now());
+                } else if matches!(kind, FileKind::RegularFile)
+                    && !Self::fresh(s.size_loaded_at)
+                    && !s.entry_id.starts_with("pending:")
+                {
+                    // size_bytes == 0 (pre-change/back-compat object) AND the
+                    // inode's size is not already fresh/authoritative: keep the
+                    // last-known size and re-arm the lazy resolve. Guarding on
+                    // freshness preserves a size just set by create()/write()/
+                    // truncate()/commit() — a stat of a just-created, not-yet-
+                    // flushed empty file must NOT re-arm a resolve (its entry_id
+                    // is still "pending:<key>" and resolve_object_size would error
+                    // with no manifest). Genuinely-stale 0s still re-resolve.
+                    s.size_loaded_at = None;
+                }
+                return s.clone();
             }
         }
-        // Known by key (e.g. entry_id changed via delete+recreate)?
+        // Known by key (e.g. entry_id changed via delete+recreate)? Reuse the
+        // by_key inode ONLY when both the existing inode and the incoming entry
+        // are RegularFile. Reusing across a kind change would retype a live inode
+        // in place (corrupting an open fd's kind/size); when kinds disagree, fall
+        // through to a fresh alloc so each kind keeps its own identity.
         if let Some(existing) = self.tables.by_key.get(&key).map(|e| *e) {
             if let Some(inode) = self.tables.inode(existing) {
-                let snapshot = {
-                    let mut s = inode.state.write().expect("inode lock poisoned");
-                    s.entry_id = entry.entry_id.clone();
-                    s.parent = parent.ino;
-                    s.name = entry.name.clone();
-                    s.kind = kind;
-                    s.size_loaded_at = None;
-                    s.children_loaded_at = None;
-                    s.clone()
-                };
-                self.tables.by_entry.insert(entry.entry_id, existing);
-                return snapshot;
+                let reuse = matches!(
+                    inode.state.read().expect("inode lock poisoned").kind,
+                    FileKind::RegularFile
+                ) && matches!(kind, FileKind::RegularFile);
+                if reuse {
+                    let snapshot = {
+                        let mut s = inode.state.write().expect("inode lock poisoned");
+                        // Drop a stale by_entry mapping (e.g. the "pending:<key>"
+                        // alias create() installed) before relinking to the real
+                        // entry_id; otherwise remove_inode (which only clears the
+                        // CURRENT entry_id) leaks the old alias, which could later
+                        // resolve to a reused inode.
+                        let old_entry_id = std::mem::replace(&mut s.entry_id, entry.entry_id.clone());
+                        if !old_entry_id.is_empty() && old_entry_id != entry.entry_id {
+                            self.tables.by_entry.remove(&old_entry_id);
+                        }
+                        s.parent = parent.ino;
+                        s.name = entry.name.clone();
+                        s.kind = kind;
+                        // Adopt the denormalized listing size when present; a nonzero
+                        // object size is authoritative (skip the lazy resolve).
+                        if entry.size_bytes > 0 {
+                            s.size = entry.size_bytes;
+                            s.size_loaded_at = Some(Instant::now());
+                        } else if !Self::fresh(s.size_loaded_at) {
+                            // size_bytes == 0 and not freshly authoritative:
+                            // re-arm the lazy resolve (back-compat object).
+                            s.size_loaded_at = None;
+                        }
+                        s.children_loaded_at = None;
+                        s.clone()
+                    };
+                    self.tables.by_entry.insert(entry.entry_id, existing);
+                    return snapshot;
+                }
             }
         }
-        // Brand new.
+        // Brand new. KMS denormalizes the object byte length into the listing
+        // (size_bytes), so readdirplus reports the real size with no per-file
+        // ResolveObjectRead. A nonzero size on an object is authoritative ->
+        // mark it fresh so getattr/refresh_file_size skip the resolve.
+        // size_bytes == 0 (dir, or an object committed before this field
+        // existed) keeps size_loaded_at: None so refresh_file_size still
+        // resolves lazily (back-compat).
+        let is_file = matches!(kind, FileKind::RegularFile);
+        let size_loaded_at = if is_file && entry.size_bytes > 0 {
+            Some(Instant::now())
+        } else {
+            None
+        };
+        // Defensively zero the size for non-files so a directory can never carry
+        // a bogus size locally, regardless of what KMS puts in size_bytes.
+        let size = if is_file { entry.size_bytes } else { 0 };
         let ino = self.tables.alloc_ino();
         let state = InodeState {
             ino,
@@ -295,13 +362,32 @@ impl FsCore {
             entry_id: entry.entry_id,
             key,
             kind,
-            size: 0,
-            size_loaded_at: None,
+            size,
+            size_loaded_at,
             children_loaded_at: None,
         };
         let snapshot = state.clone();
         self.tables.insert_inode(Inode::new(state));
         snapshot
+    }
+
+    async fn refresh_file_size(&self, ino: u64) -> Result<InodeState, FsErrno> {
+        let node = self.snapshot(ino)?;
+        if !matches!(node.kind, FileKind::RegularFile) || Self::fresh(node.size_loaded_at) {
+            return Ok(node);
+        }
+        let size = self
+            .metadata
+            .resolve_object_size(&self.bucket_id, &node.key)
+            .await
+            .map_err(|err| crate::error::classify(&*err))?;
+        if let Some(inode) = self.tables.inode(ino) {
+            let mut s = inode.state.write().expect("inode lock poisoned");
+            s.size = size;
+            s.size_loaded_at = Some(Instant::now());
+            return Ok(s.clone());
+        }
+        Err(FsErrno::NoEntry)
     }
 
     fn prune_missing_children(&self, parent_ino: u64, live_entry_ids: &HashSet<String>) {
@@ -333,28 +419,8 @@ impl FsCore {
         }
     }
 
-    async fn refresh_file_size(&self, ino: u64) -> Result<InodeState, FsErrno> {
-        let node = self.snapshot(ino)?;
-        if !matches!(node.kind, FileKind::RegularFile) || Self::fresh(node.size_loaded_at) {
-            return Ok(node);
-        }
-        let size = self
-            .metadata
-            .resolve_object_size(&self.bucket_id, &node.key)
-            .await
-            .map_err(|err| crate::error::classify(&*err))?;
-        if let Some(inode) = self.tables.inode(ino) {
-            let mut s = inode.state.write().expect("inode lock poisoned");
-            s.size = size;
-            s.size_loaded_at = Some(Instant::now());
-            return Ok(s.clone());
-        }
-        Err(FsErrno::NoEntry)
-    }
-
     async fn list_children(&self, parent: &InodeState) -> Result<Vec<InodeState>, FsErrno> {
         Self::ensure_dir(parent)?;
-        // Fresh cache path: gather children from the table without a round-trip.
         if Self::fresh(parent.children_loaded_at) {
             let mut nodes: Vec<InodeState> = self
                 .tables
@@ -368,13 +434,13 @@ impl FsCore {
             nodes.sort_by(|a, b| a.name.cmp(&b.name));
             return Ok(nodes);
         }
-
         let entries = self
             .metadata
             .list_children_all(&self.namespace_id, &parent.entry_id, 256)
             .await
             .map_err(|err| crate::error::classify(&*err))?;
-        let live: HashSet<String> = entries.iter().map(|e| e.entry_id.clone()).collect();
+        let live: std::collections::HashSet<String> =
+            entries.iter().map(|e| e.entry_id.clone()).collect();
         self.prune_missing_children(parent.ino, &live);
         let mut nodes = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -484,6 +550,9 @@ impl FsCore {
         Self::ensure_dir(&self.snapshot(ino)?)
     }
 
+    /// Create a directory by persisting a real collection namespace entry as a
+    /// child of `parent`'s namespace entry. The recursive child listing surfaces
+    /// it naturally on the next `list_children`.
     pub async fn mkdir(&self, parent: u64, name: &str, _mode: u32) -> Result<Attr, FsErrno> {
         let parent_node = self.snapshot(parent)?;
         Self::ensure_dir(&parent_node)?;
@@ -905,11 +974,7 @@ impl FsCore {
                     sink.inval_inode(ino);
                 }
             }
-            let parent_key = event
-                .key
-                .rsplit_once('/')
-                .map(|(p, _)| p)
-                .unwrap_or("");
+            let parent_key = event.key.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
             if let Some(parent_ino) = self.tables.by_key.get(parent_key).map(|e| *e) {
                 self.mark_children_stale(parent_ino, &sink);
             }
@@ -953,3 +1018,4 @@ fn object_client_pool_size() -> usize {
         .map(|p| p.get().clamp(OBJECT_CLIENT_POOL_MIN, OBJECT_CLIENT_POOL_MAX))
         .unwrap_or(OBJECT_CLIENT_POOL_MIN)
 }
+

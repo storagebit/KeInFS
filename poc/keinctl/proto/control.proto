@@ -129,6 +129,9 @@ message NamespaceDomainEntry {
   string name = 4;
   NamespaceEntryKind kind = 5;
   string path = 6;
+  // Object byte length, denormalized at commit so listings carry size
+  // without a per-object resolve. 0 for directories/collections or unknown.
+  uint64 size_bytes = 7;
 }
 
 message ShardMapEntry {

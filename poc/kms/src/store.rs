@@ -891,6 +891,8 @@ impl KmsStore {
                         name: bucket.bucket_id.clone(),
                         kind: keinctl::proto::NamespaceEntryKind::Bucket as i32,
                         path: join_path(&parent_entry.path, &bucket.bucket_id),
+                        // Bucket is a directory-kind entry; size_bytes is unused.
+                        size_bytes: 0,
                     };
                     let bucket_context = StoredBucketWriteContext {
                         bucket: bucket.clone(),
@@ -2623,6 +2625,56 @@ pub(crate) fn join_path(prefix: &str, name: &str) -> String {
     }
 }
 
+/// One level of the auto-create (mkdir -p) walk for a slashed object key.
+///
+/// `segment` is the bare path component; `prefix` is the accumulated
+/// bucket-relative prefix shallow->deep (e.g. "a", then "a/b"); `level_path`
+/// is the absolute namespace path of the collection at this level
+/// (`join_path(bucket_path, prefix)`); `deterministic_id` is the id synthesized
+/// when the level does not already exist in the path index
+/// (`{bucket_entry_id}::<prefix>`). The actual id used at commit time is the
+/// existing path-index id when present, else `deterministic_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutoCreateLevel {
+    pub segment: String,
+    pub prefix: String,
+    pub level_path: String,
+    pub deterministic_id: String,
+}
+
+/// Pure synthesis of the auto-create walk levels for `parent_key` (the object
+/// key with its trailing object name stripped), ordered shallow->deep so that
+/// each parent is materialized before its children. Empty segments (from
+/// leading/duplicate slashes) are skipped, matching the FDB walk in
+/// `FdbHotStore::prepare_and_create_write_intent`.
+pub(crate) fn auto_create_levels(
+    bucket_entry_id: &str,
+    bucket_path: &str,
+    parent_key: &str,
+) -> Vec<AutoCreateLevel> {
+    let mut levels = Vec::new();
+    let mut prefix = String::new();
+    for segment in parent_key.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if prefix.is_empty() {
+            prefix = segment.to_string();
+        } else {
+            prefix = format!("{prefix}/{segment}");
+        }
+        let level_path = join_path(bucket_path, &prefix);
+        let deterministic_id = format!("{bucket_entry_id}::{prefix}");
+        levels.push(AutoCreateLevel {
+            segment: segment.to_string(),
+            prefix: prefix.clone(),
+            level_path,
+            deterministic_id,
+        });
+    }
+    levels
+}
+
 #[cfg(test)]
 mod tests {
     use super::{apply_fragment_repair, build_finalize_plans_for_reservations};
@@ -2776,5 +2828,68 @@ mod tests {
         let new_finalize = build_finalize_plans_for_reservations(&intent, &["res-new".to_string()])
             .expect("new reservation finalize plan");
         assert!(new_finalize.is_empty());
+    }
+
+    #[test]
+    fn auto_create_levels_threads_prefix_path_and_deterministic_id_shallow_to_deep() {
+        // Object key "a/b/c.txt" under bucket "buck" whose entry id is
+        // "buck-eid" and whose namespace path is "tenant/buck". The parent key
+        // (object name stripped) is "a/b".
+        let levels = super::auto_create_levels("buck-eid", "tenant/buck", "a/b");
+        let triples: Vec<(String, String, String)> = levels
+            .iter()
+            .map(|l| {
+                (
+                    l.prefix.clone(),
+                    l.level_path.clone(),
+                    l.deterministic_id.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            triples,
+            vec![
+                (
+                    "a".to_string(),
+                    "tenant/buck/a".to_string(),
+                    "buck-eid::a".to_string(),
+                ),
+                (
+                    "a/b".to_string(),
+                    "tenant/buck/a/b".to_string(),
+                    "buck-eid::a/b".to_string(),
+                ),
+            ],
+        );
+        // Segments preserved bare for the entry name.
+        assert_eq!(levels[0].segment, "a");
+        assert_eq!(levels[1].segment, "b");
+    }
+
+    #[test]
+    fn auto_create_levels_root_bucket_path_has_no_leading_slash() {
+        // Bucket sitting at the namespace root (empty bucket_path): level_path
+        // must be the bare prefix, not "/a".
+        let levels = super::auto_create_levels("buck-eid", "", "a/b");
+        assert_eq!(levels[0].level_path, "a");
+        assert_eq!(levels[1].level_path, "a/b");
+    }
+
+    #[test]
+    fn auto_create_levels_skips_empty_segments() {
+        // Leading and duplicate slashes must not synthesize empty levels,
+        // matching the FDB walk's `segment.is_empty()` skip.
+        let levels = super::auto_create_levels("buck-eid", "buck", "/a//b/");
+        let prefixes: Vec<String> = levels.iter().map(|l| l.prefix.clone()).collect();
+        assert_eq!(prefixes, vec!["a".to_string(), "a/b".to_string()]);
+    }
+
+    #[test]
+    fn auto_create_levels_single_level() {
+        let levels = super::auto_create_levels("buck-eid", "buck", "a");
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].prefix, "a");
+        assert_eq!(levels[0].level_path, "buck/a");
+        assert_eq!(levels[0].deterministic_id, "buck-eid::a");
     }
 }

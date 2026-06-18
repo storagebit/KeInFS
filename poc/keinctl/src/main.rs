@@ -1070,6 +1070,7 @@ async fn run_namespace_command(
                         name: args.name.clone(),
                         kind: namespace_entry_kind_from_arg(args.kind.clone()) as i32,
                         path: String::new(),
+                        size_bytes: 0,
                     }),
                 })),
             )
