@@ -37,8 +37,16 @@ const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TARGET_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const TARGET_SAME_PLAN_RETRY_ATTEMPTS: usize = 2;
 const TARGET_SAME_PLAN_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+/// Ceiling on how long a KP2 429 `Retry-After` (or computed exponential backoff)
+/// may stall a same-target retry. A misbehaving or hostile target cannot park a
+/// write task for longer than this.
+const TARGET_RETRY_BACKOFF_CEILING: Duration = Duration::from_secs(3);
 pub const DEFAULT_WRITE_WINDOW_MAX_STRIPES: usize = 4096;
 pub const DEFAULT_WRITE_WINDOW_INFLIGHT_STRIPES: usize = 16;
+/// Additive-increase step (in permits) applied to the adaptive write limiter
+/// after a batch completes with no 429 observed, until it recovers to the
+/// configured ceiling.
+const ADAPTIVE_INFLIGHT_RECOVERY_STEP: usize = 1;
 const KMS_GRPC_INITIAL_STREAM_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 const KMS_GRPC_INITIAL_CONNECTION_WINDOW_BYTES: u32 = 256 * 1024 * 1024;
 pub const DEFAULT_KMS_GRPC_MAX_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
@@ -72,6 +80,43 @@ impl fmt::Display for ObjectError {
 }
 
 impl std::error::Error for ObjectError {}
+
+impl ObjectError {
+    /// Extract the KP2 429 backpressure signal from a data-plane error, if any.
+    /// Only `ObjectError::Data` wraps a `ClientError` that can carry the
+    /// `x-kp2-*` headers KST emits on a 429; every other variant yields the
+    /// empty (non-rate-limited) signal.
+    fn rate_limit_signal(&self) -> RateLimitSignal {
+        match self {
+            Self::Data(err) => RateLimitSignal::from_client_error(err),
+            _ => RateLimitSignal::default(),
+        }
+    }
+}
+
+/// Structured KP2 429 backpressure signal pulled off a `ClientError` before it
+/// is flattened to a log string. Carrying these fields (rather than the message
+/// alone) lets the retry path honor `Retry-After` and lets the adaptive limiter
+/// shrink toward the target's advertised `max-in-flight`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RateLimitSignal {
+    rate_limited: bool,
+    retry_after_ms: Option<u64>,
+    limit_max_inflight: Option<usize>,
+}
+
+impl RateLimitSignal {
+    fn from_client_error(err: &ClientError) -> Self {
+        if !err.is_rate_limited() {
+            return Self::default();
+        }
+        Self {
+            rate_limited: true,
+            retry_after_ms: err.retry_after_ms(),
+            limit_max_inflight: err.limit_max_inflight(),
+        }
+    }
+}
 
 impl From<ClientError> for ObjectError {
     fn from(value: ClientError) -> Self {
@@ -168,6 +213,10 @@ pub struct ObjectClient {
     session_options: TargetSessionOptions,
     write_window_max_stripes: usize,
     write_window_inflight_stripes: usize,
+    /// Adaptive concurrency gate for fragment writes (KP2 429 backpressure).
+    /// Shared (`Arc`) so the per-fragment write tasks spawned inside
+    /// `write_prepared_stripe_batch_with_sessions` hold permits across the await.
+    write_inflight_limiter: Arc<AdaptiveWriteLimiter>,
 }
 
 #[derive(Debug)]
@@ -175,6 +224,44 @@ struct FragmentWriteFailure {
     stripe_index: u32,
     fragment_index: u32,
     message: String,
+    /// True when the underlying KST replied HTTP 429 (KP2 backpressure).
+    rate_limited: bool,
+    /// `x-kp2-retry-after-ms` value, when the target advertised one.
+    retry_after_ms: Option<u64>,
+    /// `x-kp2-limit-max-in-flight` value, used to shrink the adaptive limiter.
+    limit_max_inflight: Option<usize>,
+}
+
+impl FragmentWriteFailure {
+    /// Build a failure carrying a structured 429 signal alongside the log
+    /// message. Used at every wrap site so retry/backpressure logic can inspect
+    /// the signal instead of re-parsing the flattened message.
+    fn new(
+        stripe_index: u32,
+        fragment_index: u32,
+        message: String,
+        signal: RateLimitSignal,
+    ) -> Self {
+        Self {
+            stripe_index,
+            fragment_index,
+            message,
+            rate_limited: signal.rate_limited,
+            retry_after_ms: signal.retry_after_ms,
+            limit_max_inflight: signal.limit_max_inflight,
+        }
+    }
+
+    /// Build a failure with no rate-limit signal (e.g. join errors, length
+    /// mismatches) — the common case where there is no `ClientError` to inspect.
+    fn plain(stripe_index: u32, fragment_index: u32, message: String) -> Self {
+        Self::new(
+            stripe_index,
+            fragment_index,
+            message,
+            RateLimitSignal::default(),
+        )
+    }
 }
 
 #[derive(Default)]
@@ -679,6 +766,9 @@ impl ObjectClient {
             session_options,
             write_window_max_stripes: options.write_window_max_stripes,
             write_window_inflight_stripes: options.write_window_inflight_stripes,
+            write_inflight_limiter: Arc::new(AdaptiveWriteLimiter::new(
+                options.write_window_inflight_stripes,
+            )),
         })
     }
 
@@ -887,6 +977,7 @@ impl ObjectClient {
                         session_snapshot,
                         &intent_id,
                         prepared_batch,
+                        Arc::clone(&self.write_inflight_limiter),
                     );
 
                     let batch_write = if next_batch_len > 0 {
@@ -1999,6 +2090,7 @@ impl ObjectClient {
             intent_id,
             plans,
             fragments,
+            Arc::clone(&self.write_inflight_limiter),
         )
         .await
     }
@@ -2037,7 +2129,21 @@ impl ObjectClient {
             pending_failures = retry_failures;
 
             if !pending_failures.is_empty() && attempt + 1 < TARGET_SAME_PLAN_RETRY_ATTEMPTS {
-                sleep(TARGET_SAME_PLAN_RETRY_BACKOFF).await;
+                // Honor the MAX 429 Retry-After across this batch's rate-limited
+                // failures (clamped); fall back to a capped exponential backoff
+                // when no target asked for a specific pause.
+                //
+                // Note: with TARGET_SAME_PLAN_RETRY_ATTEMPTS == 2 only one backoff
+                // sleep fires (attempt == 0), so the `<< attempt` exponential
+                // growth is dormant today; it is retained (and unit-tested) so the
+                // backoff scales correctly if the attempt count is raised.
+                let backoff = compute_retry_backoff(
+                    &pending_failures,
+                    attempt as u32,
+                    TARGET_SAME_PLAN_RETRY_BACKOFF,
+                    TARGET_RETRY_BACKOFF_CEILING,
+                );
+                sleep(backoff).await;
             }
         }
         result.failures = pending_failures;
@@ -2188,6 +2294,7 @@ async fn write_fragment_plans_with_sessions(
     intent_id: &str,
     plans: &[FragmentPlan],
     fragments: &[Vec<u8>],
+    write_inflight_limiter: Arc<AdaptiveWriteLimiter>,
 ) -> Result<(Vec<FragmentWriteFailure>, RequestPhaseTimes), ObjectError> {
     let mut writes = JoinSet::new();
     for plan in plans {
@@ -2216,20 +2323,30 @@ async fn write_fragment_plans_with_sessions(
         let stripe_index = plan.stripe_index;
         let granule_index = plan.granule_index;
         let generation = plan.generation;
+        // Honor the shared adaptive gate on the same-target RETRY path too: a 429
+        // that shrank the gate to 1 must still bound this fan-out. Acquire a
+        // permit BEFORE spawning; it moves into the task and is released on
+        // completion (success or error).
+        let permit = write_inflight_limiter.acquire().await;
         writes.spawn(async move {
+            let _permit = permit;
             data_rpc(
                 "target write",
                 TARGET_IO_TIMEOUT,
                 session.write_chunk(chunk_id, granule_index, generation, fragment),
             )
             .await
-            .map_err(|err| FragmentWriteFailure {
-                stripe_index,
-                fragment_index,
-                message: format!(
-                    "fragment {} target {} endpoint {} failed: {}",
-                    fragment_index, target_id, endpoint, err
-                ),
+            .map_err(|err| {
+                let signal = err.rate_limit_signal();
+                FragmentWriteFailure::new(
+                    stripe_index,
+                    fragment_index,
+                    format!(
+                        "fragment {} target {} endpoint {} failed: {}",
+                        fragment_index, target_id, endpoint, err
+                    ),
+                    signal,
+                )
             })
         });
     }
@@ -2239,23 +2356,63 @@ async fn write_fragment_plans_with_sessions(
         match result {
             Ok(Ok(phases)) => add_request_phase_times(&mut phase_totals, &phases),
             Ok(Err(err)) => failures.push(err),
-            Err(err) => failures.push(FragmentWriteFailure {
-                stripe_index: u32::MAX,
-                fragment_index: u32::MAX,
-                message: format!(
+            Err(err) => failures.push(FragmentWriteFailure::plain(
+                u32::MAX,
+                u32::MAX,
+                format!(
                     "object write worker task failed before completing a fragment write: {}",
                     err
                 ),
-            }),
+            )),
         }
     }
+    // Feed the shared gate from the retry path as well so 429s observed during
+    // retries shrink the client-wide inflight ceiling (and clean retries let it
+    // recover). Mirrors the primary batched path: only an all-clean batch grows
+    // the gate; a 429 shrinks it; a non-429 failure is a no-op (neither grow nor
+    // shrink) so a failing-but-not-rate-limited target is not nudged wider.
+    feed_inflight_limiter(&write_inflight_limiter, failures.iter());
     Ok((failures, phase_totals))
+}
+
+/// Drive the adaptive write gate from a completed batch's failures.
+///
+/// - Any 429 shrinks the gate toward the smallest advertised max-in-flight.
+/// - A fully clean batch (no failures of any kind) additively recovers it.
+/// - A batch with only non-429 failures is a no-op: a target failing for
+///   transport/join/length reasons is not healthy, so growing concurrency at it
+///   is counterproductive, and it asked for no specific backpressure.
+fn feed_inflight_limiter<'a, I>(limiter: &AdaptiveWriteLimiter, failures: I)
+where
+    I: Iterator<Item = &'a FragmentWriteFailure>,
+{
+    let mut observed_rate_limit = false;
+    let mut any_failure = false;
+    let mut advertised_inflight: Option<usize> = None;
+    for failure in failures {
+        any_failure = true;
+        if failure.rate_limited {
+            observed_rate_limit = true;
+            if let Some(limit) = failure.limit_max_inflight {
+                advertised_inflight = Some(match advertised_inflight {
+                    Some(existing) => existing.min(limit),
+                    None => limit,
+                });
+            }
+        }
+    }
+    if observed_rate_limit {
+        limiter.note_rate_limited(advertised_inflight);
+    } else if !any_failure {
+        limiter.note_success();
+    }
 }
 
 async fn write_prepared_stripe_batch_with_sessions(
     target_sessions: Arc<HashMap<String, TargetSession>>,
     intent_id: &str,
     prepared_batch: Vec<PreparedStripeWrite>,
+    write_inflight_limiter: Arc<AdaptiveWriteLimiter>,
 ) -> Result<PreparedStripeBatchWriteResult, ObjectError> {
     let endpoint_batches = build_endpoint_write_batches(intent_id, &prepared_batch)?;
     let mut writes = JoinSet::new();
@@ -2278,7 +2435,12 @@ async fn write_prepared_stripe_batch_with_sessions(
                 ))
             })?
             .clone();
+        // Acquire a permit BEFORE spawning so the fan-out is bounded by the
+        // adaptive gate. The permit moves into the task and is dropped (released)
+        // when the task finishes, on both the success and error paths.
+        let permit = write_inflight_limiter.acquire().await;
         writes.spawn(async move {
+            let _permit = permit;
             let write_started = Instant::now();
             let outcome = if batch.len() == 1 {
                 let mut item = batch.into_iter().next().expect("single-item batch");
@@ -2304,12 +2466,15 @@ async fn write_prepared_stripe_batch_with_sessions(
                         write_elapsed: write_started.elapsed(),
                         error: None,
                     },
-                    Err(err) => EndpointWriteBatchResult::Single {
-                        item,
-                        phases: RequestPhaseTimes::default(),
-                        write_elapsed: write_started.elapsed(),
-                        error: Some(err.to_string()),
-                    },
+                    Err(err) => {
+                        let signal = err.rate_limit_signal();
+                        EndpointWriteBatchResult::Single {
+                            item,
+                            phases: RequestPhaseTimes::default(),
+                            write_elapsed: write_started.elapsed(),
+                            error: Some((err.to_string(), signal)),
+                        }
+                    }
                 }
             } else {
                 let mut batch = batch;
@@ -2341,12 +2506,15 @@ async fn write_prepared_stripe_batch_with_sessions(
                         phases: reply.phases,
                         write_elapsed: write_started.elapsed(),
                     },
-                    Err(err) => EndpointWriteBatchResult::Packed {
-                        items: batch,
-                        reply: Err(err.to_string()),
-                        phases: RequestPhaseTimes::default(),
-                        write_elapsed: write_started.elapsed(),
-                    },
+                    Err(err) => {
+                        let signal = err.rate_limit_signal();
+                        EndpointWriteBatchResult::Packed {
+                            items: batch,
+                            reply: Err((err.to_string(), signal)),
+                            phases: RequestPhaseTimes::default(),
+                            write_elapsed: write_started.elapsed(),
+                        }
+                    }
                 }
             };
             Ok::<EndpointWriteBatchResult, ObjectError>(outcome)
@@ -2367,17 +2535,18 @@ async fn write_prepared_stripe_batch_with_sessions(
                 } => {
                     add_request_phase_times(&mut phase_totals, &phases);
                     write_elapsed += batch_elapsed;
-                    if let Some(message) = error {
+                    if let Some((message, signal)) = error {
                         record_batched_write_failure(
                             &mut failures_by_stripe,
-                            FragmentWriteFailure {
-                                stripe_index: item.stripe_index,
-                                fragment_index: item.fragment_index,
-                                message: format!(
+                            FragmentWriteFailure::new(
+                                item.stripe_index,
+                                item.fragment_index,
+                                format!(
                                     "fragment {} target {} endpoint {} failed: {}",
                                     item.fragment_index, item.target_id, item.endpoint, message
                                 ),
-                            },
+                                signal,
+                            ),
                         );
                     }
                 }
@@ -2396,10 +2565,10 @@ async fn write_prepared_stripe_batch_with_sessions(
                                 for item in items {
                                     record_batched_write_failure(
                                         &mut failures_by_stripe,
-                                        FragmentWriteFailure {
-                                            stripe_index: item.stripe_index,
-                                            fragment_index: item.fragment_index,
-                                            message: format!(
+                                        FragmentWriteFailure::plain(
+                                            item.stripe_index,
+                                            item.fragment_index,
+                                            format!(
                                                 "fragment {} target {} endpoint {} failed: packed write reply length {} did not match request length {}",
                                                 item.fragment_index,
                                                 item.target_id,
@@ -2407,7 +2576,7 @@ async fn write_prepared_stripe_batch_with_sessions(
                                                 reply.entries.len(),
                                                 item_count
                                             ),
-                                        },
+                                        ),
                                     );
                                 }
                                 continue;
@@ -2421,35 +2590,36 @@ async fn write_prepared_stripe_batch_with_sessions(
                                 });
                                 record_batched_write_failure(
                                     &mut failures_by_stripe,
-                                    FragmentWriteFailure {
-                                        stripe_index: item.stripe_index,
-                                        fragment_index: item.fragment_index,
-                                        message: format!(
+                                    FragmentWriteFailure::plain(
+                                        item.stripe_index,
+                                        item.fragment_index,
+                                        format!(
                                             "fragment {} target {} endpoint {} failed: {}",
                                             item.fragment_index,
                                             item.target_id,
                                             item.endpoint,
                                             detail
                                         ),
-                                    },
+                                    ),
                                 );
                             }
                         }
-                        Err(message) => {
+                        Err((message, signal)) => {
                             for item in items {
                                 record_batched_write_failure(
                                     &mut failures_by_stripe,
-                                    FragmentWriteFailure {
-                                        stripe_index: item.stripe_index,
-                                        fragment_index: item.fragment_index,
-                                        message: format!(
+                                    FragmentWriteFailure::new(
+                                        item.stripe_index,
+                                        item.fragment_index,
+                                        format!(
                                             "fragment {} target {} endpoint {} failed: {}",
                                             item.fragment_index,
                                             item.target_id,
                                             item.endpoint,
                                             message
                                         ),
-                                    },
+                                        signal,
+                                    ),
                                 );
                             }
                         }
@@ -2462,18 +2632,24 @@ async fn write_prepared_stripe_batch_with_sessions(
             Err(err) => {
                 record_batched_write_failure(
                     &mut failures_by_stripe,
-                    FragmentWriteFailure {
-                        stripe_index: u32::MAX,
-                        fragment_index: u32::MAX,
-                        message: format!(
+                    FragmentWriteFailure::plain(
+                        u32::MAX,
+                        u32::MAX,
+                        format!(
                             "object write worker task failed before completing a batched target write: {}",
                             err
                         ),
-                    },
+                    ),
                 );
             }
         }
     }
+
+    // Feed the adaptive gate: if any fragment in this batch hit a 429, shrink
+    // toward the smallest advertised max-in-flight; if the batch was fully clean,
+    // additively recover; if it failed for non-429 reasons, leave the gate alone
+    // (don't grow concurrency at an unhealthy target).
+    feed_inflight_limiter(&write_inflight_limiter, failures_by_stripe.values().flatten());
 
     let stripe_results = prepared_batch
         .into_iter()
@@ -2496,11 +2672,13 @@ enum EndpointWriteBatchResult {
         item: BatchedTargetWritePlan,
         phases: RequestPhaseTimes,
         write_elapsed: Duration,
-        error: Option<String>,
+        // (message, 429 signal) so the consumer can build a structured
+        // FragmentWriteFailure instead of just a string.
+        error: Option<(String, RateLimitSignal)>,
     },
     Packed {
         items: Vec<BatchedTargetWritePlan>,
-        reply: Result<kp2::PackedWriteReply, String>,
+        reply: Result<kp2::PackedWriteReply, (String, RateLimitSignal)>,
         phases: RequestPhaseTimes,
         write_elapsed: Duration,
     },
@@ -2773,6 +2951,212 @@ async fn read_plans_batched_with_sessions(
         phases: phase_totals,
         read_elapsed,
     })
+}
+
+/// Compute how long to sleep before the next same-target retry attempt.
+///
+/// Pure function so the backpressure math is unit-testable in isolation:
+/// - If any failure in `failures` carried a KP2 429 `Retry-After`, honor the
+///   MAX advertised delay across them (a target that asked for the longest
+///   pause gets it), clamped to `ceiling`.
+/// - Otherwise fall back to an exponential backoff seeded at `fallback`
+///   (`fallback << attempt`), also clamped to `ceiling`, so repeated transient
+///   failures back off instead of hammering at a fixed interval.
+///
+/// `attempt` is zero-based (0 for the first retry pause).
+fn compute_retry_backoff(
+    failures: &[FragmentWriteFailure],
+    attempt: u32,
+    fallback: Duration,
+    ceiling: Duration,
+) -> Duration {
+    let max_retry_after_ms = failures
+        .iter()
+        .filter(|failure| failure.rate_limited)
+        .filter_map(|failure| failure.retry_after_ms)
+        .max();
+    let backoff = match max_retry_after_ms {
+        Some(ms) => Duration::from_millis(ms),
+        None => {
+            let shift = attempt.min(16);
+            fallback
+                .checked_mul(1u32 << shift)
+                .unwrap_or(ceiling)
+        }
+    };
+    backoff.min(ceiling)
+}
+
+/// Pure adaptive-limit transition for the write inflight gate (AIMD-style).
+///
+/// `current` and `max` are the live and configured ceilings; the result is
+/// always clamped to `[1, max]` so the gate never deadlocks (>= 1) and never
+/// exceeds the operator-configured limit.
+fn adaptive_inflight_after_429(current: usize, max: usize, advertised: Option<usize>) -> usize {
+    let target = match advertised {
+        // Honor the target's advertised ceiling, but never grow past it here
+        // and never below 1.
+        Some(advertised) => advertised.min(current),
+        // No advertised ceiling: multiplicative decrease (halve).
+        None => current / 2,
+    };
+    target.clamp(1, max.max(1))
+}
+
+/// Additive-increase recovery for the write inflight gate after a clean batch.
+fn adaptive_inflight_after_success(current: usize, max: usize, step: usize) -> usize {
+    current.saturating_add(step).clamp(1, max.max(1))
+}
+
+/// Client-wide adaptive concurrency gate for fragment writes.
+///
+/// Scope: this is a single per-`ObjectClient` limiter, not per-target-endpoint.
+/// `write_prepared_stripe_batch_with_sessions` is a free function that fans out
+/// one task per *endpoint batch*, so a per-target gate would mean threading a
+/// keyed map of semaphores through every spawn site and the retry path. The spec
+/// permits a client-wide limiter; it is chosen here for minimal blast radius. A
+/// 429 from any target shrinks the shared gate, which is conservative (it also
+/// throttles healthy targets briefly) but safe and deadlock-free. Both the
+/// primary batched path and the same-target retry path
+/// (`write_fragment_plans_with_sessions`) acquire permits from and report 429s
+/// to this shared gate.
+///
+/// Mechanics: a `tokio::sync::Semaphore` carries the permit budget. tokio has no
+/// atomic "resize" primitive, so the limiter maintains a target ceiling plus a
+/// *forget debt* under a mutex:
+/// - Shrinking lowers `target` and forgets as many *available* permits as it can
+///   immediately (`try_acquire_many` + `forget`); permits that are checked out by
+///   in-flight tasks can't be forgotten yet, so the shortfall is recorded as
+///   `forget_debt`.
+/// - Every `acquire` first reconciles: it pays down the debt by forgetting freshly
+///   available permits before taking one for itself. This is what keeps a
+///   returned in-flight permit from overshooting a shrunken ceiling — the next
+///   acquirer absorbs it.
+/// - Growing raises `target`, first cancelling outstanding debt, then
+///   `add_permits` for any real surplus.
+///
+/// Invariants: `target` is always clamped to `[1, max]` (never deadlocks, never
+/// exceeds the configured ceiling); the limiter never forgets more permits than
+/// are available at the moment, so in-flight work is never starved. Permits are
+/// acquired before a task spawns and released (dropped) on completion — success
+/// or error — on BOTH the primary batched fan-out
+/// (`write_prepared_stripe_batch_with_sessions`) and the same-target retry
+/// fan-out (`write_fragment_plans_with_sessions`), and both paths feed the gate
+/// via `feed_inflight_limiter`.
+///
+/// Ceiling semantics: `max` is the only HARD ceiling — total issued permits is
+/// always `target + forget_debt <= max`, so in-flight work never exceeds `max`.
+/// The live shrunk `target` is a SOFT ceiling honored at acquire boundaries:
+/// after a shrink-with-debt where in-flight tasks then return their permits
+/// before any intervening acquire, `available_permits()` can transiently sit
+/// above `target` until the next `acquire()` (or a `note_success()`, which now
+/// pays down debt eagerly) reconciles it.
+struct AdaptiveWriteLimiter {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    max: usize,
+    state: Mutex<AdaptiveLimiterState>,
+}
+
+struct AdaptiveLimiterState {
+    /// Desired live ceiling (`[1, max]`).
+    target: usize,
+    /// Permits we still owe forgetting because they were checked out when a
+    /// shrink happened; paid down opportunistically as permits free up.
+    forget_debt: usize,
+}
+
+impl AdaptiveWriteLimiter {
+    fn new(initial: usize) -> Self {
+        let initial = initial.max(1);
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(initial)),
+            max: initial,
+            state: Mutex::new(AdaptiveLimiterState {
+                target: initial,
+                forget_debt: 0,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn current_limit(&self) -> usize {
+        self.state.lock().unwrap().target
+    }
+
+    /// Forget as many currently-available permits as the outstanding debt
+    /// allows. Caller holds `state`. Returns nothing; debt is decremented by the
+    /// number actually forgotten.
+    fn pay_forget_debt(&self, state: &mut AdaptiveLimiterState) {
+        if state.forget_debt == 0 {
+            return;
+        }
+        let available = self.semaphore.available_permits();
+        // Bound the request to both what is available and the configured ceiling
+        // so the `as u32` cast is provably in range regardless of future callers
+        // (`forget_debt` is bounded by `max` today, but make that explicit).
+        let forgettable = state.forget_debt.min(available).min(self.max);
+        debug_assert!(forgettable <= u32::MAX as usize);
+        if forgettable > 0 {
+            if let Ok(permits) = self.semaphore.try_acquire_many(forgettable as u32) {
+                permits.forget();
+                state.forget_debt -= forgettable;
+            }
+        }
+    }
+
+    /// Acquire one permit, held by the returned guard until it is dropped (on
+    /// task completion). Reconciles any pending shrink debt first so a permit
+    /// returned by a finished task cannot overshoot a shrunken ceiling. Never
+    /// fails unless the semaphore is closed, which this limiter never does.
+    async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        {
+            let mut state = self.state.lock().unwrap();
+            self.pay_forget_debt(&mut state);
+        }
+        Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .await
+            .expect("write inflight semaphore is never closed")
+    }
+
+    /// Shrink the live ceiling toward a 429's advertised max-in-flight (or
+    /// halve when none was advertised). Forgets available permits immediately and
+    /// records the rest as debt; never forgets more than are available, so
+    /// in-flight work is never wedged.
+    fn note_rate_limited(&self, advertised: Option<usize>) {
+        let mut state = self.state.lock().unwrap();
+        let next = adaptive_inflight_after_429(state.target, self.max, advertised);
+        if next < state.target {
+            state.forget_debt += state.target - next;
+            state.target = next;
+            self.pay_forget_debt(&mut state);
+        }
+    }
+
+    /// Additively recover the live ceiling toward the configured max after a
+    /// clean batch. Cancels outstanding shrink debt first (cheapest way to
+    /// re-grant capacity), then adds real permits for any remaining growth.
+    fn note_success(&self) {
+        let mut state = self.state.lock().unwrap();
+        // Reconcile any outstanding shrink debt first so permits returned by
+        // finished in-flight tasks (which can sit above the shrunken `target`
+        // until the next acquire) are reclaimed eagerly here rather than only at
+        // the next acquire(). This keeps the live ceiling closer to `target`
+        // between batches instead of relying solely on an acquire to reconcile.
+        self.pay_forget_debt(&mut state);
+        let next =
+            adaptive_inflight_after_success(state.target, self.max, ADAPTIVE_INFLIGHT_RECOVERY_STEP);
+        if next > state.target {
+            let mut grow = next - state.target;
+            let debt_cancelled = grow.min(state.forget_debt);
+            state.forget_debt -= debt_cancelled;
+            grow -= debt_cancelled;
+            if grow > 0 {
+                self.semaphore.add_permits(grow);
+            }
+            state.target = next;
+        }
+    }
 }
 
 fn record_batched_write_failure(
@@ -3350,6 +3734,7 @@ mod tests {
             session_options: TargetSessionOptions::default(),
             write_window_max_stripes: 1,
             write_window_inflight_stripes: 1,
+            write_inflight_limiter: Arc::new(AdaptiveWriteLimiter::new(1)),
         }
     }
 
@@ -3715,5 +4100,159 @@ mod tests {
             .encode_into(&payload, &mut expected)
             .expect("direct encode");
         assert_eq!(encoded.prepared_batch[0].fragments, expected);
+    }
+
+    // ---- KP2 429 backpressure: backoff + adaptive-limit math (Phase 3) ----
+
+    fn rate_limited_failure(retry_after_ms: Option<u64>) -> FragmentWriteFailure {
+        FragmentWriteFailure::new(
+            0,
+            0,
+            "rate limited".to_string(),
+            RateLimitSignal {
+                rate_limited: true,
+                retry_after_ms,
+                limit_max_inflight: None,
+            },
+        )
+    }
+
+    #[test]
+    fn retry_backoff_falls_back_to_exponential_when_no_429() {
+        let fallback = Duration::from_millis(50);
+        let ceiling = Duration::from_secs(3);
+        // Plain (non-429) failure: backoff is fallback << attempt.
+        let plain = vec![FragmentWriteFailure::plain(0, 0, "boom".to_string())];
+        assert_eq!(
+            compute_retry_backoff(&plain, 0, fallback, ceiling),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            compute_retry_backoff(&plain, 1, fallback, ceiling),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            compute_retry_backoff(&plain, 2, fallback, ceiling),
+            Duration::from_millis(200)
+        );
+        // Exponential growth saturates at the ceiling, never beyond.
+        assert_eq!(
+            compute_retry_backoff(&plain, 30, fallback, ceiling),
+            ceiling
+        );
+        // Empty batch behaves like the no-429 fallback path.
+        assert_eq!(
+            compute_retry_backoff(&[], 0, fallback, ceiling),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn retry_backoff_honors_max_retry_after_clamped() {
+        let fallback = Duration::from_millis(50);
+        let ceiling = Duration::from_secs(3);
+        // Takes the MAX retry-after across rate-limited failures (250 > 100).
+        let failures = vec![
+            rate_limited_failure(Some(100)),
+            rate_limited_failure(Some(250)),
+            // A plain failure in the mix is ignored by the 429 path.
+            FragmentWriteFailure::plain(0, 0, "boom".to_string()),
+        ];
+        assert_eq!(
+            compute_retry_backoff(&failures, 0, fallback, ceiling),
+            Duration::from_millis(250)
+        );
+        // A huge retry-after is clamped to the ceiling.
+        let absurd = vec![rate_limited_failure(Some(60_000))];
+        assert_eq!(compute_retry_backoff(&absurd, 0, fallback, ceiling), ceiling);
+        // 429 without a retry-after header falls through to the fallback (not 0).
+        let no_header = vec![rate_limited_failure(None)];
+        assert_eq!(
+            compute_retry_backoff(&no_header, 0, fallback, ceiling),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn adaptive_inflight_shrinks_on_429() {
+        // Advertised ceiling pulls the limit down to it.
+        assert_eq!(adaptive_inflight_after_429(16, 16, Some(4)), 4);
+        // Advertised >= current does not grow the live limit here.
+        assert_eq!(adaptive_inflight_after_429(8, 16, Some(12)), 8);
+        // No advertised ceiling => multiplicative halving.
+        assert_eq!(adaptive_inflight_after_429(16, 16, None), 8);
+        assert_eq!(adaptive_inflight_after_429(8, 16, None), 4);
+        // Floor is always >= 1, never 0.
+        assert_eq!(adaptive_inflight_after_429(1, 16, None), 1);
+        assert_eq!(adaptive_inflight_after_429(2, 16, Some(0)), 1);
+        assert_eq!(adaptive_inflight_after_429(1, 16, Some(0)), 1);
+    }
+
+    #[test]
+    fn adaptive_inflight_recovers_additively_to_max() {
+        // Additive increase by `step`, capped at the configured max.
+        assert_eq!(adaptive_inflight_after_success(4, 16, 1), 5);
+        assert_eq!(adaptive_inflight_after_success(15, 16, 1), 16);
+        assert_eq!(adaptive_inflight_after_success(16, 16, 1), 16);
+        // Larger step is clamped at max, never overshoots.
+        assert_eq!(adaptive_inflight_after_success(14, 16, 4), 16);
+        // Floor invariant holds even with a zero-ish max.
+        assert_eq!(adaptive_inflight_after_success(1, 1, 1), 1);
+    }
+
+    #[test]
+    fn adaptive_limiter_shrinks_then_recovers_without_deadlock() {
+        let limiter = AdaptiveWriteLimiter::new(8);
+        assert_eq!(limiter.current_limit(), 8);
+        assert_eq!(limiter.semaphore.available_permits(), 8);
+
+        // A 429 advertising max-in-flight 2 shrinks the gate to 2.
+        limiter.note_rate_limited(Some(2));
+        assert_eq!(limiter.current_limit(), 2);
+        assert_eq!(limiter.semaphore.available_permits(), 2);
+
+        // Shrinking never forgets more permits than are available: even an
+        // aggressive shrink leaves at least one permit so the gate cannot wedge.
+        limiter.note_rate_limited(Some(1));
+        assert_eq!(limiter.current_limit(), 1);
+        assert_eq!(limiter.semaphore.available_permits(), 1);
+
+        // Sustained success additively recovers toward the configured max (8).
+        for _ in 0..100 {
+            limiter.note_success();
+        }
+        assert_eq!(limiter.current_limit(), 8);
+        assert_eq!(limiter.semaphore.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn adaptive_limiter_shrink_does_not_lose_held_permits() {
+        let limiter = Arc::new(AdaptiveWriteLimiter::new(4));
+        // Hold two permits (as in-flight tasks would).
+        let held_a = limiter.acquire().await;
+        let held_b = limiter.acquire().await;
+        assert_eq!(limiter.semaphore.available_permits(), 2);
+
+        // Shrink toward 1 while two permits are checked out: only the 2 available
+        // permits can be forgotten immediately, so 1 unit of shrink becomes debt.
+        limiter.note_rate_limited(Some(1));
+        assert_eq!(limiter.current_limit(), 1);
+        assert_eq!(limiter.semaphore.available_permits(), 0);
+
+        // Releasing held permits returns them to the pool (held permits are never
+        // lost), temporarily overshooting the shrunken ceiling.
+        drop(held_a);
+        drop(held_b);
+        assert_eq!(limiter.semaphore.available_permits(), 2);
+
+        // The next acquire reconciles: it pays down the 1-unit debt before taking
+        // its own permit, so the effective ceiling settles back at the target (1).
+        let reconciled = limiter.acquire().await;
+        // One forgotten for the debt, one held by `reconciled` => 0 available.
+        assert_eq!(limiter.semaphore.available_permits(), 0);
+        drop(reconciled);
+        // Now exactly `target` (1) permit is available — ceiling honored, no deadlock.
+        assert_eq!(limiter.semaphore.available_permits(), 1);
+        assert_eq!(limiter.current_limit(), 1);
     }
 }
