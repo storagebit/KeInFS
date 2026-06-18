@@ -840,6 +840,42 @@ run_dependency_checks() {
     fi
   fi
 
+  # --- FUSE-over-io_uring support (runtime, optional kfc fast transport) ---
+  # The kfc io_uring backend (built with --features io-uring) needs Linux >= 6.14
+  # AND CONFIG_FUSE_IO_URING=y AND the fuse module's `enable_uring` param turned on.
+  # Probed the same way on Ubuntu and RHEL/Rocky (kernel config + sysfs param live in
+  # the same places); current RHEL/Rocky kernels (5.14/6.12) predate 6.14 -> OPT.
+  if (( ENABLE_FUSE )); then
+    local kver kmaj kmin krest fu_kok=0 fuse_iou_cfg="" enable_uring=""
+    kver=$(uname -r 2>/dev/null || echo 0.0)
+    kmaj=${kver%%.*}; krest=${kver#*.}; kmin=${krest%%.*}
+    [[ "${kmaj}" =~ ^[0-9]+$ ]] || kmaj=0
+    [[ "${kmin}" =~ ^[0-9]+$ ]] || kmin=0
+    if (( kmaj > 6 || (kmaj == 6 && kmin >= 14) )); then fu_kok=1; fi
+    # CONFIG_FUSE_IO_URING: prefer /boot/config-<rel> (Ubuntu + RHEL/Rocky), then /proc/config.gz.
+    if [[ -r "/boot/config-${kver}" ]]; then
+      fuse_iou_cfg=$(grep -E '^CONFIG_FUSE_IO_URING=' "/boot/config-${kver}" 2>/dev/null | head -1)
+    elif [[ -r /proc/config.gz ]] && command -v zcat >/dev/null 2>&1; then
+      fuse_iou_cfg=$(zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_FUSE_IO_URING=' | head -1)
+    fi
+    if [[ -r /sys/module/fuse/parameters/enable_uring ]]; then
+      enable_uring=$(cat /sys/module/fuse/parameters/enable_uring 2>/dev/null)
+    fi
+    if (( ! fu_kok )); then
+      record_row "kfc" "fuse-io_uring" "OPT" \
+        "runtime: needs Linux 6.14+ (have ${kver}); kfc falls back to /dev/fuse"
+    elif [[ "${fuse_iou_cfg}" != "CONFIG_FUSE_IO_URING=y" ]]; then
+      record_row "kfc" "fuse-io_uring" "OPT" \
+        "runtime: kernel ${kver} lacks CONFIG_FUSE_IO_URING=y; kfc uses /dev/fuse"
+    elif [[ "${enable_uring}" == "Y" || "${enable_uring}" == "1" ]]; then
+      record_row "kfc" "fuse-io_uring" "FOUND" \
+        "kernel ${kver}: FUSE_OVER_IO_URING on (build kfc --features io-uring)"
+    else
+      record_row "kfc" "fuse-io_uring" "OPT" \
+        "runtime: enable via 'echo Y >/sys/module/fuse/parameters/enable_uring' (param=${enable_uring:-unset})"
+    fi
+  fi
+
   # --- io_uring kernel support (runtime, required for kst data path) ---
   if [[ -e /proc/sys/kernel/io_uring_disabled ]]; then
     local iou
