@@ -21,11 +21,22 @@ kfc-core = { path = "../kfc-core" }
 # macFUSE). Enabling `macos-no-mount` is inert on Linux.
 fuser = { version = "0.17", features = ["macos-no-mount"] }
 libc = "0.2"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+# `sync` is needed for the tokio::sync::oneshot channel the io_uring backend
+# uses to bridge !Send compio futures to the tokio-spawned FsCore ops. The
+# oneshot Receiver is runtime-agnostic, so awaiting it inside compio is fine.
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+
+# Phase 5: the FUSE-over-io_uring backend (Linux kernel >= 6.14) drives
+# `fractal-fuse` (FUSE_OVER_IO_URING over the compio runtime). It is optional +
+# feature-gated and scoped to Linux: macOS never sees it (it is edition-2024 and
+# Linux-only), keeping the portable build green per FIRST_PRINCIPLES §1.
+[target.'cfg(target_os = "linux")'.dependencies]
+fractal-fuse = { version = "0.4", optional = true }
 
 [features]
 default = []
 # Phase 5: FUSE-over-io_uring backend (Linux kernel >= 6.14). Off by default;
-# selected at runtime only when the kernel advertises FUSE_OVER_IO_URING.
-io-uring = []
+# selected at runtime only when the kernel advertises FUSE_OVER_IO_URING. Pulls
+# in the (optional, Linux-only) `fractal-fuse` dependency.
+io-uring = ["dep:fractal-fuse"]
 isa-l-backend = ["kfc-core/isa-l-backend"]
