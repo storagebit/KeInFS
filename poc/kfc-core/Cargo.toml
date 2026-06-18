@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andreas Krause / storagebit
+#
+# kfc-core: the portable, transport-agnostic heart of the KeInFS FUSE client.
+# It contains NO dependency on any FUSE transport library (fuser / io_uring /
+# FUSE-T) and NO `#[cfg(target_os)]` gates: it is the "run anywhere" client
+# core that FIRST_PRINCIPLES §1 grants the client stack. All object bytes still
+# travel KP2-direct client<->KST via the KSC engine; gRPC stays KMS-only.
+[package]
+name = "kfc-core"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+async-nats = "0.39"
+bytes = "1"
+dashmap = "6"
+futures-util = "0.3"
+keinctl = { path = "../keinctl" }
+ksc = { path = "../ksc" }
+libc = "0.2"
+prost = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "macros"] }
+tonic = { version = "0.14", features = ["transport"] }
+
+[features]
+default = []
+# Optional ISA-L EC backend, forwarded to KSC (matches the rest of the tree).
+isa-l-backend = ["ksc/isa-l-backend"]

@@ -10,7 +10,10 @@ use std::time::Duration;
 
 const DEFAULT_KMS_ENDPOINT: &str = "http://127.0.0.1:50060";
 const DEFAULT_MOUNT_READ_COMPLETION_MODE: CompletionMode = CompletionMode::Interrupt;
-const DEFAULT_MOUNT_WRITE_COMPLETION_MODE: CompletionMode = CompletionMode::HotPoll;
+// KFC v2: default FUSE writeback to Interrupt. HotPoll busy-spins a tokio
+// worker (ksc client.rs:852), which starves the shared dispatch runtime; it is
+// opt-in for a dedicated latency-profile mount only.
+const DEFAULT_MOUNT_WRITE_COMPLETION_MODE: CompletionMode = CompletionMode::Interrupt;
 const DEFAULT_MODE_BENCH_READ_COMPLETION_MODE: CompletionMode = CompletionMode::Interrupt;
 const DEFAULT_MODE_BENCH_WRITE_COMPLETION_MODE: CompletionMode = CompletionMode::HotPoll;
 
@@ -20,6 +23,9 @@ pub(crate) enum Command {
     ModeBench(ModeBenchConfig),
 }
 
+// Without the `fuse` feature the `mount` subcommand is a stub, so these fields
+// are legitimately unread; keep the warning active for real (fuse) builds.
+#[cfg_attr(not(feature = "fuse"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct MountConfig {
     pub(crate) kms_endpoints: Vec<String>,

@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andreas Krause / storagebit
+#
+# kfc-transport: the FUSE transport shim. This is the ONLY crate that depends on
+# a concrete FUSE library. It maps the portable `kfc-core::FsCore` async ops to
+# a kernel backend chosen at runtime per OS:
+#   - Linux: FUSE-over-io_uring (Phase 5, feature `io-uring`) -> /dev/fuse (fuser)
+#   - macOS: FUSE-T (kext-less) -> macFUSE, both via fuser's `macos-no-mount`
+# Per FIRST_PRINCIPLES §1 the perf-critical, Linux-only backends stay behind
+# cfg/feature gates so the portable build never rots.
+[package]
+name = "kfc-transport"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[dependencies]
+kfc-core = { path = "../kfc-core" }
+# fuser 0.17 is pure-Rust on Linux (talks to /dev/fuse directly, no libfuse
+# link) and uses an external mounter on macOS via `macos-no-mount` (FUSE-T or
+# macFUSE). Enabling `macos-no-mount` is inert on Linux.
+fuser = { version = "0.17", features = ["macos-no-mount"] }
+libc = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[features]
+default = []
+# Phase 5: FUSE-over-io_uring backend (Linux kernel >= 6.14). Off by default;
+# selected at runtime only when the kernel advertises FUSE_OVER_IO_URING.
+io-uring = []
+isa-l-backend = ["kfc-core/isa-l-backend"]

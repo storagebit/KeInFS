@@ -108,6 +108,24 @@ pub struct ObjectGetResult {
     pub reconstructed: bool,
 }
 
+/// Result of a stripe-granular ranged read. `payload` covers `[offset,
+/// offset+payload.len())` of the object (clamped to the object length). Built
+/// by reading only the stripes the requested range touches, instead of
+/// materializing the whole object.
+#[derive(Clone, Debug)]
+pub struct RangedGetResult {
+    pub payload: Vec<u8>,
+    pub offset: u64,
+    pub object_length_bytes: u64,
+    pub manifest: ObjectVersionManifest,
+    pub ec_profile: EcProfile,
+    pub phases: ObjectPhaseTimes,
+    pub missing_fragments: usize,
+    pub data_fragment_reads: usize,
+    pub parity_fragment_reads: usize,
+    pub reconstructed: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct ObjectDeleteResult {
     pub deleted_versions: Vec<DeletedObjectVersion>,
@@ -1072,6 +1090,140 @@ impl ObjectClient {
         }
         .await;
         result
+    }
+
+    /// Stripe-granular ranged read: returns the object bytes in `[offset,
+    /// offset+len)` (clamped to the object length) by reading only the stripes
+    /// the range touches, rather than materializing the whole object. Built on
+    /// `read_single_stripe` + the uniform stripe geometry; no protocol change.
+    pub async fn get_object_range(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<RangedGetResult, ObjectError> {
+        let mut phases = ObjectPhaseTimes::default();
+        let (manifest, ec_profile) = if let Some(cached) = self.cached_resolved_read(bucket_id, key)
+        {
+            cached
+        } else {
+            let phase_started = Instant::now();
+            let mut kms = self.kms.client();
+            let resolved = control_rpc(
+                "KMS ResolveObjectRead",
+                kms.resolve_object_read(ResolveObjectReadRequest {
+                    bucket_id: bucket_id.to_string(),
+                    key: key.to_string(),
+                }),
+            )
+            .await?
+            .into_inner();
+            phases.kms_resolve = phase_started.elapsed();
+            let manifest = resolved.manifest.ok_or_else(|| {
+                ObjectError::Metadata("KMS ResolveObjectRead did not return manifest".to_string())
+            })?;
+            let ec_profile = resolved.ec_profile.ok_or_else(|| {
+                ObjectError::Metadata("KMS ResolveObjectRead did not return ec_profile".to_string())
+            })?;
+            self.cache_resolved_read(manifest.clone(), ec_profile.clone());
+            (manifest, ec_profile)
+        };
+
+        // Clamp the requested window to the object's logical length.
+        let object_len = manifest.logical_length_bytes;
+        let start = offset.min(object_len);
+        let end = offset.saturating_add(len).min(object_len);
+        let empty = |manifest: ObjectVersionManifest, ec_profile: EcProfile, phases| RangedGetResult {
+            payload: Vec::new(),
+            offset: start,
+            object_length_bytes: object_len,
+            manifest,
+            ec_profile,
+            phases,
+            missing_fragments: 0,
+            data_fragment_reads: 0,
+            parity_fragment_reads: 0,
+            reconstructed: false,
+        };
+        if end <= start {
+            return Ok(empty(manifest, ec_profile, phases));
+        }
+
+        // Whole-object payload-cache fast path: slice the window out of a cached
+        // full payload with zero target I/O. Never write a partial slice back —
+        // the payload cache is keyed whole-object.
+        if let Some(full) = self.cached_payload_read(&manifest) {
+            let lo = (start as usize).min(full.len());
+            let hi = (end as usize).min(full.len());
+            let mut result = empty(manifest, ec_profile, phases);
+            if lo < hi {
+                result.payload = full[lo..hi].to_vec();
+            }
+            return Ok(result);
+        }
+
+        if manifest.stripes.is_empty() {
+            return Err(ObjectError::Metadata(
+                "manifest has no stripes for a non-empty ranged read".to_string(),
+            ));
+        }
+
+        // read_single_stripe's reconstruct path needs the encoder prepared.
+        self.ensure_prepared_encoder(&ec_profile)?;
+
+        // Uniform stripe width W = data_fragments * fragment_bytes. Every stripe
+        // but the last is exactly W; read_single_stripe truncates each returned
+        // payload to that stripe's logical length, so we slice directly into it.
+        let stripe_width = stripe_logical_bytes(&ec_profile)? as u64;
+        if stripe_width == 0 {
+            return Err(ObjectError::Metadata(
+                "EC profile has a zero-width stripe geometry".to_string(),
+            ));
+        }
+        let (first_stripe, last_stripe) = range_to_stripe_indices(start, end, stripe_width);
+        if last_stripe >= manifest.stripes.len() {
+            return Err(ObjectError::Metadata(format!(
+                "ranged read [{start}, {end}) maps to stripe {last_stripe} but manifest carries {} stripes",
+                manifest.stripes.len()
+            )));
+        }
+
+        let mut out = Vec::with_capacity((end - start) as usize);
+        let mut missing_fragments = 0_usize;
+        let mut data_fragment_reads = 0_usize;
+        let mut parity_fragment_reads = 0_usize;
+        let mut reconstructed_any = false;
+
+        for stripe_index in first_stripe..=last_stripe {
+            let stripe = self
+                .read_single_stripe(bucket_id, key, &manifest, &ec_profile, stripe_index)
+                .await?;
+            add_object_phase_times(&mut phases, &stripe.phases);
+            missing_fragments += stripe.missing_fragments;
+            data_fragment_reads += stripe.data_fragment_reads;
+            parity_fragment_reads += stripe.parity_fragment_reads;
+            reconstructed_any |= stripe.reconstructed;
+
+            let (slice_start, slice_end) =
+                stripe_slice_bounds(start, end, stripe_index, stripe_width, stripe.payload.len());
+            if slice_start < slice_end {
+                out.extend_from_slice(&stripe.payload[slice_start..slice_end]);
+            }
+        }
+
+        Ok(RangedGetResult {
+            payload: out,
+            offset: start,
+            object_length_bytes: object_len,
+            manifest,
+            ec_profile,
+            phases,
+            missing_fragments,
+            data_fragment_reads,
+            parity_fragment_reads,
+            reconstructed: reconstructed_any,
+        })
     }
 
     pub async fn get_object_single_stripe(
@@ -2557,6 +2709,33 @@ fn stripe_logical_bytes(profile: &EcProfile) -> Result<usize, ObjectError> {
         })
 }
 
+/// Map a non-empty, length-clamped object byte range `[start, end)` to the
+/// inclusive span of stripe indices it touches, given the uniform stripe width.
+/// Caller guarantees `end > start` and `stripe_width > 0`.
+fn range_to_stripe_indices(start: u64, end: u64, stripe_width: u64) -> (usize, usize) {
+    let first = (start / stripe_width) as usize;
+    let last = ((end - 1) / stripe_width) as usize;
+    (first, last)
+}
+
+/// For one covered stripe, the `[lo, hi)` slice of its payload (already
+/// truncated to the stripe's logical length) that falls inside the requested
+/// object range `[start, end)`. Returns an empty slice if the range does not
+/// overlap this stripe's payload.
+fn stripe_slice_bounds(
+    start: u64,
+    end: u64,
+    stripe_index: usize,
+    stripe_width: u64,
+    payload_len: usize,
+) -> (usize, usize) {
+    let stripe_object_start = (stripe_index as u64) * stripe_width;
+    let payload_len = payload_len as u64;
+    let lo = start.saturating_sub(stripe_object_start).min(payload_len) as usize;
+    let hi = end.saturating_sub(stripe_object_start).min(payload_len) as usize;
+    (lo, hi)
+}
+
 fn stripe_payload_range(
     payload_len: usize,
     stripe_index: usize,
@@ -2708,6 +2887,36 @@ pub async fn get_object_single_stripe_with_options(
 ) -> Result<ObjectGetResult, ObjectError> {
     let mut client = ObjectClient::connect_with_options(kms_endpoints, options).await?;
     client.get_object_single_stripe(bucket_id, key).await
+}
+
+pub async fn get_object_range(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+    offset: u64,
+    len: u64,
+) -> Result<RangedGetResult, ObjectError> {
+    get_object_range_with_options(
+        kms_endpoints,
+        bucket_id,
+        key,
+        offset,
+        len,
+        ObjectClientOptions::default(),
+    )
+    .await
+}
+
+pub async fn get_object_range_with_options(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+    offset: u64,
+    len: u64,
+    options: ObjectClientOptions,
+) -> Result<RangedGetResult, ObjectError> {
+    let mut client = ObjectClient::connect_with_options(kms_endpoints, options).await?;
+    client.get_object_range(bucket_id, key, offset, len).await
 }
 
 pub async fn delete_object(
@@ -2955,6 +3164,62 @@ fn accumulate_target_request_phases(into: &mut ObjectPhaseTimes, request: &Reque
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- ranged-read stripe arithmetic (Phase 2 / get_object_range) ----
+
+    #[test]
+    fn range_to_stripe_indices_spans_boundaries() {
+        let w = 100u64;
+        // Whole first stripe.
+        assert_eq!(range_to_stripe_indices(0, 100, w), (0, 0));
+        // Range entirely inside stripe 1.
+        assert_eq!(range_to_stripe_indices(100, 200, w), (1, 1));
+        // Range crossing the 0/1 boundary.
+        assert_eq!(range_to_stripe_indices(50, 150, w), (0, 1));
+        // End exactly on a boundary stays in the lower stripe (exclusive end).
+        assert_eq!(range_to_stripe_indices(0, 100, w), (0, 0));
+        assert_eq!(range_to_stripe_indices(99, 100, w), (0, 0));
+        assert_eq!(range_to_stripe_indices(100, 101, w), (1, 1));
+        // Multi-stripe span.
+        assert_eq!(range_to_stripe_indices(50, 350, w), (0, 3));
+        // Single byte at the very start of stripe 2.
+        assert_eq!(range_to_stripe_indices(200, 201, w), (2, 2));
+    }
+
+    #[test]
+    fn stripe_slice_bounds_clamps_to_payload_and_range() {
+        let w = 100u64;
+        // First covered stripe (index 0): range starts mid-stripe.
+        assert_eq!(stripe_slice_bounds(50, 150, 0, w, 100), (50, 100));
+        // Interior/last covered stripe (index 1): range ends mid-stripe.
+        assert_eq!(stripe_slice_bounds(50, 150, 1, w, 100), (0, 50));
+        // Range fully inside a single interior stripe (index 1).
+        assert_eq!(stripe_slice_bounds(120, 180, 1, w, 100), (20, 80));
+        // Short last stripe: payload shorter than stripe width clamps hi.
+        assert_eq!(stripe_slice_bounds(300, 340, 3, w, 25), (0, 25));
+        // Stripe not overlapping the range yields an empty slice.
+        assert_eq!(stripe_slice_bounds(0, 50, 2, w, 100), (0, 0));
+    }
+
+    #[test]
+    fn stripe_slice_bounds_reassembles_a_full_object() {
+        // Object of 250 bytes, stripe width 100 => stripes [100,100,50].
+        let w = 100u64;
+        let stripes = [vec![1u8; 100], vec![2u8; 100], vec![3u8; 50]];
+        // Read [80, 230): stripe0[80..100] + stripe1[0..100] + stripe2[0..30].
+        let (start, end) = (80u64, 230u64);
+        let (first, last) = range_to_stripe_indices(start, end, w);
+        assert_eq!((first, last), (0, 2));
+        let mut out = Vec::new();
+        for s in first..=last {
+            let (lo, hi) = stripe_slice_bounds(start, end, s, w, stripes[s].len());
+            out.extend_from_slice(&stripes[s][lo..hi]);
+        }
+        assert_eq!(out.len(), 150);
+        assert_eq!(&out[..20], &[1u8; 20]);
+        assert_eq!(&out[20..120], &[2u8; 100]);
+        assert_eq!(&out[120..150], &[3u8; 30]);
+    }
 
     fn test_client_with_cache(shared_read_cache: SharedObjectMetadataCache) -> ObjectClient {
         ObjectClient {
