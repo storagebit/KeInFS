@@ -40,6 +40,43 @@ mod imp {
         mutation_guards: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
         owner_id: Arc<String>,
         allocation_shard_id: Arc<Option<String>>,
+        // Phase-2 (DESIGN_KAS_WRITE_SCALE.md §3 change #2/#4). When set, this
+        // instance holds the per-shard mutation lease for the whole leadership
+        // term instead of acquiring/releasing it per op, drops the per-op stamp
+        // read, and relies on the epoch fence (#3) for split-brain safety. The
+        // flag gates ONLY that behavior change; the epoch fence write/assert is
+        // always on (it is strictly stronger than the per-op stamp reload).
+        leader_resident_lease: bool,
+        // In-memory leadership term: the epoch this instance acquired and the
+        // wall-clock expiry of the held lease. `Some` only while we believe we
+        // are the shard leader under the leader-resident model; the background
+        // renewer keeps `expires_at_unix_ms` ahead of now and the foreground
+        // fence asserts `epoch` in every mutating txn. Cleared on step-down /
+        // lost renewal / observed epoch bump, which makes the instance stop
+        // serving mutations until it re-acquires.
+        leadership: Arc<tokio::sync::Mutex<Option<LeadershipTerm>>>,
+        // Phase-3 (change #7) deferred durable bin-member deletes. The lock-light
+        // claim pops the in-memory bin (authoritative) and defers the durable
+        // `reservation_bin_member_key` cleanup here instead of committing it per
+        // claim. These entries are write-only acceleration never read back into
+        // `state.bins` (every refresh clears bins), so deferral cannot affect
+        // claim correctness; the flush is opportunistic and best-effort.
+        deferred_bin_member_deletes: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+        // Optional handle to the runtime stats tree for fence/renewal
+        // observability (fenced-commit aborts, leader renew failures). `None` in
+        // unit construction; wired by `main` so the counters land under
+        // /run/keinfs/kas/<id>/.
+        stats: Option<Arc<crate::stats::KasStats>>,
+    }
+
+    /// One leadership term under the leader-resident lease model. `epoch` is the
+    /// fencing token this instance acquired; the foreground asserts it in every
+    /// mutating txn (the epoch fence). `lease_expires_at_unix_ms` is the durable
+    /// lease expiry we are renewing toward.
+    #[derive(Clone, Copy, Debug)]
+    struct LeadershipTerm {
+        epoch: u64,
+        lease_expires_at_unix_ms: u64,
     }
 
     #[derive(Default)]
@@ -63,6 +100,18 @@ mod imp {
     struct CoordinationLeaseRecord {
         owner_id: String,
         expires_at_unix_ms: u64,
+        /// Monotonic per-lease fencing token (DESIGN_KAS_WRITE_SCALE.md §3/§4
+        /// change #3, the epoch fence). Bumped ONLY on a *new* grant (an
+        /// absent/expired lease, or one taken from another owner) — never on a
+        /// self-renewal. A new leader that wins a stale lease increments it, so a
+        /// superseded old leader still carries the prior (now lower) epoch.
+        ///
+        /// `#[serde(default)]` so records written before this field existed
+        /// decode to epoch 0; the first new acquisition after upgrade bumps to 1,
+        /// which is strictly greater, so the fence never spuriously passes for a
+        /// stale leader.
+        #[serde(default)]
+        epoch: u64,
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -152,14 +201,24 @@ mod imp {
     struct TargetWrite {
         record_key: Vec<u8>,
         record_value: Vec<u8>,
-        span_clear_begin: Vec<u8>,
-        span_clear_end: Vec<u8>,
+        // `Some` only when the caller asked to rewrite this target's free spans
+        // (`persist_state(rewrite_spans = true)`). When `None` the target's span
+        // chunks are left entirely untouched and only the metadata record is set,
+        // so a span-neutral control-plane write can never clobber a leader's
+        // committed spans (FIX B).
+        span_rewrite: Option<TargetSpanRewrite>,
+    }
+
+    #[derive(Clone)]
+    struct TargetSpanRewrite {
+        clear_begin: Vec<u8>,
+        clear_end: Vec<u8>,
         chunk_writes: Vec<(Vec<u8>, Vec<u8>)>,
     }
 
     /// A single FoundationDB mutation. `persist_state` groups these into
     /// byte-bounded batches so no transaction exceeds the ~10 MB FDB limit.
-    #[derive(Clone)]
+    #[derive(Clone, Debug, PartialEq, Eq)]
     enum WriteOp {
         ClearRange(Vec<u8>, Vec<u8>),
         Set(Vec<u8>, Vec<u8>),
@@ -189,6 +248,24 @@ mod imp {
         Release,
     }
 
+    /// Whether a `persist_state` commit is fenced by the per-shard allocator
+    /// mutation epoch (DESIGN_KAS_WRITE_SCALE.md §3/§4 change #3).
+    ///
+    /// `Leased` is used by every split-brain-sensitive allocator-state mutation
+    /// (reserve / claim / finalize / release / expire / refill) — those run under
+    /// the per-shard mutation lease, so each of their commits reads the lease
+    /// epoch in the SAME FDB txn and aborts if a newer leader has bumped it.
+    ///
+    /// `Unfenced` preserves today's behavior for control-plane writes
+    /// (register_target, heartbeat_target, set_target_state, upsert_service_instance,
+    /// reclaim_target_granules, reset) that were never taken under the mutation
+    /// lease and are not part of the double-allocated-span hazard the fence guards.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum EpochFence {
+        Leased,
+        Unfenced,
+    }
+
     #[derive(Debug)]
     struct StatusCarrier(Status);
 
@@ -210,8 +287,21 @@ mod imp {
     }
 
     impl FdbKasStore {
-        const ALLOCATOR_MUTATION_LEASE_TTL_MS: u64 = 120_000;
+        // Lease TTL = 30s, renew at TTL/2 = 15s (DESIGN_KAS_WRITE_SCALE.md §4
+        // decision: keep TTL modest so clock skew degrades to "stale writes
+        // abort," not corruption; the KMS pool masks the short failover gap a
+        // hung-but-not-crashed leader leaves). The per-op model also uses this
+        // TTL, so the change is backward compatible for the default path.
+        const ALLOCATOR_MUTATION_LEASE_TTL_MS: u64 = 30_000;
         const ALLOCATOR_MUTATION_RETRY_MS: u64 = 10;
+        /// Renew the leader-resident lease once its remaining life drops to this
+        /// fraction of the TTL. TTL/2 (15s at a 30s TTL) leaves a full renew
+        /// interval of slack before expiry even under one missed renewal.
+        const ALLOCATOR_MUTATION_RENEW_FRACTION: u64 = 2;
+        /// Background renewer cadence for the leader-resident lease. Well below
+        /// TTL/2 so several renew attempts fall inside the renew window; a single
+        /// failed tick still leaves slack before expiry.
+        const ALLOCATOR_MUTATION_RENEW_TICK_MS: u64 = 5_000;
 
         /// Coordination lease name for this instance's allocation shard. Disjoint
         /// shards derive distinct names so they never contend on a single
@@ -243,6 +333,8 @@ mod imp {
         pub(crate) fn connect(
             cluster_file: &str,
             allocation_shard_id: Option<String>,
+            leader_resident_lease: bool,
+            stats: Option<Arc<crate::stats::KasStats>>,
         ) -> Result<Self, Box<dyn Error>> {
             let db = if cluster_file.trim().is_empty() {
                 Database::default()?
@@ -259,7 +351,57 @@ mod imp {
                         .map(|value| value.trim().to_string())
                         .filter(|value| !value.is_empty()),
                 ),
+                leader_resident_lease,
+                leadership: Arc::new(tokio::sync::Mutex::new(None)),
+                deferred_bin_member_deletes: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                stats,
             })
+        }
+
+        /// Start the leader-resident lease renewer (DESIGN_KAS_WRITE_SCALE.md §3
+        /// #2). No-op unless the `leader_resident_lease` flag is set, so the
+        /// default build spawns nothing and keeps the per-op model. Must be called
+        /// from within a tokio runtime (it is, from `main`). The renewer:
+        ///   * acquires the per-shard lease on first tick (becoming leader),
+        ///   * renews at TTL/2 while held,
+        ///   * steps down (drops in-memory state, stops serving) on any renewal
+        ///     failure / observed epoch bump.
+        ///
+        /// Renewal errors are surfaced into the store (step-down bumps the
+        /// `leader_renew_failures` counter and clears in-memory state) AND made
+        /// visible here (logged + recorded as last_error) instead of being
+        /// silently dropped — the renewer is a detached spawn, so a silent failure
+        /// would otherwise be invisible. The next tick re-attempts acquisition and
+        /// the epoch fence keeps a superseded leader's writes from committing in
+        /// the meantime. The loop never exits on a renew error (only the tokio
+        /// runtime shutting down ends it), so the renewer cannot die silently.
+        pub(crate) fn start_leader_resident_renewer(&self) {
+            if !self.leader_resident_lease {
+                return;
+            }
+            let renewer = self.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_millis(
+                    Self::ALLOCATOR_MUTATION_RENEW_TICK_MS,
+                ));
+                loop {
+                    ticker.tick().await;
+                    // `renew_leader_resident_lease` (re)acquires when not held and
+                    // renews when near expiry; on failure it has already stepped us
+                    // down (which bumps `leader_renew_failures`). Log + record the
+                    // error so the detached renewer's loss of leadership is visible,
+                    // then continue — a renew error must not kill the renewer.
+                    if let Err(err) = renewer.renew_leader_resident_lease().await {
+                        let message = format!(
+                            "KAS leader-resident lease renew failed (stepped down): {err}"
+                        );
+                        eprintln!("{message}");
+                        if let Some(stats) = renewer.stats.as_ref() {
+                            stats.set_last_error(message);
+                        }
+                    }
+                }
+            });
         }
 
         async fn refresh_target_state_from_fdb(&self) -> Result<(), Status> {
@@ -288,8 +430,23 @@ mod imp {
             let (reservations, delete_reservations) = self.load_active_reservations().await?;
             let service_instances = self.load_service_instances_from_fdb().await?;
             if !delete_reservations.is_empty() {
-                self.persist_state(&[], &[], &delete_reservations, &[], &[], &[])
-                    .await?;
+                // Read-path cleanup of already-non-Reserved (finalized/released)
+                // records. Runs from un-leased read paths too, so it must not be
+                // epoch-fenced; it is benign (only deletes records no longer
+                // Reserved) and not part of the double-allocation hazard.
+                self.persist_state(
+                    &[],
+                    &[],
+                    &delete_reservations,
+                    &[],
+                    &[],
+                    &[],
+                    // No targets passed -> rewrite_spans is moot; false keeps the
+                    // span keyspace untouched.
+                    false,
+                    EpochFence::Unfenced,
+                )
+                .await?;
             }
             let allocator_state_stamp = self.load_allocator_state_stamp().await?;
             let mut state = self.state.lock().await;
@@ -479,6 +636,19 @@ mod imp {
                 .collect())
         }
 
+        /// `rewrite_spans` (DESIGN_KAS_WRITE_SCALE.md §3 #2/#3 FIX B). When `true`
+        /// each passed target's free-span chunk set is fully rewritten:
+        /// `ClearRange(target_span_prefix)` + a blind re-write of `entry.spans`.
+        /// That blind global rewrite is the split-brain surface — span keys are
+        /// keyed by `target_id` ONLY (not shard-namespaced, see `fdb_schema.rs`),
+        /// so ANY writer that passes a target here clobbers that target's spans
+        /// for every shard from its (possibly stale) in-memory copy.
+        ///
+        /// Control-plane metadata writes (register/heartbeat/set-state) only mean
+        /// to change the target RECORD, never its spans, so they pass `false`: the
+        /// per-target `ClearRange` + chunk writes are skipped entirely and only the
+        /// `target_key` record is set. Paths that genuinely mutate spans
+        /// (reserve / reclaim / top_up / reset / release) pass `true`.
         async fn persist_state(
             &self,
             targets: &[TargetAllocatorState],
@@ -487,7 +657,27 @@ mod imp {
             service_instances: &[ServiceInstanceRecord],
             delete_bin_members: &[(String, String)],
             add_bin_members: &[(String, String)],
+            rewrite_spans: bool,
+            fence: EpochFence,
         ) -> Result<(), Status> {
+            // Resolve the epoch to assert in each committed batch. `Leased`
+            // mutations (the split-brain-sensitive allocator-state writes) read
+            // the epoch held for the current critical section: the per-op path and
+            // the leader-resident path both publish the granted epoch into
+            // `leadership` while they hold the lease, so this is `Some` for any
+            // legitimately-leased commit. If it is `None` we are not (any longer)
+            // the leader and MUST refuse to mutate rather than silently commit
+            // unfenced — fail closed. `Unfenced` control-plane writes commit
+            // without the epoch check, exactly as today.
+            let fence_epoch = match fence {
+                EpochFence::Leased => Some(self.current_mutation_epoch().await.ok_or_else(|| {
+                    Status::aborted(
+                        "allocator mutation epoch fence: leadership not held at commit; refusing \
+                         to persist allocator state",
+                    )
+                })?),
+                EpochFence::Unfenced => None,
+            };
             let targets = targets.to_vec();
             let reservations = reservations.to_vec();
             let delete_reservations = delete_reservations.to_vec();
@@ -501,19 +691,32 @@ mod imp {
             let mut target_writes: Vec<TargetWrite> = Vec::with_capacity(targets.len());
             for target in &targets {
                 let id = target.target.target_id.as_str();
-                let span_prefix = target_span_prefix(id);
-                let span_end = prefix_range_end(&span_prefix);
-                let mut chunk_writes = Vec::new();
-                for chunk in split_spans_into_chunks(id, &target.spans) {
-                    chunk_writes
-                        .push((target_span_chunk_key(id, chunk.chunk_index), encode_json(&chunk)?));
-                }
+                // FIX B: only build the span clear-range + chunk writes when this
+                // caller actually changed spans. A span-neutral metadata write
+                // (rewrite_spans = false) leaves the target's existing span chunks
+                // untouched so it cannot clobber a leader's committed free spans.
+                let span_rewrite = if rewrite_spans {
+                    let span_prefix = target_span_prefix(id);
+                    let span_end = prefix_range_end(&span_prefix);
+                    let mut chunk_writes = Vec::new();
+                    for chunk in split_spans_into_chunks(id, &target.spans) {
+                        chunk_writes.push((
+                            target_span_chunk_key(id, chunk.chunk_index),
+                            encode_json(&chunk)?,
+                        ));
+                    }
+                    Some(TargetSpanRewrite {
+                        clear_begin: span_prefix,
+                        clear_end: span_end,
+                        chunk_writes,
+                    })
+                } else {
+                    None
+                };
                 target_writes.push(TargetWrite {
                     record_key: target_key(id),
                     record_value: encode_json(&target.target)?,
-                    span_clear_begin: span_prefix,
-                    span_clear_end: span_end,
-                    chunk_writes,
+                    span_rewrite,
                 });
             }
             let update_allocator_state = !targets.is_empty()
@@ -538,15 +741,7 @@ mod imp {
             // crash mid-persist is recoverable by reset/reformat.
             let mut units: Vec<(Vec<WriteOp>, usize)> = Vec::new();
             for tw in target_writes {
-                let mut ops = Vec::with_capacity(2 + tw.chunk_writes.len());
-                let mut bytes = tw.record_key.len() + tw.record_value.len();
-                ops.push(WriteOp::ClearRange(tw.span_clear_begin, tw.span_clear_end));
-                ops.push(WriteOp::Set(tw.record_key, tw.record_value));
-                for (key, value) in tw.chunk_writes {
-                    bytes += key.len() + value.len();
-                    ops.push(WriteOp::Set(key, value));
-                }
-                units.push((ops, bytes));
+                units.push(build_target_write_unit(tw));
             }
             for reservation in &reservations {
                 let key = reservation_key(&reservation.reservation_id);
@@ -586,14 +781,15 @@ mod imp {
             let mut batch_bytes = 0usize;
             for (ops, bytes) in units {
                 if !batch.is_empty() && batch_bytes.saturating_add(bytes) > MAX_TXN_BYTES {
-                    self.commit_write_ops(std::mem::take(&mut batch)).await?;
+                    self.commit_write_ops(std::mem::take(&mut batch), fence_epoch)
+                        .await?;
                     batch_bytes = 0;
                 }
                 batch.extend(ops);
                 batch_bytes = batch_bytes.saturating_add(bytes);
             }
             if !batch.is_empty() {
-                self.commit_write_ops(batch).await?;
+                self.commit_write_ops(batch, fence_epoch).await?;
             }
 
             if let Some(stamp) = allocator_state_stamp {
@@ -606,11 +802,60 @@ mod imp {
 
         /// Apply a batch of mutations in one FoundationDB transaction. Callers
         /// (currently `persist_state`) size batches under the ~10 MB limit.
-        async fn commit_write_ops(&self, ops: Vec<WriteOp>) -> Result<(), Status> {
+        ///
+        /// `fence_epoch`, when `Some`, is the per-shard allocator mutation epoch
+        /// this writer holds. The transaction then reads the mutation lease key
+        /// and aborts (without writing anything) if the stored epoch differs —
+        /// the epoch fence (DESIGN_KAS_WRITE_SCALE.md §3/§4). Reading the lease
+        /// key inside the SAME txn turns it into an FDB conflict key: a superseded
+        /// leader's commit fails deterministically under serializable isolation
+        /// rather than corrupting state. We deliberately read only this one
+        /// already-hot key (smallest possible conflict footprint, §8 open
+        /// question 3) instead of a separate epoch key.
+        ///
+        /// When `None` the commit is unfenced (control-plane writes that never
+        /// took the mutation lease), preserving today's behavior.
+        async fn commit_write_ops(
+            &self,
+            ops: Vec<WriteOp>,
+            fence_epoch: Option<u64>,
+        ) -> Result<(), Status> {
+            let fence_key = fence_epoch.map(|_| {
+                coordination_lease_key(&self.allocator_mutation_lease_name())
+            });
             self.db
                 .run(move |trx, _| {
                     let ops = ops.clone();
+                    let fence_key = fence_key.clone();
                     async move {
+                        // Epoch fence: read the lease epoch in this txn and abort
+                        // if we are no longer the epoch holder. The read makes the
+                        // lease key a conflict key, so a concurrent new leader's
+                        // bump deterministically fails this commit.
+                        if let (Some(expected), Some(key)) = (fence_epoch, fence_key.as_ref()) {
+                            let current = trx
+                                .get(key, false)
+                                .await
+                                .map_err(FdbBindingError::from)?
+                                .map(|bytes| bytes.as_ref().to_vec());
+                            let actual = match current {
+                                Some(bytes) => {
+                                    decode_json::<CoordinationLeaseRecord>(&bytes)
+                                        .map_err(status_to_fdb)?
+                                        .epoch
+                                }
+                                // Lease record gone (cleared/expired-and-reaped):
+                                // treat as epoch 0, which never matches a held
+                                // epoch >= 1, so the commit aborts.
+                                None => 0,
+                            };
+                            if actual != expected {
+                                return Err(status_to_fdb(Status::aborted(format!(
+                                    "allocator mutation epoch fence: held {expected}, found \
+                                     {actual}; a newer leader has taken the shard"
+                                ))));
+                            }
+                        }
                         for op in &ops {
                             match op {
                                 WriteOp::ClearRange(begin, end) => trx.clear_range(begin, end),
@@ -623,6 +868,94 @@ mod imp {
                 })
                 .await
                 .map_err(map_fdb_binding_error)
+                .inspect_err(|err| {
+                    // Surface a fenced-commit abort into the stats tree so failover
+                    // fault-injection can confirm a superseded leader's write was
+                    // rejected (not committed). Only the epoch fence raises an
+                    // Aborted from this txn, so the code is a precise signal.
+                    if fence_epoch.is_some() && err.code() == tonic::Code::Aborted {
+                        if let Some(stats) = self.stats.as_ref() {
+                            stats.record_fenced_commit_abort();
+                        }
+                    }
+                })
+        }
+
+        /// Phase-3 lock-light claim persist (change #7): write ONLY the claimed
+        /// reservations' (TTL-bumped) records, fenced by the held epoch, WITHOUT
+        /// bumping the allocator-state stamp. Reaping correctness needs the TTL
+        /// bump durable; the stamp is intentionally not touched (the sole fenced
+        /// writer no longer relies on it — the epoch fence is the safety net).
+        /// Reuses the byte-bounded batching of `commit_write_ops` so a large claim
+        /// can never build an over-limit transaction.
+        async fn persist_claim_ttl_bumps_lock_light(
+            &self,
+            claimed: &[PlacementReservationRecord],
+        ) -> Result<(), Status> {
+            // Fail closed: a lock-light claim must hold leadership, else its fenced
+            // commit would have nothing to assert. (The wrapper already ensured it.)
+            let fence_epoch = Some(self.current_mutation_epoch().await.ok_or_else(|| {
+                Status::aborted(
+                    "lock-light claim: leadership not held at commit; refusing to persist",
+                )
+            })?);
+            const MAX_TXN_BYTES: usize = 4 * 1024 * 1024;
+            let mut batch: Vec<WriteOp> = Vec::new();
+            let mut batch_bytes = 0usize;
+            for reservation in claimed {
+                let key = reservation_key(&reservation.reservation_id);
+                let value = encode_json(reservation)?;
+                let bytes = key.len() + value.len();
+                if !batch.is_empty() && batch_bytes.saturating_add(bytes) > MAX_TXN_BYTES {
+                    self.commit_write_ops(std::mem::take(&mut batch), fence_epoch)
+                        .await?;
+                    batch_bytes = 0;
+                }
+                batch.push(WriteOp::Set(key, value));
+                batch_bytes = batch_bytes.saturating_add(bytes);
+            }
+            if !batch.is_empty() {
+                self.commit_write_ops(batch, fence_epoch).await?;
+            }
+            Ok(())
+        }
+
+        /// Flush deferred durable bin-member deletes accumulated by lock-light
+        /// claims (change #7). Best-effort: these entries are write-only and never
+        /// read back, so on failure they are simply left for a later flush / a
+        /// `reset`'s prefix clear. Fenced like any other leased write.
+        async fn flush_deferred_bin_member_deletes(&self) -> Result<(), Status> {
+            let pending = {
+                let mut deferred = self.deferred_bin_member_deletes.lock().await;
+                if deferred.is_empty() {
+                    return Ok(());
+                }
+                std::mem::take(&mut *deferred)
+            };
+            // Only the leader may emit fenced deletes. If we are not leader, drop
+            // them: a new leader's refresh discards `state.bins` anyway, so the
+            // orphaned durable members are harmless until the next `reset`.
+            let Some(fence_epoch) = self.current_mutation_epoch().await else {
+                return Ok(());
+            };
+            const MAX_TXN_BYTES: usize = 4 * 1024 * 1024;
+            let mut batch: Vec<WriteOp> = Vec::new();
+            let mut batch_bytes = 0usize;
+            for (bin_key, reservation_id) in &pending {
+                let key = reservation_bin_member_key(bin_key, reservation_id);
+                let bytes = key.len();
+                if !batch.is_empty() && batch_bytes.saturating_add(bytes) > MAX_TXN_BYTES {
+                    self.commit_write_ops(std::mem::take(&mut batch), Some(fence_epoch))
+                        .await?;
+                    batch_bytes = 0;
+                }
+                batch.push(WriteOp::Clear(key));
+                batch_bytes = batch_bytes.saturating_add(bytes);
+            }
+            if !batch.is_empty() {
+                self.commit_write_ops(batch, Some(fence_epoch)).await?;
+            }
+            Ok(())
         }
 
         async fn clear_all_reservations_and_bins(&self) -> Result<(), Status> {
@@ -664,38 +997,30 @@ mod imp {
             Ok(())
         }
 
-        async fn load_lease(
-            &self,
-            lease_name: &str,
-        ) -> Result<Option<CoordinationLeaseRecord>, Status> {
-            let key = coordination_lease_key(lease_name);
-            let value = self
-                .db
-                .run(move |trx, _| {
-                    let key = key.clone();
-                    async move {
-                        let value = trx
-                            .get(&key, false)
-                            .await
-                            .map_err(FdbBindingError::from)?
-                            .map(|bytes| bytes.as_ref().to_vec());
-                        Ok::<Option<Vec<u8>>, FdbBindingError>(value)
-                    }
-                })
-                .await
-                .map_err(map_fdb_binding_error)?;
-            value
-                .map(|bytes| decode_json::<CoordinationLeaseRecord>(&bytes))
-                .transpose()
+        async fn ensure_target_state_current(&self) -> Result<(), Status> {
+            self.ensure_target_state_current_inner(false).await
         }
 
-        async fn ensure_target_state_current(&self) -> Result<(), Status> {
+        /// `skip_stamp_read` implements change #4: while the leader holds the
+        /// per-shard lease, the per-op `load_allocator_state_stamp` GET is
+        /// dropped. It is safe ONLY because the epoch fence (#3) now detects an
+        /// out-of-band writer at commit time instead. A reload is still forced on
+        /// (re)acquisition / epoch change, which `acquire_leader_resident_lease`
+        /// signals by clearing `target_state_loaded`, so the `needs_refresh`
+        /// branch below still picks it up.
+        async fn ensure_target_state_current_inner(
+            &self,
+            skip_stamp_read: bool,
+        ) -> Result<(), Status> {
             let needs_refresh = {
                 let state = self.state.lock().await;
                 !state.target_state_loaded
             };
             if needs_refresh {
                 return self.refresh_target_state_from_fdb().await;
+            }
+            if skip_stamp_read {
+                return Ok(());
             }
             let remote_stamp = self.load_allocator_state_stamp().await?;
             let local_stamp = {
@@ -709,12 +1034,24 @@ mod imp {
         }
 
         async fn ensure_full_state_current(&self) -> Result<(), Status> {
+            self.ensure_full_state_current_inner(false).await
+        }
+
+        /// See `ensure_target_state_current_inner`: `skip_stamp_read` drops the
+        /// per-op stamp GET under a held leader-resident lease (change #4).
+        async fn ensure_full_state_current_inner(
+            &self,
+            skip_stamp_read: bool,
+        ) -> Result<(), Status> {
             let needs_refresh = {
                 let state = self.state.lock().await;
                 !state.target_state_loaded || !state.reservation_state_loaded
             };
             if needs_refresh {
                 return self.refresh_full_state_from_fdb().await;
+            }
+            if skip_stamp_read {
+                return Ok(());
             }
             let remote_stamp = self.load_allocator_state_stamp().await?;
             let local_stamp = {
@@ -727,34 +1064,32 @@ mod imp {
             Ok(())
         }
 
+        /// Per-op (default-path) acquire. Loops until it holds the per-shard
+        /// mutation lease, then publishes the granted epoch + expiry into
+        /// `leadership` so the always-on epoch fence in `persist_state(Leased)`
+        /// can assert it. The matching `release_allocator_mutation_lease` clears
+        /// `leadership` and the durable record, restoring the historical
+        /// sub-millisecond hold window.
         async fn acquire_allocator_mutation_lease(&self) -> Result<(), Status> {
             let lease_name = self.allocator_mutation_lease_name();
             loop {
-                let now_ms = now_unix_ms();
-                if let Some(existing) = self.load_lease(&lease_name).await? {
-                    if existing.owner_id == self.owner_id.as_str()
-                        && existing.expires_at_unix_ms > now_ms
-                    {
-                        let renew_before_ms = Self::ALLOCATOR_MUTATION_LEASE_TTL_MS / 2;
-                        if existing.expires_at_unix_ms.saturating_sub(now_ms) <= renew_before_ms {
-                            self.try_acquire_coordination_lease(
-                                &lease_name,
-                                self.owner_id.as_str(),
-                                Self::ALLOCATOR_MUTATION_LEASE_TTL_MS,
-                            )
-                            .await?;
-                        }
-                        return Ok(());
-                    }
-                }
-                if self
-                    .try_acquire_coordination_lease(
+                // The epoch-aware acquirer already self-renews (same owner, live)
+                // vs new-grant (absent/expired) and returns the epoch we now hold.
+                if let Some(epoch) = self
+                    .try_acquire_coordination_lease_epoch(
                         &lease_name,
                         self.owner_id.as_str(),
                         Self::ALLOCATOR_MUTATION_LEASE_TTL_MS,
                     )
                     .await?
                 {
+                    let expires_at_unix_ms =
+                        now_unix_ms().saturating_add(Self::ALLOCATOR_MUTATION_LEASE_TTL_MS);
+                    let mut leadership = self.leadership.lock().await;
+                    *leadership = Some(LeadershipTerm {
+                        epoch,
+                        lease_expires_at_unix_ms: expires_at_unix_ms,
+                    });
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(Self::ALLOCATOR_MUTATION_RETRY_MS)).await;
@@ -762,6 +1097,10 @@ mod imp {
         }
 
         async fn release_allocator_mutation_lease(&self) -> Result<(), Status> {
+            {
+                let mut leadership = self.leadership.lock().await;
+                *leadership = None;
+            }
             self.release_coordination_lease(
                 &self.allocator_mutation_lease_name(),
                 self.owner_id.as_str(),
@@ -800,6 +1139,220 @@ mod imp {
                 .await
                 .map_err(map_fdb_binding_error)?;
             Ok(())
+        }
+
+        // ---- Epoch fence + leader-resident lease (DESIGN_KAS_WRITE_SCALE.md §3/§4) ----
+
+        /// Acquire (or self-renew) a coordination lease and return the epoch the
+        /// caller now holds, or `None` if the lease is held by a live other owner.
+        ///
+        /// The epoch is the fencing token for change #3. In one serializable FDB
+        /// transaction we read the current record and decide availability exactly
+        /// as before (`owner_id == us || expired`). The epoch is then:
+        ///   * carried unchanged on a **self-renew** (same owner, still live) — a
+        ///     renewal must never advance the fence or it would invalidate our own
+        ///     in-flight writes;
+        ///   * **bumped** (`existing.epoch + 1`) on every *new* grant — an
+        ///     absent/expired lease, or one stolen from a different (dead) owner.
+        ///     A fresh record starts at epoch 1 (0 is reserved for "never granted"
+        ///     / legacy records that decode with `#[serde(default)]`).
+        ///
+        /// Because FDB linearizes the read+set on the lease key, two racing new
+        /// acquisitions cannot both win the same epoch: one commits, the other
+        /// conflicts and retries against the now-advanced record. That is what
+        /// makes pure lease-race leadership safe (§8 open question 4).
+        async fn try_acquire_coordination_lease_epoch(
+            &self,
+            lease_name: &str,
+            owner_id: &str,
+            lease_ttl_ms: u64,
+        ) -> Result<Option<u64>, Status> {
+            let now_ms = now_unix_ms();
+            let expires_at_unix_ms = now_ms.saturating_add(lease_ttl_ms.max(1_000));
+            let key = coordination_lease_key(lease_name);
+            let owner_id = owner_id.to_string();
+            self.db
+                .run(move |trx, _| {
+                    let key = key.clone();
+                    let owner_id = owner_id.clone();
+                    async move {
+                        let current = trx
+                            .get(&key, false)
+                            .await
+                            .map_err(FdbBindingError::from)?
+                            .map(|bytes| bytes.as_ref().to_vec());
+                        let existing = match current {
+                            Some(bytes) => Some(
+                                decode_json::<CoordinationLeaseRecord>(&bytes)
+                                    .map_err(status_to_fdb)?,
+                            ),
+                            None => None,
+                        };
+                        let (available, epoch) = decide_lease_grant(
+                            existing.as_ref().map(|record| {
+                                (record.owner_id.as_str(), record.expires_at_unix_ms, record.epoch)
+                            }),
+                            &owner_id,
+                            now_ms,
+                        );
+                        if available {
+                            let record = CoordinationLeaseRecord {
+                                owner_id: owner_id.clone(),
+                                expires_at_unix_ms,
+                                epoch,
+                            };
+                            let value = encode_json(&record).map_err(status_to_fdb)?;
+                            trx.set(&key, &value);
+                        }
+                        Ok::<Option<u64>, FdbBindingError>(available.then_some(epoch))
+                    }
+                })
+                .await
+                .map_err(map_fdb_binding_error)
+        }
+
+        /// The epoch this instance must assert in fenced commits, or `None` if it
+        /// is not currently a leader under the leader-resident model.
+        ///
+        /// On the leader-resident path this is the held term's epoch. On the
+        /// default (per-op) path the per-op acquire records the freshly granted
+        /// epoch into `leadership` for the duration of the critical section, so a
+        /// `Leased` commit reads the right value here too.
+        async fn current_mutation_epoch(&self) -> Option<u64> {
+            self.leadership.lock().await.map(|term| term.epoch)
+        }
+
+        /// Become (or refresh) the shard leader under the leader-resident lease
+        /// model: acquire the per-shard mutation lease, record the granted epoch
+        /// and expiry in `leadership`. Returns `Ok(true)` if we hold leadership
+        /// afterward, `Ok(false)` if another live owner holds the lease (we are
+        /// not leader and must not mutate).
+        ///
+        /// If the granted epoch differs from a previously-held one we drop our
+        /// in-memory allocator state and force a refresh on the next op, because
+        /// an epoch change means a different leader may have mutated the shard
+        /// while we were not leader.
+        async fn acquire_leader_resident_lease(&self) -> Result<bool, Status> {
+            let lease_name = self.allocator_mutation_lease_name();
+            let granted = self
+                .try_acquire_coordination_lease_epoch(
+                    &lease_name,
+                    self.owner_id.as_str(),
+                    Self::ALLOCATOR_MUTATION_LEASE_TTL_MS,
+                )
+                .await?;
+            let Some(epoch) = granted else {
+                // Lost the lease to a live other owner: step down hard.
+                self.step_down_leader_resident().await;
+                return Ok(false);
+            };
+            let expires_at_unix_ms =
+                now_unix_ms().saturating_add(Self::ALLOCATOR_MUTATION_LEASE_TTL_MS);
+            let epoch_changed = {
+                let mut leadership = self.leadership.lock().await;
+                let changed = leadership.map(|term| term.epoch) != Some(epoch);
+                *leadership = Some(LeadershipTerm {
+                    epoch,
+                    lease_expires_at_unix_ms: expires_at_unix_ms,
+                });
+                changed
+            };
+            if epoch_changed {
+                // A new term (or first acquisition): our cached allocator state
+                // may be stale relative to whatever the previous leader wrote.
+                // Mark it for reload; the fence guards against acting on stale
+                // spans in the meantime.
+                let mut state = self.state.lock().await;
+                state.target_state_loaded = false;
+                state.reservation_state_loaded = false;
+            }
+            Ok(true)
+        }
+
+        /// Renew the held leader-resident lease if it is near expiry. A renewal
+        /// never advances the epoch. On any renewal failure or observed loss of
+        /// ownership we step down (drop in-memory state, stop serving) rather than
+        /// blindly retry — renewal failure == immediate loss of leadership (§4).
+        async fn renew_leader_resident_lease(&self) -> Result<(), Status> {
+            let held = *self.leadership.lock().await;
+            let Some(term) = held else {
+                // Not currently leader: (re)attempt acquisition.
+                let _ = self.acquire_leader_resident_lease().await?;
+                return Ok(());
+            };
+            let now_ms = now_unix_ms();
+            let renew_before_ms =
+                Self::ALLOCATOR_MUTATION_LEASE_TTL_MS / Self::ALLOCATOR_MUTATION_RENEW_FRACTION;
+            if term.lease_expires_at_unix_ms.saturating_sub(now_ms) > renew_before_ms {
+                return Ok(());
+            }
+            let lease_name = self.allocator_mutation_lease_name();
+            match self
+                .try_acquire_coordination_lease_epoch(
+                    &lease_name,
+                    self.owner_id.as_str(),
+                    Self::ALLOCATOR_MUTATION_LEASE_TTL_MS,
+                )
+                .await
+            {
+                Ok(Some(epoch)) if epoch == term.epoch => {
+                    // Clean self-renew: epoch unchanged, push out expiry.
+                    let mut leadership = self.leadership.lock().await;
+                    if let Some(current) = leadership.as_mut() {
+                        if current.epoch == term.epoch {
+                            current.lease_expires_at_unix_ms = now_unix_ms()
+                                .saturating_add(Self::ALLOCATOR_MUTATION_LEASE_TTL_MS);
+                        }
+                    }
+                    Ok(())
+                }
+                Ok(Some(_epoch)) => {
+                    // We re-acquired but the epoch advanced under us: someone else
+                    // held the shard in between. Step down — our cached state and
+                    // any in-flight assumptions are no longer valid.
+                    self.step_down_leader_resident().await;
+                    Err(Status::aborted(
+                        "allocator mutation lease epoch advanced during renewal; stepped down",
+                    ))
+                }
+                Ok(None) => {
+                    self.step_down_leader_resident().await;
+                    Err(Status::aborted(
+                        "allocator mutation lease lost to another owner; stepped down",
+                    ))
+                }
+                Err(err) => {
+                    // Renewal RPC failed: we can no longer prove leadership. Drop
+                    // it; the fence would abort our writes anyway once the lease
+                    // expires and another leader bumps the epoch.
+                    self.step_down_leader_resident().await;
+                    Err(err)
+                }
+            }
+        }
+
+        /// Drop leadership: clear the held term and mark in-memory allocator state
+        /// stale so the next (re)acquisition reloads from FDB. Does NOT clear the
+        /// durable lease record — a partitioned ex-leader can no longer reach FDB
+        /// to release, and the epoch fence makes an unreleased-but-superseded
+        /// lease harmless (its writes abort).
+        async fn step_down_leader_resident(&self) {
+            let was_leader = {
+                let mut leadership = self.leadership.lock().await;
+                leadership.take().is_some()
+            };
+            // Count only a genuine loss of held leadership (renew failure / lost
+            // lease / epoch advanced under us), not a cold "never had it" tick, so
+            // the counter measures real step-downs the detached renewer would
+            // otherwise hide.
+            if was_leader {
+                if let Some(stats) = self.stats.as_ref() {
+                    stats.record_leader_renew_failure();
+                }
+            }
+            let mut state = self.state.lock().await;
+            state.target_state_loaded = false;
+            state.reservation_state_loaded = false;
         }
 
         async fn reserve_batch_common_locked(
@@ -875,8 +1428,18 @@ mod imp {
                 (dirty_targets, planned.reservations)
             };
             let persist_started = Instant::now();
-            self.persist_state(&dirty_targets, &reservations, &[], &[], &[], &[])
-                .await?;
+            self.persist_state(
+                &dirty_targets,
+                &reservations,
+                &[],
+                &[],
+                &[],
+                &[],
+                // Reserve consumes free spans from the dirty targets -> rewrite.
+                true,
+                EpochFence::Leased,
+            )
+            .await?;
             Ok(TimedStoreResult {
                 value: reservations,
                 phase_timings: vec![
@@ -1005,6 +1568,9 @@ mod imp {
                 &[],
                 &delete_bin_members,
                 &[],
+                // Metadata-only finalize: no targets, no span change.
+                false,
+                EpochFence::Leased,
             )
             .await?;
             Ok(Some(results))
@@ -1157,6 +1723,9 @@ mod imp {
                 &[],
                 &delete_bin_members,
                 &[],
+                // Release returns spans to the dirty targets -> rewrite.
+                true,
+                EpochFence::Leased,
             )
             .await?;
             Ok(results)
@@ -1185,6 +1754,27 @@ mod imp {
         where
             F: std::future::Future<Output = Result<T, Status>>,
         {
+            if self.leader_resident_lease {
+                self.with_leader_resident_lease(refresh_full_state, op)
+                    .await
+            } else {
+                self.with_per_op_lease(refresh_full_state, op).await
+            }
+        }
+
+        /// Default path (flag off): the historical behavior, now also publishing
+        /// the held epoch into `leadership` so the always-on fence asserts it. The
+        /// in-process guard serializes writers; the durable lease is acquired and
+        /// released around each op (sub-millisecond hold); the per-op stamp read
+        /// still runs.
+        async fn with_per_op_lease<T, F>(
+            &self,
+            refresh_full_state: bool,
+            op: F,
+        ) -> Result<T, Status>
+        where
+            F: std::future::Future<Output = Result<T, Status>>,
+        {
             let guard = self.mutation_guard().await;
             let _guard = guard.lock().await;
             self.acquire_allocator_mutation_lease().await?;
@@ -1197,6 +1787,7 @@ mod imp {
                 Ok(()) => op.await,
                 Err(err) => Err(err),
             };
+            // Release clears `leadership` and the durable lease record.
             let release_result = self.release_allocator_mutation_lease().await;
             match (result, release_result) {
                 (Ok(value), Ok(())) => Ok(value),
@@ -1204,6 +1795,53 @@ mod imp {
                 (Err(err), Ok(())) => Err(err),
                 (Err(err), Err(_)) => Err(err),
             }
+        }
+
+        /// Leader-resident path (flag on, DESIGN_KAS_WRITE_SCALE.md §3 #2/#4):
+        /// the lease is held for the whole leadership term, NOT acquired/released
+        /// per op. Per op we only:
+        ///   1. ensure leadership (acquire on first use, opportunistically renew
+        ///      at TTL/2) — a step-down here means we are no longer leader and
+        ///      must not serve, so we return UNAVAILABLE and the KMS pool (#1)
+        ///      masks the gap;
+        ///   2. refresh in-memory state WITHOUT the per-op stamp GET (#4) — the
+        ///      epoch fence detects any out-of-band writer at commit time;
+        ///   3. run the op. No per-op durable release.
+        ///
+        /// The in-process `mutation_guard` mutex still serializes writers within
+        /// this process; the lease+epoch handle the cross-process invariant.
+        async fn with_leader_resident_lease<T, F>(
+            &self,
+            refresh_full_state: bool,
+            op: F,
+        ) -> Result<T, Status>
+        where
+            F: std::future::Future<Output = Result<T, Status>>,
+        {
+            let guard = self.mutation_guard().await;
+            let _guard = guard.lock().await;
+            // Ensure we hold leadership; renew if near expiry. A renewal failure /
+            // observed epoch bump steps us down and surfaces an error.
+            self.renew_leader_resident_lease().await?;
+            if self.current_mutation_epoch().await.is_none() {
+                // Not (any longer) the leader. Refuse to mutate; the route cache /
+                // KMS pool is expected to surface UNAVAILABLE and refresh routes
+                // (design §7: a demoted leader must surface UNAVAILABLE, not retry).
+                return Err(Status::unavailable(
+                    "KAS is not the current allocation-shard leader; retry routing",
+                ));
+            }
+            // Skip the per-op stamp GET; the fence supersedes it.
+            let refresh_result = if refresh_full_state {
+                self.ensure_full_state_current_inner(true).await
+            } else {
+                self.ensure_target_state_current_inner(true).await
+            };
+            match refresh_result {
+                Ok(()) => op.await,
+                Err(err) => Err(err),
+            }
+            // No release: the lease is leadership-resident.
         }
     }
 
@@ -1230,8 +1868,18 @@ mod imp {
                 dirty_targets
             };
             self.clear_all_reservations_and_bins().await?;
-            self.persist_state(&dirty_targets, &[], &[], &[], &[], &[])
-                .await
+            // Reset rewrites every target's spans back to one full span -> rewrite.
+            self.persist_state(
+                &dirty_targets,
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                true,
+                EpochFence::Unfenced,
+            )
+            .await
         }
 
         async fn register_target(&self, mut target: TargetRecord) -> Result<TargetRecord, Status> {
@@ -1243,18 +1891,23 @@ mod imp {
             if target.lifecycle_state == TargetLifecycleState::Unspecified as i32 {
                 target.lifecycle_state = TargetLifecycleState::Active as i32;
             }
-            let stored = {
+            let (stored, is_new_target) = {
                 let mut state = self.state.lock().await;
-                let spans = state
+                let existing_spans = state
                     .targets
                     .get(&target.target_id)
-                    .map(|existing| existing.spans.clone())
-                    .unwrap_or_else(|| {
-                        vec![GranuleSpan {
-                            start: 0,
-                            len: target.granule_count,
-                        }]
-                    });
+                    .map(|existing| existing.spans.clone());
+                // A first-time registration must durably seed the initial full
+                // span; a re-registration is a metadata refresh that must NOT
+                // rewrite spans (FIX B: that blind rewrite from in-memory could
+                // clobber a leader's committed reservations cross-shard).
+                let is_new_target = existing_spans.is_none();
+                let spans = existing_spans.unwrap_or_else(|| {
+                    vec![GranuleSpan {
+                        start: 0,
+                        len: target.granule_count,
+                    }]
+                });
                 target.free_granules = span_free_count(&spans);
                 let stored = TargetAllocatorState {
                     target: target.clone(),
@@ -1263,10 +1916,21 @@ mod imp {
                 state
                     .targets
                     .insert(target.target_id.clone(), stored.clone());
-                stored
+                (stored, is_new_target)
             };
-            self.persist_state(&[stored], &[], &[], &[], &[], &[])
-                .await?;
+            // Only seed spans on a genuinely-new target; re-registrations are
+            // span-neutral metadata writes.
+            self.persist_state(
+                &[stored],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                is_new_target,
+                EpochFence::Unfenced,
+            )
+            .await?;
             Ok(target)
         }
 
@@ -1285,8 +1949,18 @@ mod imp {
                 entry.target.last_heartbeat_unix_ms = observed_unix_ms;
                 (entry.target.clone(), entry.clone())
             };
-            self.persist_state(&[entry], &[], &[], &[], &[], &[])
-                .await?;
+            // Heartbeat only touches target metadata; never rewrite spans (FIX B).
+            self.persist_state(
+                &[entry],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                false,
+                EpochFence::Unfenced,
+            )
+            .await?;
             Ok(reply)
         }
 
@@ -1301,8 +1975,18 @@ mod imp {
                     .service_instances
                     .insert(instance.instance_id.clone(), instance.clone());
             }
-            self.persist_state(&[], &[], &[], &[instance.clone()], &[], &[])
-                .await?;
+            self.persist_state(
+                &[],
+                &[],
+                &[],
+                &[instance.clone()],
+                &[],
+                &[],
+                // Service-instance write only; no targets, no span change.
+                false,
+                EpochFence::Unfenced,
+            )
+            .await?;
             Ok(instance)
         }
 
@@ -1312,43 +1996,15 @@ mod imp {
             owner_id: &str,
             lease_ttl_ms: u64,
         ) -> Result<bool, Status> {
-            let now_ms = now_unix_ms();
-            let expires_at_unix_ms = now_ms.saturating_add(lease_ttl_ms.max(1_000));
-            let key = coordination_lease_key(lease_name);
-            let owner_id = owner_id.to_string();
-            let record = CoordinationLeaseRecord {
-                owner_id: owner_id.clone(),
-                expires_at_unix_ms,
-            };
-            let value = encode_json(&record)?;
-            self.db
-                .run(move |trx, _| {
-                    let key = key.clone();
-                    let owner_id = owner_id.clone();
-                    let value = value.clone();
-                    async move {
-                        let current = trx
-                            .get(&key, false)
-                            .await
-                            .map_err(FdbBindingError::from)?
-                            .map(|bytes| bytes.as_ref().to_vec());
-                        let available = match current {
-                            Some(bytes) => {
-                                let existing = decode_json::<CoordinationLeaseRecord>(&bytes)
-                                    .map_err(status_to_fdb)?;
-                                existing.owner_id == owner_id
-                                    || existing.expires_at_unix_ms <= now_ms
-                            }
-                            None => true,
-                        };
-                        if available {
-                            trx.set(&key, &value);
-                        }
-                        Ok::<bool, FdbBindingError>(available)
-                    }
-                })
-                .await
-                .map_err(map_fdb_binding_error)
+            // Delegate to the epoch-aware acquirer and discard the granted epoch.
+            // Non-mutation coordination leases (reaper, bin-refill leader
+            // election) only need the boolean. The epoch is still bumped on the
+            // durable record on a new grant — harmless for those leases and the
+            // single source of truth for the allocator mutation lease's fence.
+            Ok(self
+                .try_acquire_coordination_lease_epoch(lease_name, owner_id, lease_ttl_ms)
+                .await?
+                .is_some())
         }
 
         async fn list_service_instances(
@@ -1431,8 +2087,18 @@ mod imp {
                 }
                 (entry.target.clone(), entry.clone())
             };
-            self.persist_state(&[entry], &[], &[], &[], &[], &[])
-                .await?;
+            // Lifecycle transition only touches metadata; never rewrite spans (FIX B).
+            self.persist_state(
+                &[entry],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                false,
+                EpochFence::Unfenced,
+            )
+            .await?;
             Ok(target)
         }
 
@@ -1542,7 +2208,14 @@ mod imp {
         ) -> Result<TimedStoreResult<Vec<PlacementReservationRecord>>, Status> {
             let bin_key = format!("fc:{}:fd:{}", fragment_count, failure_domain as i32);
             self.with_allocator_mutation_lease(async move {
-                self.ensure_full_state_current().await?;
+                // On the leader-resident path the wrapper already dropped the per-op
+                // acquire/release + stamp read; this op skips the per-op stamp GET
+                // too (`_inner(true)`). On the default path it behaves as before.
+                if self.leader_resident_lease {
+                    self.ensure_full_state_current_inner(true).await?;
+                } else {
+                    self.ensure_full_state_current().await?;
+                }
                 let started = Instant::now();
                 let (claimed, delete_bin_members) = {
                     let mut state = self.state.lock().await;
@@ -1553,8 +2226,46 @@ mod imp {
                         reservation_ttl_ms,
                     )
                 };
-                self.persist_state(&[], &claimed, &[], &[], &delete_bin_members, &[])
+                if self.leader_resident_lease {
+                    // Phase 3 / change #7 — lock-light claim. The in-memory pop
+                    // (under `state.lock()` + the in-process mutation guard) is the
+                    // authoritative hand-out: a popped reservation_id is gone from
+                    // the in-memory queue so it cannot be re-claimed in-process, and
+                    // `refresh_full_state_from_fdb` always *clears* `state.bins` (the
+                    // durable bin members are write-only acceleration that is never
+                    // read back), so the durable `delete_bin_members` cleanup is pure
+                    // bookkeeping with no claim-correctness role. We therefore:
+                    //   * persist ONLY the claimed reservations' TTL bumps, fenced —
+                    //     required so the reaper (`release_expired_reservations`) sees
+                    //     the extended expiry and does not reap a just-handed-out
+                    //     reservation;
+                    //   * SKIP the stamp bump (sole fenced writer; the stamp is no
+                    //     longer the safety net — the epoch fence is);
+                    //   * DEFER the durable bin-member deletes — accumulated and
+                    //     flushed opportunistically off the hot path.
+                    if !claimed.is_empty() {
+                        self.persist_claim_ttl_bumps_lock_light(&claimed).await?;
+                    }
+                    if !delete_bin_members.is_empty() {
+                        let mut deferred = self.deferred_bin_member_deletes.lock().await;
+                        deferred.extend(delete_bin_members);
+                    }
+                } else {
+                    // Default path: unchanged — fenced persist of TTL bumps +
+                    // synchronous durable bin-member deletes, stamp bumped.
+                    self.persist_state(
+                        &[],
+                        &claimed,
+                        &[],
+                        &[],
+                        &delete_bin_members,
+                        &[],
+                        // Claim bumps reservation TTLs + bin members only; no spans.
+                        false,
+                        EpochFence::Leased,
+                    )
                     .await?;
+                }
                 Ok(TimedStoreResult {
                     value: claimed,
                     phase_timings: vec![StorePhaseTiming {
@@ -1579,6 +2290,13 @@ mod imp {
                     value: 0,
                     phase_timings: Vec::new(),
                 });
+            }
+            // Opportunistically drain the lock-light claim's deferred durable
+            // bin-member deletes (change #7) off the refill cadence — never on the
+            // foreground claim path. Best-effort; failures are swallowed (these
+            // entries are write-only and discarded on any refresh).
+            if self.leader_resident_lease {
+                let _ = self.flush_deferred_bin_member_deletes().await;
             }
             let storage_key = format!(
                 "fc:{}:fd:{}",
@@ -1636,8 +2354,20 @@ mod imp {
                                 })
                                 .collect::<Vec<_>>()
                         };
-                        self.persist_state(&[], &[], &[], &[], &[], &add_bin_members)
-                            .await?;
+                        self.persist_state(
+                            &[],
+                            &[],
+                            &[],
+                            &[],
+                            &[],
+                            &add_bin_members,
+                            // The span change for these reservations was already
+                            // persisted (rewrite) inside reserve_batch_common_locked;
+                            // this commit only adds bin members. No span rewrite.
+                            false,
+                            EpochFence::Leased,
+                        )
+                        .await?;
                         Ok(TimedStoreResult {
                             value: add_bin_members.len(),
                             phase_timings: records.phase_timings,
@@ -1798,46 +2528,78 @@ mod imp {
             if granules.is_empty() {
                 return Ok(0);
             }
-            let (reclaimed, dirty_targets) = {
-                let mut state = self.state.lock().await;
-                let mut by_target: HashMap<String, Vec<u64>> = HashMap::new();
-                for granule in granules {
-                    by_target
-                        .entry(granule.target_id)
-                        .or_default()
-                        .push(granule.granule_index);
-                }
-                let mut reclaimed = 0u64;
-                let mut dirty_targets = HashSet::new();
-                for (target_id, indexes) in by_target {
-                    let entry = state.targets.get_mut(&target_id).ok_or_else(|| {
-                        Status::not_found(format!("unknown target {}", target_id))
-                    })?;
-                    for granule_index in indexes {
-                        if granule_index >= entry.target.granule_count {
-                            return Err(Status::invalid_argument(format!(
-                                "granule {} is out of range for target {} capacity {}",
-                                granule_index, target_id, entry.target.granule_count
-                            )));
-                        }
-                        if granule_is_free(&entry.spans, granule_index) {
-                            continue;
-                        }
-                        release_granule(&mut entry.spans, granule_index);
-                        entry.target.free_granules = span_free_count(&entry.spans);
-                        reclaimed = reclaimed.saturating_add(1);
-                        dirty_targets.insert(target_id.clone());
+            // FIX A (DESIGN_KAS_WRITE_SCALE.md §3 #2). reclaim genuinely mutates a
+            // target's free spans (release_granule), and its `persist_state`
+            // ALWAYS rewrote that target's ENTIRE span chunk set from in-memory.
+            // Run it UNDER the allocator mutation lease (like reserve/release) so:
+            //   * on the per-op (flag-off) path it acquires+holds the epoch and the
+            //     state is freshly re-read before we mutate spans, then the persist
+            //     commits `Leased` (epoch-fenced);
+            //   * on the leader-resident path a non-leader returns UNAVAILABLE (the
+            //     wrapper refuses to mutate) instead of clobbering the rightful
+            //     leader's committed reservations from stale memory.
+            // The `full_state` refresh re-reads spans + reservations inside the
+            // lease so the release operates on current state, not a stale snapshot.
+            //
+            // KMS-side routing TODO: KMS currently routes ReclaimTargetGranules
+            // round-robin (kas_channels.client()), NOT shard-aware, so a reclaim can
+            // land on the wrong shard's KAS. With this `Leased` fence that misroute
+            // ABORTS (no held epoch / epoch mismatch -> commit fails) instead of
+            // corrupting state — SAFE but not yet correctly routed. See the
+            // matching TODO in kms/service.rs::reclaim_target_granules.
+            self.with_allocator_mutation_lease_full_state(async move {
+                let (reclaimed, dirty_targets) = {
+                    let mut state = self.state.lock().await;
+                    let mut by_target: HashMap<String, Vec<u64>> = HashMap::new();
+                    for granule in granules {
+                        by_target
+                            .entry(granule.target_id)
+                            .or_default()
+                            .push(granule.granule_index);
                     }
-                }
-                let dirty_targets = dirty_targets
-                    .into_iter()
-                    .filter_map(|target_id| state.targets.get(&target_id).cloned())
-                    .collect::<Vec<_>>();
-                (reclaimed, dirty_targets)
-            };
-            self.persist_state(&dirty_targets, &[], &[], &[], &[], &[])
+                    let mut reclaimed = 0u64;
+                    let mut dirty_targets = HashSet::new();
+                    for (target_id, indexes) in by_target {
+                        let entry = state.targets.get_mut(&target_id).ok_or_else(|| {
+                            Status::not_found(format!("unknown target {}", target_id))
+                        })?;
+                        for granule_index in indexes {
+                            if granule_index >= entry.target.granule_count {
+                                return Err(Status::invalid_argument(format!(
+                                    "granule {} is out of range for target {} capacity {}",
+                                    granule_index, target_id, entry.target.granule_count
+                                )));
+                            }
+                            if granule_is_free(&entry.spans, granule_index) {
+                                continue;
+                            }
+                            release_granule(&mut entry.spans, granule_index);
+                            entry.target.free_granules = span_free_count(&entry.spans);
+                            reclaimed = reclaimed.saturating_add(1);
+                            dirty_targets.insert(target_id.clone());
+                        }
+                    }
+                    let dirty_targets = dirty_targets
+                        .into_iter()
+                        .filter_map(|target_id| state.targets.get(&target_id).cloned())
+                        .collect::<Vec<_>>();
+                    (reclaimed, dirty_targets)
+                };
+                // Spans changed -> rewrite_spans = true; fenced by the held epoch.
+                self.persist_state(
+                    &dirty_targets,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    true,
+                    EpochFence::Leased,
+                )
                 .await?;
-            Ok(reclaimed)
+                Ok(reclaimed)
+            })
+            .await
         }
 
         async fn release_expired_reservations(
@@ -2245,6 +3007,70 @@ mod imp {
             .as_millis() as u64
     }
 
+    /// Pure epoch-fence grant decision (DESIGN_KAS_WRITE_SCALE.md §3/§4 change #3),
+    /// factored out of the FDB transaction so the bump rule is unit-testable.
+    ///
+    /// `existing` is `(owner_id, expires_at_unix_ms, epoch)` of the current lease
+    /// record, or `None` if no record exists. Returns `(available, epoch)` where
+    /// `available` is whether `owner_id` may take/keep the lease and `epoch` is the
+    /// fencing token it would hold:
+    ///   * absent record        -> grant, epoch 1 (first term);
+    ///   * same owner, still live -> self-renew, epoch UNCHANGED (never advance on
+    ///     renewal — that would invalidate the renewing leader's own writes);
+    ///   * expired (any owner)  -> NEW grant, epoch = old + 1 (advance the fence so
+    ///     a superseded leader's later commit aborts);
+    ///   * live, different owner -> not available, epoch 0 (caller is not leader).
+    /// Build the FDB write unit for one target (FIX B). The metadata record is
+    /// ALWAYS written. The span clear-range + chunk Sets are emitted ONLY when
+    /// `tw.span_rewrite` is `Some` (the caller passed `rewrite_spans = true`).
+    /// A span-neutral metadata write therefore produces exactly one op — the
+    /// record Set — and touches nothing under `PREFIX_TARGET_SPAN`, so it can
+    /// never clobber a leader's committed free spans. Returns `(ops, byte_size)`
+    /// for the byte-bounded batcher. Extracted as a free function so the
+    /// span-neutral invariant is directly unit-testable.
+    fn build_target_write_unit(tw: TargetWrite) -> (Vec<WriteOp>, usize) {
+        let chunk_count = tw
+            .span_rewrite
+            .as_ref()
+            .map(|rewrite| rewrite.chunk_writes.len())
+            .unwrap_or(0);
+        let mut ops = Vec::with_capacity(2 + chunk_count);
+        let mut bytes = tw.record_key.len() + tw.record_value.len();
+        ops.push(WriteOp::Set(tw.record_key, tw.record_value));
+        if let Some(rewrite) = tw.span_rewrite {
+            ops.push(WriteOp::ClearRange(rewrite.clear_begin, rewrite.clear_end));
+            for (key, value) in rewrite.chunk_writes {
+                bytes += key.len() + value.len();
+                ops.push(WriteOp::Set(key, value));
+            }
+        }
+        (ops, bytes)
+    }
+
+    fn decide_lease_grant(
+        existing: Option<(&str, u64, u64)>,
+        owner_id: &str,
+        now_ms: u64,
+    ) -> (bool, u64) {
+        match existing {
+            None => (true, 1),
+            Some((existing_owner, expires_at_unix_ms, existing_epoch)) => {
+                let same_owner = existing_owner == owner_id;
+                let live = expires_at_unix_ms > now_ms;
+                if same_owner && live {
+                    // Self-renew: keep epoch.
+                    (true, existing_epoch)
+                } else if !live {
+                    // Expired (ours or theirs): new grant, advance the fence.
+                    (true, existing_epoch.saturating_add(1))
+                } else {
+                    // Live and held by a different owner: not available.
+                    (false, 0)
+                }
+            }
+        }
+    }
+
     fn synthetic_reservation_result(
         reservation_id: &str,
         state: ReservationState,
@@ -2253,6 +3079,139 @@ mod imp {
             reservation_id: reservation_id.to_string(),
             state: state as i32,
             ..PlacementReservationRecord::default()
+        }
+    }
+
+    #[cfg(test)]
+    mod epoch_fence_tests {
+        use super::*;
+
+        const ME: &str = "owner-a";
+        const OTHER: &str = "owner-b";
+        const NOW: u64 = 1_000_000;
+
+        #[test]
+        fn first_grant_starts_at_epoch_one() {
+            // No record: first term is epoch 1 (0 is reserved for legacy /
+            // never-granted so a held epoch is always strictly greater).
+            assert_eq!(decide_lease_grant(None, ME, NOW), (true, 1));
+        }
+
+        #[test]
+        fn self_renew_keeps_epoch() {
+            // Same owner, still live -> renew, epoch UNCHANGED. Advancing here
+            // would fence out the renewing leader's own in-flight writes.
+            let existing = Some((ME, NOW + 5_000, 7));
+            assert_eq!(decide_lease_grant(existing, ME, NOW), (true, 7));
+        }
+
+        #[test]
+        fn new_grant_from_expired_other_owner_bumps_epoch() {
+            // A dead leader's lease expired; we take it and ADVANCE the fence so
+            // the old leader's resumed commit aborts (held epoch 5 < new 6).
+            let existing = Some((OTHER, NOW - 1, 5));
+            assert_eq!(decide_lease_grant(existing, ME, NOW), (true, 6));
+        }
+
+        #[test]
+        fn reacquiring_our_own_expired_lease_bumps_epoch() {
+            // Even our own expired lease is a NEW term: bump so any write that was
+            // in flight under the lapsed term is fenced out.
+            let existing = Some((ME, NOW - 1, 3));
+            assert_eq!(decide_lease_grant(existing, ME, NOW), (true, 4));
+        }
+
+        #[test]
+        fn live_lease_held_by_other_is_unavailable() {
+            // A different owner holds a live lease: we are not leader.
+            let existing = Some((OTHER, NOW + 5_000, 9));
+            assert_eq!(decide_lease_grant(existing, ME, NOW), (false, 0));
+        }
+
+        #[test]
+        fn expiry_boundary_is_exclusive_grant() {
+            // expires_at == now means expired (the `> now` liveness test fails),
+            // so it is a new grant that advances the fence.
+            let existing = Some((OTHER, NOW, 2));
+            assert_eq!(decide_lease_grant(existing, ME, NOW), (true, 3));
+        }
+
+        #[test]
+        fn epoch_is_monotonic_across_failovers() {
+            // Simulate A -> (expire) -> B -> (expire) -> A: epoch only ever rises.
+            let (_, e1) = decide_lease_grant(None, "A", NOW); // 1
+            let (_, e2) = decide_lease_grant(Some(("A", NOW - 1, e1)), "B", NOW); // 2
+            let (_, e3) = decide_lease_grant(Some(("B", NOW - 1, e2)), "A", NOW); // 3
+            assert!(e1 < e2 && e2 < e3, "epoch must be strictly monotonic");
+            assert_eq!((e1, e2, e3), (1, 2, 3));
+        }
+    }
+
+    #[cfg(test)]
+    mod span_neutral_write_tests {
+        use super::*;
+
+        fn record_only_target_write() -> TargetWrite {
+            TargetWrite {
+                record_key: target_key("epyc-target-07"),
+                record_value: b"{\"record\":true}".to_vec(),
+                span_rewrite: None,
+            }
+        }
+
+        #[test]
+        fn span_neutral_write_emits_only_the_record_set() {
+            // FIX B: a metadata-only write (rewrite_spans = false -> span_rewrite
+            // None) must produce EXACTLY the record Set and NOTHING under the span
+            // keyspace — no ClearRange, no chunk Sets. This is what stops a
+            // control-plane write from clobbering a leader's committed spans.
+            let (ops, _bytes) = build_target_write_unit(record_only_target_write());
+            assert_eq!(ops.len(), 1, "span-neutral write must emit one op");
+            match &ops[0] {
+                WriteOp::Set(key, _) => {
+                    assert_eq!(key, &target_key("epyc-target-07"));
+                    // The single op must NOT be under the span prefix.
+                    assert!(!key.starts_with(&target_span_all_prefix()));
+                }
+                other => panic!("expected a record Set, got {other:?}"),
+            }
+            // No op may touch the target's span keyspace.
+            let span_prefix = target_span_prefix("epyc-target-07");
+            for op in &ops {
+                match op {
+                    WriteOp::ClearRange(begin, _) => {
+                        assert!(!begin.starts_with(&span_prefix), "must not clear spans");
+                    }
+                    WriteOp::Set(key, _) | WriteOp::Clear(key) => {
+                        assert!(!key.starts_with(&span_prefix), "must not write span chunks");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn span_rewriting_write_clears_then_writes_chunks() {
+            // The reserve/reclaim/reset path (rewrite_spans = true) DOES rewrite:
+            // the unit clears the target's span prefix and writes its chunk(s).
+            let id = "epyc-target-07";
+            let span_prefix = target_span_prefix(id);
+            let span_end = prefix_range_end(&span_prefix);
+            let chunk_key = target_span_chunk_key(id, 0);
+            let tw = TargetWrite {
+                record_key: target_key(id),
+                record_value: b"{\"record\":true}".to_vec(),
+                span_rewrite: Some(TargetSpanRewrite {
+                    clear_begin: span_prefix.clone(),
+                    clear_end: span_end.clone(),
+                    chunk_writes: vec![(chunk_key.clone(), b"{\"spans\":[]}".to_vec())],
+                }),
+            };
+            let (ops, _bytes) = build_target_write_unit(tw);
+            // record Set, then ClearRange(span), then one chunk Set.
+            assert_eq!(ops.len(), 3);
+            assert_eq!(ops[0], WriteOp::Set(target_key(id), b"{\"record\":true}".to_vec()));
+            assert_eq!(ops[1], WriteOp::ClearRange(span_prefix, span_end));
+            assert_eq!(ops[2], WriteOp::Set(chunk_key, b"{\"spans\":[]}".to_vec()));
         }
     }
 
@@ -2332,12 +3291,18 @@ mod imp {
         pub(crate) fn connect(
             _cluster_file: &str,
             _allocation_shard_id: Option<String>,
+            _leader_resident_lease: bool,
+            _stats: Option<std::sync::Arc<crate::stats::KasStats>>,
         ) -> Result<Self, Box<dyn Error>> {
             Err(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "FoundationDB-backed KAS is only supported on Linux",
             )))
         }
+
+        /// Signature parity with the Linux impl; the non-Linux store never
+        /// constructs successfully, so this is unreachable in practice.
+        pub(crate) fn start_leader_resident_renewer(&self) {}
     }
 
     #[tonic::async_trait]

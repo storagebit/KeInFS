@@ -28,6 +28,21 @@ pub(crate) struct Config {
     pub(crate) reservation_bin_top_up_chunk: usize,
     pub(crate) reservation_bin_bypass_batch_size: usize,
     pub(crate) reset_allocator_state_and_exit: bool,
+    /// Phase-2 write-scale opt-in (DESIGN_KAS_WRITE_SCALE.md §3 change #2/#4).
+    ///
+    /// When `false` (the default) the allocator keeps the historical
+    /// acquire-lease / refresh / mutate / release-lease dance on every mutating
+    /// op. When `true` the leader acquires the per-shard coordination lease once,
+    /// renews it in the background at TTL/2, drops the per-op stamp read while the
+    /// lease is held, and gives it up only on step-down / lost renewal / observed
+    /// epoch bump. The behavior change is gated so the default build keeps the
+    /// proven path and the new path is opt-in for lab validation + rollback.
+    ///
+    /// The epoch fence itself (the in-txn epoch read+assert that makes the
+    /// leader-resident lease split-brain-safe) is *always* on — it is strictly
+    /// stronger than the per-op stamp reload it replaces and is safe with either
+    /// lease model. This flag only gates the lease-hold/renew/drop-stamp behavior.
+    pub(crate) allocator_leader_resident_lease: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -49,6 +64,7 @@ struct FileConfig {
     reservation_bin_top_up_chunk: Option<usize>,
     reservation_bin_bypass_batch_size: Option<usize>,
     reset_allocator_state_and_exit: Option<bool>,
+    allocator_leader_resident_lease: Option<bool>,
 }
 
 impl Config {
@@ -76,6 +92,10 @@ impl Config {
             reservation_bin_top_up_chunk: 2_048,
             reservation_bin_bypass_batch_size: 2_048,
             reset_allocator_state_and_exit: false,
+            // Default FALSE: keep the current per-op acquire/release lease path.
+            // The leader-resident lease + dropped per-op stamp read is opt-in
+            // (DESIGN_KAS_WRITE_SCALE.md §3 change #2/#4, §5 Phase 2).
+            allocator_leader_resident_lease: false,
         })
     }
 
@@ -149,6 +169,9 @@ impl Config {
         if let Some(value) = file.reset_allocator_state_and_exit {
             self.reset_allocator_state_and_exit = value;
         }
+        if let Some(value) = file.allocator_leader_resident_lease {
+            self.allocator_leader_resident_lease = value;
+        }
 
         Ok(())
     }
@@ -198,7 +221,8 @@ impl Config {
                 "reservation_bin_high_watermark={}\n",
                 "reservation_bin_top_up_chunk={}\n",
                 "reservation_bin_bypass_batch_size={}\n",
-                "reset_allocator_state_and_exit={}\n"
+                "reset_allocator_state_and_exit={}\n",
+                "allocator_leader_resident_lease={}\n"
             ),
             self.listen_addr,
             self.public_endpoint,
@@ -217,6 +241,7 @@ impl Config {
             self.reservation_bin_top_up_chunk,
             self.reservation_bin_bypass_batch_size,
             self.reset_allocator_state_and_exit,
+            self.allocator_leader_resident_lease,
         )
     }
 }
@@ -339,6 +364,9 @@ pub(crate) fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn Error>> {
             "--reset-allocator-state-and-exit" => {
                 config.reset_allocator_state_and_exit = true;
             }
+            "--allocator-leader-resident-lease" => {
+                config.allocator_leader_resident_lease = true;
+            }
             flag => {
                 return Err(arg_error(format!(
                     "unknown KAS option `{flag}`\n\n{}",
@@ -392,7 +420,7 @@ fn normalize_endpoint(value: String) -> String {
 }
 
 fn usage() -> String {
-    "kas [--config /etc/keinfs/kas.toml] [--listen 127.0.0.1:50061] [--public-endpoint http://127.0.0.1:50061] [--allocation-shard-id alloc-shard-00] [--foundationdb-cluster-file /etc/foundationdb/fdb.cluster] [--service-heartbeat-ms 30000] [--stats-root /run/keinfs/kas] [--stats-publish-ms 250] [--reservation-ttl-ms 30000] [--reservation-reap-ms 1000] [--reservation-reap-limit 256] [--reserve-batch-size 4096] [--reservation-bin-refill-ms 250] [--reservation-bin-low-watermark 2048] [--reservation-bin-high-watermark 8192] [--reservation-bin-top-up-chunk 65536] [--reservation-bin-bypass-batch-size 2048] [--reset-allocator-state-and-exit]"
+    "kas [--config /etc/keinfs/kas.toml] [--listen 127.0.0.1:50061] [--public-endpoint http://127.0.0.1:50061] [--allocation-shard-id alloc-shard-00] [--foundationdb-cluster-file /etc/foundationdb/fdb.cluster] [--service-heartbeat-ms 30000] [--stats-root /run/keinfs/kas] [--stats-publish-ms 250] [--reservation-ttl-ms 30000] [--reservation-reap-ms 1000] [--reservation-reap-limit 256] [--reserve-batch-size 4096] [--reservation-bin-refill-ms 250] [--reservation-bin-low-watermark 2048] [--reservation-bin-high-watermark 8192] [--reservation-bin-top-up-chunk 65536] [--reservation-bin-bypass-batch-size 2048] [--allocator-leader-resident-lease] [--reset-allocator-state-and-exit]"
         .to_string()
 }
 
@@ -416,6 +444,20 @@ mod tests {
             "/etc/foundationdb/fdb.cluster"
         );
         assert_eq!(defaults.listen_addr.to_string(), "127.0.0.1:50061");
+        // The leader-resident lease (Phase-2 write-scale opt-in) is OFF by
+        // default so the default build keeps the proven per-op lease path.
+        assert!(!defaults.allocator_leader_resident_lease);
+    }
+
+    #[test]
+    fn leader_resident_lease_flag_is_opt_in() {
+        let parsed = parse_args(vec![
+            "--foundationdb-cluster-file".to_string(),
+            "/tmp/fdb.cluster".to_string(),
+            "--allocator-leader-resident-lease".to_string(),
+        ])
+        .expect("parsed args");
+        assert!(parsed.allocator_leader_resident_lease);
     }
 
     #[test]

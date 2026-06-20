@@ -49,10 +49,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.stats_publish_interval,
     )?;
 
-    let store: Arc<dyn AllocatorStore> = Arc::new(FdbKasStore::connect(
+    let fdb_store = FdbKasStore::connect(
         &config.foundationdb_cluster_file,
         Some(config.allocation_shard_id.clone()),
-    )?);
+        config.allocator_leader_resident_lease,
+        Some(stats.clone()),
+    )?;
+    // Phase-2 opt-in: start the leader-resident lease renewer (no-op unless the
+    // flag is set). Must run inside the tokio runtime, which `#[tokio::main]`
+    // provides here. The reset-and-exit path below uses the default config, so
+    // the flag is off there and nothing spawns.
+    fdb_store.start_leader_resident_renewer();
+    let store: Arc<dyn AllocatorStore> = Arc::new(fdb_store);
     if config.reset_allocator_state_and_exit {
         store.init().await?;
         store.reset_allocator_state().await?;

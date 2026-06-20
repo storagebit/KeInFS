@@ -67,6 +67,8 @@ pub(crate) struct KasSnapshot {
     pub(crate) reserve_replacement_requests: u64,
     pub(crate) reservation_reaper_runs: u64,
     pub(crate) reservation_reaper_released: u64,
+    pub(crate) fenced_commit_aborts: u64,
+    pub(crate) leader_renew_failures: u64,
     pub(crate) rpcs: BTreeMap<String, RpcSnapshot>,
     pub(crate) last_error: Option<String>,
 }
@@ -83,6 +85,8 @@ struct RuntimeStatusSnapshot {
     total_errors: u64,
     reservation_reaper_runs: u64,
     reservation_reaper_released: u64,
+    fenced_commit_aborts: u64,
+    leader_renew_failures: u64,
     last_error: Option<String>,
 }
 
@@ -212,6 +216,16 @@ pub(crate) struct KasStats {
     reserve_replacement_placement: RpcRuntimeStats,
     reservation_reaper_runs: AtomicU64,
     reservation_reaper_released: AtomicU64,
+    // DESIGN_KAS_WRITE_SCALE.md §3/§4 fence observability. Incremented when a
+    // `commit_write_ops` aborts because the held epoch no longer matches the
+    // durable lease epoch (a newer leader has taken the shard). A nonzero count
+    // is the signal that fault-injection failover actually fenced a superseded
+    // leader's write rather than corrupting state.
+    fenced_commit_aborts: AtomicU64,
+    // Incremented when the leader-resident renewer fails to renew / steps down
+    // (lost lease, epoch advanced under us, or renewal RPC error). Makes a
+    // step-down visible instead of silent (the renewer is a detached spawn).
+    leader_renew_failures: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
 
@@ -244,6 +258,8 @@ impl KasStats {
             reserve_replacement_placement: RpcRuntimeStats::new(),
             reservation_reaper_runs: AtomicU64::new(0),
             reservation_reaper_released: AtomicU64::new(0),
+            fenced_commit_aborts: AtomicU64::new(0),
+            leader_renew_failures: AtomicU64::new(0),
             last_error: Mutex::new(None),
         })
     }
@@ -325,6 +341,8 @@ impl KasStats {
                 .load(Ordering::Relaxed),
             reservation_reaper_runs: self.reservation_reaper_runs.load(Ordering::Relaxed),
             reservation_reaper_released: self.reservation_reaper_released.load(Ordering::Relaxed),
+            fenced_commit_aborts: self.fenced_commit_aborts.load(Ordering::Relaxed),
+            leader_renew_failures: self.leader_renew_failures.load(Ordering::Relaxed),
             rpcs,
             last_error: self.last_error.lock().unwrap().clone(),
         }
@@ -355,6 +373,22 @@ impl KasStats {
         self.reservation_reaper_runs.fetch_add(1, Ordering::Relaxed);
         self.reservation_reaper_released
             .fetch_add(released as u64, Ordering::Relaxed);
+    }
+
+    /// A fenced allocator commit aborted on an epoch mismatch (a newer leader has
+    /// taken the shard). DESIGN_KAS_WRITE_SCALE.md §3/§4. Only the Linux
+    /// FDB-backed store calls this, so it is dead on a non-Linux host build.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn record_fenced_commit_abort(&self) {
+        self.fenced_commit_aborts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The leader-resident lease renewer failed / stepped down. Surfaced so a
+    /// detached renewer's loss of leadership is visible, not silent. Only the
+    /// Linux FDB-backed store calls this.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn record_leader_renew_failure(&self) {
+        self.leader_renew_failures.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn set_last_error(&self, message: impl Into<String>) {
@@ -513,6 +547,8 @@ impl RuntimeStatusSnapshot {
             total_errors: snapshot.total_errors,
             reservation_reaper_runs: snapshot.reservation_reaper_runs,
             reservation_reaper_released: snapshot.reservation_reaper_released,
+            fenced_commit_aborts: snapshot.fenced_commit_aborts,
+            leader_renew_failures: snapshot.leader_renew_failures,
             last_error: snapshot.last_error.clone(),
         }
     }
