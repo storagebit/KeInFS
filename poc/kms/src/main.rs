@@ -19,8 +19,8 @@ use keinctl::proto::kms_server::KmsServer;
 use read_cache::ResolveObjectReadCache;
 use service::{
     reap_expired_intents, reconcile_pending_reservations, reservation_mutation_dispatch_loop,
-    KasEndpoint, KasEndpointBalancer, KmsService, ReservationCache, ReservationCacheConfig,
-    ReservationMutationDispatcher,
+    AllocationRouteCache, KasEndpoint, KasEndpointBalancer, KmsService, ReservationCache,
+    ReservationCacheConfig, ReservationMutationDispatcher,
 };
 use stats::{KmsIdentity, KmsStats, Publisher};
 use store::KmsStore;
@@ -117,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             single_window_seed_batch: config.reservation_cache_single_window_seed_batch,
             initiate_write_window_max_stripes: config.initiate_write_window_max_stripes,
         }),
+        route_cache: AllocationRouteCache::new(config.allocation_route_cache_ttl, stats.clone()),
         write_profile_max_stripes: config.write_profile_max_stripes,
         write_profile_min_fragment_bytes: config.write_profile_min_fragment_bytes,
         reservation_mutation_batch_size: config.reservation_mutation_batch_size,

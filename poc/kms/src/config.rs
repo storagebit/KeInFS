@@ -36,6 +36,10 @@ pub(crate) struct Config {
     pub(crate) reservation_cache_stale_refill: Duration,
     pub(crate) reservation_cache_small_object_max_stripes: usize,
     pub(crate) reservation_cache_single_window_seed_batch: usize,
+    // Phase 1 #5: TTL for the allocation-shard route cache. While fresh,
+    // foreground reserves resolve shard count from RAM instead of issuing ~6
+    // `list_service_instances` RPCs to KAS per reserve.
+    pub(crate) allocation_route_cache_ttl: Duration,
     pub(crate) initiate_write_window_max_stripes: usize,
     pub(crate) large_write_initiate_max_concurrency: usize,
     pub(crate) write_profile_max_stripes: usize,
@@ -83,6 +87,7 @@ struct FileConfig {
     reservation_cache_stale_refill_ms: Option<u64>,
     reservation_cache_small_object_max_stripes: Option<usize>,
     reservation_cache_single_window_seed_batch: Option<usize>,
+    allocation_route_cache_ttl_ms: Option<u64>,
     initiate_write_window_max_stripes: Option<usize>,
     large_write_initiate_max_concurrency: Option<usize>,
     write_profile_max_stripes: Option<usize>,
@@ -125,6 +130,7 @@ impl Config {
             reservation_cache_stale_refill: Duration::from_millis(180_000),
             reservation_cache_small_object_max_stripes: 64,
             reservation_cache_single_window_seed_batch: 4_096,
+            allocation_route_cache_ttl: Duration::from_millis(5_000),
             initiate_write_window_max_stripes: 256,
             large_write_initiate_max_concurrency: 1,
             write_profile_max_stripes: 8,
@@ -233,6 +239,9 @@ impl Config {
         }
         if let Some(value) = file.reservation_cache_single_window_seed_batch {
             self.reservation_cache_single_window_seed_batch = value;
+        }
+        if let Some(value) = file.allocation_route_cache_ttl_ms {
+            self.allocation_route_cache_ttl = Duration::from_millis(value.max(250));
         }
         if let Some(value) = file.initiate_write_window_max_stripes {
             self.initiate_write_window_max_stripes = value;
@@ -378,6 +387,7 @@ impl Config {
                 "reservation_cache_stale_refill_ms={}\n",
                 "reservation_cache_small_object_max_stripes={}\n",
                 "reservation_cache_single_window_seed_batch={}\n",
+                "allocation_route_cache_ttl_ms={}\n",
                 "initiate_write_window_max_stripes={}\n",
                 "large_write_initiate_max_concurrency={}\n",
                 "write_profile_max_stripes={}\n",
@@ -416,6 +426,7 @@ impl Config {
             self.reservation_cache_stale_refill.as_millis(),
             self.reservation_cache_small_object_max_stripes,
             self.reservation_cache_single_window_seed_batch,
+            self.allocation_route_cache_ttl.as_millis(),
             self.initiate_write_window_max_stripes,
             self.large_write_initiate_max_concurrency,
             self.write_profile_max_stripes,
@@ -618,6 +629,12 @@ pub(crate) fn parse_args(args: Vec<String>) -> Result<Config, Box<dyn Error>> {
                 i += 1;
                 config.reservation_cache_single_window_seed_batch =
                     parse_usize_arg(args.get(i), "--reservation-cache-single-window-seed-batch")?;
+            }
+            "--allocation-route-cache-ttl-ms" => {
+                i += 1;
+                config.allocation_route_cache_ttl = Duration::from_millis(
+                    parse_u64_arg(args.get(i), "--allocation-route-cache-ttl-ms")?.max(250),
+                );
             }
             "--initiate-write-window-max-stripes" => {
                 i += 1;

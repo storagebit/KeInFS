@@ -104,6 +104,12 @@ pub(crate) struct KmsSnapshot {
     pub(crate) reservation_cache_misses: u64,
     pub(crate) reservation_cache_refills: u64,
     pub(crate) reservation_cache_depth: u64,
+    pub(crate) route_discovery_lookups: u64,
+    pub(crate) route_discovery_rpcs: u64,
+    pub(crate) route_cache_hits: u64,
+    pub(crate) route_cache_misses: u64,
+    pub(crate) reservation_cache_shard_bypasses: u64,
+    pub(crate) reservation_cache_serves: u64,
     pub(crate) rpcs: BTreeMap<String, RpcSnapshot>,
     pub(crate) background: BackgroundSnapshot,
     pub(crate) last_error: Option<String>,
@@ -237,6 +243,15 @@ pub(crate) struct KmsStats {
     reservation_cache_misses: AtomicU64,
     reservation_cache_refills: AtomicU64,
     reservation_cache_depth: AtomicU64,
+    // Phase 0 write-scale instrumentation. These surface the reserve-path
+    // decomposition the lab needs to measure each later phase (route-discovery
+    // amplification, cache effectiveness, synchronous KAS bypasses).
+    route_discovery_lookups: AtomicU64,
+    route_discovery_rpcs: AtomicU64,
+    route_cache_hits: AtomicU64,
+    route_cache_misses: AtomicU64,
+    reservation_cache_shard_bypasses: AtomicU64,
+    reservation_cache_serves: AtomicU64,
     reaper_runs: AtomicU64,
     reaper_released_reservations: AtomicU64,
     reaper_latency: Mutex<LatencyRecorder>,
@@ -299,6 +314,12 @@ impl KmsStats {
             reservation_cache_misses: AtomicU64::new(0),
             reservation_cache_refills: AtomicU64::new(0),
             reservation_cache_depth: AtomicU64::new(0),
+            route_discovery_lookups: AtomicU64::new(0),
+            route_discovery_rpcs: AtomicU64::new(0),
+            route_cache_hits: AtomicU64::new(0),
+            route_cache_misses: AtomicU64::new(0),
+            reservation_cache_shard_bypasses: AtomicU64::new(0),
+            reservation_cache_serves: AtomicU64::new(0),
             reaper_runs: AtomicU64::new(0),
             reaper_released_reservations: AtomicU64::new(0),
             reaper_latency: Mutex::new(LatencyRecorder::default()),
@@ -392,6 +413,42 @@ impl KmsStats {
     pub(crate) fn set_reservation_cache_depth(&self, depth: usize) {
         self.reservation_cache_depth
             .store(depth as u64, Ordering::Relaxed);
+    }
+
+    /// Phase 0: record one allocation-shard route resolution and the number of
+    /// `list_service_instances` RPCs it actually issued to KAS. With the
+    /// uncached resolver this is ~6 RPCs/reserve; with the TTL route cache
+    /// (Phase 1 #5) it should fall toward ~0 RPCs per lookup.
+    pub(crate) fn record_route_discovery(&self, rpc_count: usize) {
+        self.route_discovery_lookups.fetch_add(1, Ordering::Relaxed);
+        self.route_discovery_rpcs
+            .fetch_add(rpc_count as u64, Ordering::Relaxed);
+    }
+
+    /// Phase 0/1 #5: route TTL-cache hit (served from RAM, no KAS RPC).
+    pub(crate) fn record_route_cache_hit(&self) {
+        self.route_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Phase 0/1 #5: route TTL-cache miss (forced a fresh discovery).
+    pub(crate) fn record_route_cache_miss(&self) {
+        self.route_cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Phase 0: a foreground reserve that fell through to a synchronous KAS
+    /// `reserve_stripe_batch` instead of draining the pool. On a multi-shard
+    /// cluster this is the dominant write-scale bottleneck; Phase 1 #1 should
+    /// drive it toward zero.
+    pub(crate) fn record_reservation_cache_shard_bypass(&self) {
+        self.reservation_cache_shard_bypasses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Phase 0: a foreground reserve served from the pool branch (cache path),
+    /// regardless of whether each stripe hit or had to refill on demand.
+    pub(crate) fn record_reservation_cache_serve(&self) {
+        self.reservation_cache_serves
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_reaper_run(&self, elapsed: Duration, released_reservations: usize) {
@@ -500,6 +557,14 @@ impl KmsStats {
             reservation_cache_misses: self.reservation_cache_misses.load(Ordering::Relaxed),
             reservation_cache_refills: self.reservation_cache_refills.load(Ordering::Relaxed),
             reservation_cache_depth: self.reservation_cache_depth.load(Ordering::Relaxed),
+            route_discovery_lookups: self.route_discovery_lookups.load(Ordering::Relaxed),
+            route_discovery_rpcs: self.route_discovery_rpcs.load(Ordering::Relaxed),
+            route_cache_hits: self.route_cache_hits.load(Ordering::Relaxed),
+            route_cache_misses: self.route_cache_misses.load(Ordering::Relaxed),
+            reservation_cache_shard_bypasses: self
+                .reservation_cache_shard_bypasses
+                .load(Ordering::Relaxed),
+            reservation_cache_serves: self.reservation_cache_serves.load(Ordering::Relaxed),
             rpcs,
             background: BackgroundSnapshot {
                 runs: self.reaper_runs.load(Ordering::Relaxed),

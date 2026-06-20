@@ -106,6 +106,7 @@ pub(crate) struct KmsService {
     pub(crate) reservation_finalizer_grace: Duration,
     pub(crate) large_write_initiate_gate: Arc<Semaphore>,
     pub(crate) reservation_cache: ReservationCache,
+    pub(crate) route_cache: AllocationRouteCache,
     pub(crate) write_profile_max_stripes: usize,
     pub(crate) write_profile_min_fragment_bytes: u32,
     pub(crate) reservation_mutation_batch_size: usize,
@@ -2602,15 +2603,24 @@ impl KmsService {
         }
         let remaining_after_window = total_stripes.saturating_sub(window_end);
         let configured_kas_endpoint_count = self.kas_channels.endpoint_count().max(1);
-        let discovered_allocation_shard_count = match discover_allocation_shard_routes(
-            self.kas_channels.clone(),
-            self.kas_rpc_timeout.min(Duration::from_secs(5)),
-        )
-        .await
-        {
-            Ok(routes) => routes.len(),
-            Err(_) => 1,
-        };
+        // Phase 1 #5: shard-count comes from the TTL route cache, not a fresh
+        // per-reserve discovery. The cache records its own hit/miss + RPC count
+        // (Phase 0). We still record the wall-time spent here so the lab can see
+        // route resolution drop toward ~0 once the cache warms.
+        let route_phase_started = Instant::now();
+        let discovered_allocation_shard_count = self
+            .route_cache
+            .shard_count(
+                self.kas_channels.clone(),
+                self.kas_rpc_timeout.min(Duration::from_secs(5)),
+            )
+            .await
+            .max(1);
+        self.stats.record_phase(
+            kind,
+            "reserve_route_resolve",
+            route_phase_started.elapsed(),
+        );
         let allocation_shard_count =
             discovered_allocation_shard_count.max(configured_kas_endpoint_count);
         let use_shared_reservation_cache = shared_reservation_cache_enabled(
@@ -2619,7 +2629,13 @@ impl KmsService {
             self.reservation_cache.small_object_max_stripes(),
             allocation_shard_count,
         );
-        if !use_shared_reservation_cache && allocation_shard_count > 1 {
+        // Phase 0: distinguish the pool (cache) branch from the synchronous KAS
+        // bypass. On multi-shard with Phase 1 #1 the bypass counter should fall
+        // toward zero; previously it was hit on every multi-shard reserve.
+        if use_shared_reservation_cache {
+            self.stats.record_reservation_cache_serve();
+        } else if allocation_shard_count > 1 {
+            self.stats.record_reservation_cache_shard_bypass();
             self.stats
                 .record_phase(kind, "reserve_cache_shard_bypass", Duration::ZERO);
         }
@@ -2634,8 +2650,10 @@ impl KmsService {
             )
             .await?
         } else {
-            reserve_stripe_batch(
+            let bypass_started = Instant::now();
+            let reserved = reserve_stripe_batch(
                 self.kas_channels.clone(),
+                &self.route_cache,
                 window_stripe_count,
                 ec_profile,
                 self.reservation_cache.reservation_ttl_ms(),
@@ -2643,7 +2661,15 @@ impl KmsService {
                 self.kas_reserve_attempt_timeout,
                 self.reservation_mutation_batch_size,
             )
-            .await?
+            .await?;
+            // Phase 0: latency of the synchronous foreground KAS reserve, so the
+            // lab can attribute the bypass cost separately from the pool path.
+            self.stats.record_phase(
+                kind,
+                "reserve_stripe_batch_sync",
+                bypass_started.elapsed(),
+            );
+            reserved
         };
         self.stats
             .record_phase(kind, "reservation_cache_acquire", phase_started.elapsed());
@@ -2875,12 +2901,18 @@ impl KmsService {
 
         let cache = self.reservation_cache.clone();
         let kas_channels = self.kas_channels.clone();
+        let route_cache = self.route_cache.clone();
         let stats = self.stats.clone();
         let kas_rpc_timeout = self.kas_rpc_timeout;
         let reservation_mutation_batch_size = self.reservation_mutation_batch_size;
         tokio::spawn(async move {
+            // Phase 1 #1/#6: the BACKGROUND refill assembles full stripes via
+            // the sharded reserve path (and so benefits from the concurrent
+            // per-shard fan-out). This is what keeps the foreground reserve off
+            // a synchronous KAS call on multi-shard.
             let result = reserve_stripe_batch(
                 kas_channels,
+                &route_cache,
                 batch_size,
                 &ec_profile,
                 cache.reservation_ttl_ms(),
@@ -2927,6 +2959,7 @@ impl KmsService {
         let direct_started = Instant::now();
         let reservations = reserve_stripe_batch(
             self.kas_channels.clone(),
+            &self.route_cache,
             batch_size,
             ec_profile,
             self.reservation_cache.reservation_ttl_ms(),
@@ -3253,6 +3286,7 @@ async fn send_reservation_mutation_batches(
     let routes = resolved_allocation_shard_routes(
         kas_channels.clone(),
         rpc_timeout.min(Duration::from_secs(5)),
+        None,
     )
     .await;
     if routes.is_empty() {
@@ -3373,6 +3407,23 @@ fn is_idempotent_reservation_finalize_error(status: &Status) -> bool {
             || status.message().contains("is not finalizable"))
 }
 
+/// FIX C (DESIGN_KAS_WRITE_SCALE.md §4/§7): whether a per-shard reserve error
+/// means the route is now stale (a leadership change on the target KAS shard)
+/// and the [`AllocationRouteCache`] must be invalidated for immediate
+/// re-discovery rather than retried for the route TTL.
+///
+/// With the always-on epoch fence (#3) a demoted-but-reachable old leader does
+/// NOT return `Unavailable`; it returns `Aborted` (its fenced commit hit an
+/// advanced epoch) or `FailedPrecondition` (not-leader/superseded). Treating
+/// only `Unavailable` as a re-route signal — as the original code did — would
+/// keep routing reserves to that demoted leader until the TTL elapsed.
+fn route_change_should_invalidate(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Aborted | tonic::Code::FailedPrecondition
+    )
+}
+
 #[derive(Clone)]
 struct AllocationShardRoute {
     shard_id: String,
@@ -3380,8 +3431,118 @@ struct AllocationShardRoute {
     channel: Channel,
 }
 
+/// Phase 1 #5 — TTL cache for allocation-shard route discovery.
+///
+/// Before this, `discover_allocation_shard_routes` ran *uncached* on every
+/// reserve (`reserve_object_write_window` at ~2605) and *again* inside
+/// `reserve_stripe_batch -> resolved_allocation_shard_routes` (~3551), so a
+/// single foreground reserve issued ~6 `list_service_instances` RPCs to KAS.
+/// This memoizes the merged-and-resolved route set for a configurable TTL
+/// (default ~5s) so steady-state reserves read routes from RAM.
+///
+/// Failover safety: a per-shard reserve that comes back `UNAVAILABLE` (e.g. a
+/// demoted leader after a KAS failover) calls [`AllocationRouteCache::invalidate`]
+/// so the *next* resolve re-discovers rather than silently retrying the stale
+/// route. (See `reserve_stripe_batch_sharded`.)
+#[derive(Clone)]
+pub(crate) struct AllocationRouteCache {
+    inner: Arc<AllocationRouteCacheInner>,
+}
+
+struct AllocationRouteCacheInner {
+    // Cached, fully-resolved (discovered ∪ configured) route set + the instant
+    // it was fetched. `None` => cold / explicitly invalidated.
+    cached: Mutex<Option<CachedAllocationRoutes>>,
+    // Single-flight refresh guard so a thundering herd of foreground reserves
+    // does not all stampede KAS with discovery RPCs on a cold/expired cache.
+    refresh_lock: tokio::sync::Mutex<()>,
+    ttl: Duration,
+    stats: Arc<KmsStats>,
+}
+
+#[derive(Clone)]
+struct CachedAllocationRoutes {
+    routes: Vec<AllocationShardRoute>,
+    fetched_at: Instant,
+}
+
+impl AllocationRouteCache {
+    pub(crate) fn new(ttl: Duration, stats: Arc<KmsStats>) -> Self {
+        Self {
+            inner: Arc::new(AllocationRouteCacheInner {
+                cached: Mutex::new(None),
+                refresh_lock: tokio::sync::Mutex::new(()),
+                ttl,
+                stats,
+            }),
+        }
+    }
+
+    fn fresh_snapshot(&self) -> Option<Vec<AllocationShardRoute>> {
+        let guard = self.inner.cached.lock().unwrap();
+        guard.as_ref().and_then(|cached| {
+            if cached.fetched_at.elapsed() < self.inner.ttl {
+                Some(cached.routes.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Force the next [`resolve`](Self::resolve) to re-discover. Called on a
+    /// per-shard `UNAVAILABLE` so a leadership change is picked up immediately
+    /// instead of waiting out the TTL on a demoted leader.
+    pub(crate) fn invalidate(&self) {
+        *self.inner.cached.lock().unwrap() = None;
+    }
+
+    /// Return the resolved allocation-shard routes, served from the TTL cache
+    /// when fresh and otherwise re-discovered under a single-flight guard.
+    async fn resolve(
+        &self,
+        kas_channels: KasEndpointBalancer,
+        rpc_timeout: Duration,
+    ) -> Vec<AllocationShardRoute> {
+        if let Some(routes) = self.fresh_snapshot() {
+            self.inner.stats.record_route_cache_hit();
+            return routes;
+        }
+        // Cold or expired: serialize discovery so concurrent reserves do not
+        // each fan out their own ~6 RPCs.
+        let _refresh = self.inner.refresh_lock.lock().await;
+        // Re-check under the refresh lock: another task may have just refilled
+        // it while we waited for the guard.
+        if let Some(routes) = self.fresh_snapshot() {
+            self.inner.stats.record_route_cache_hit();
+            return routes;
+        }
+        self.inner.stats.record_route_cache_miss();
+        let routes =
+            resolved_allocation_shard_routes(kas_channels, rpc_timeout, Some(&self.inner.stats))
+                .await;
+        if !routes.is_empty() {
+            *self.inner.cached.lock().unwrap() = Some(CachedAllocationRoutes {
+                routes: routes.clone(),
+                fetched_at: Instant::now(),
+            });
+        }
+        routes
+    }
+
+    /// Count of currently-cached routes (fresh only), for the foreground
+    /// shard-count decision. Does *not* issue RPCs.
+    async fn shard_count(
+        &self,
+        kas_channels: KasEndpointBalancer,
+        rpc_timeout: Duration,
+    ) -> usize {
+        self.resolve(kas_channels, rpc_timeout).await.len()
+    }
+}
+
 async fn reserve_stripe_batch(
     kas_channels: KasEndpointBalancer,
+    route_cache: &AllocationRouteCache,
     batch_size: usize,
     profile: &EcProfile,
     reservation_ttl_ms: u64,
@@ -3393,14 +3554,16 @@ async fn reserve_stripe_batch(
         return Ok(Vec::new());
     }
 
-    let routes = resolved_allocation_shard_routes(
-        kas_channels.clone(),
-        rpc_timeout.min(Duration::from_secs(5)),
-    )
-    .await;
+    // Phase 1 #5: route discovery is served from the TTL cache. This is the
+    // background-refill / single-shard-fallback path; the foreground reserve
+    // resolves shard count via the same cache before deciding to use the pool.
+    let routes = route_cache
+        .resolve(kas_channels.clone(), rpc_timeout.min(Duration::from_secs(5)))
+        .await;
     if routes.len() > 1 {
         return reserve_stripe_batch_sharded(
             kas_channels,
+            route_cache,
             routes,
             batch_size,
             profile,
@@ -3428,15 +3591,20 @@ async fn reserve_stripe_batch(
 async fn discover_allocation_shard_routes(
     kas_channels: KasEndpointBalancer,
     rpc_timeout: Duration,
+    stats: Option<&KmsStats>,
 ) -> Result<Vec<AllocationShardRoute>, Status> {
     let now_ms = now_unix_ms();
     let mut last_err = None;
     let mut fresh_routes = HashMap::new();
     let mut stale_routes = HashMap::new();
+    // Phase 0: count the list_service_instances RPCs this single resolution
+    // issued so the lab can measure route-discovery amplification per reserve.
+    let mut rpc_count = 0usize;
     for endpoint in kas_channels.ordered_endpoints() {
         let mut client = KasClient::new(endpoint.channel.clone())
             .max_decoding_message_size(KAS_GRPC_MAX_MESSAGE_BYTES)
             .max_encoding_message_size(KAS_GRPC_MAX_MESSAGE_BYTES);
+        rpc_count += 1;
         let service_instances = match timeout(
             rpc_timeout,
             client.list_service_instances(Request::new(ListServiceInstancesRequest {
@@ -3470,6 +3638,9 @@ async fn discover_allocation_shard_routes(
         if fresh_routes.len() >= kas_channels.endpoint_count() {
             break;
         }
+    }
+    if let Some(stats) = stats {
+        stats.record_route_discovery(rpc_count);
     }
 
     let routes = finalize_discovered_allocation_shard_routes(fresh_routes, stale_routes);
@@ -3551,9 +3722,10 @@ fn merge_configured_allocation_shard_routes(
 async fn resolved_allocation_shard_routes(
     kas_channels: KasEndpointBalancer,
     rpc_timeout: Duration,
+    stats: Option<&KmsStats>,
 ) -> Vec<AllocationShardRoute> {
     let configured_routes = configured_allocation_shard_routes(&kas_channels);
-    let discovered_routes = discover_allocation_shard_routes(kas_channels, rpc_timeout)
+    let discovered_routes = discover_allocation_shard_routes(kas_channels, rpc_timeout, stats)
         .await
         .unwrap_or_default();
     merge_configured_allocation_shard_routes(discovered_routes, configured_routes)
@@ -3773,7 +3945,11 @@ fn merge_sharded_reservation_batches(
     let mut merged = Vec::with_capacity(batch_size);
     for stripe_index in 0..batch_size {
         let mut placements = Vec::with_capacity(fragment_count);
-        let mut expires_at_unix_ms = 0u64;
+        // A merged full-stripe reservation is only usable while EVERY per-shard
+        // fragment is still valid, so its cached expiry is the EARLIEST (min)
+        // fragment expiry, NOT the max. Treat 0 as "no expiry" (+infinity) so it
+        // does not collapse the min; if every fragment is 0 the merged record is 0.
+        let mut expires_at_unix_ms: Option<u64> = None;
         for (_, reservations) in partial_batches {
             let reservation = reservations.get(stripe_index).ok_or_else(|| {
                 Status::internal(format!(
@@ -3781,7 +3957,12 @@ fn merge_sharded_reservation_batches(
                     stripe_index
                 ))
             })?;
-            expires_at_unix_ms = expires_at_unix_ms.max(reservation.expires_at_unix_ms);
+            if reservation.expires_at_unix_ms != 0 {
+                expires_at_unix_ms = Some(match expires_at_unix_ms {
+                    Some(current) => current.min(reservation.expires_at_unix_ms),
+                    None => reservation.expires_at_unix_ms,
+                });
+            }
             for (placement_index, placement) in reservation.placements.iter().enumerate() {
                 let merged_placement = PlacementReservation {
                     target_id: placement.target_id.clone(),
@@ -3819,7 +4000,8 @@ fn merge_sharded_reservation_batches(
             reservation_id: format!("merged-{}", Uuid::new_v4()),
             state: keinctl::proto::ReservationState::Reserved as i32,
             placements,
-            expires_at_unix_ms,
+            // None (all fragments had no expiry) -> 0 = "no expiry".
+            expires_at_unix_ms: expires_at_unix_ms.unwrap_or(0),
         });
     }
     Ok(merged)
@@ -3827,6 +4009,7 @@ fn merge_sharded_reservation_batches(
 
 async fn reserve_stripe_batch_sharded(
     kas_channels: KasEndpointBalancer,
+    route_cache: &AllocationRouteCache,
     routes: Vec<AllocationShardRoute>,
     batch_size: usize,
     profile: &EcProfile,
@@ -3838,53 +4021,101 @@ async fn reserve_stripe_batch_sharded(
     let fragment_count = profile.fragment_count() as usize;
     let shard_plans = shard_fragment_distributions(fragment_count, &routes)?;
     let mut last_error = None;
-    'candidate: for shard_plan in shard_plans {
+    for shard_plan in shard_plans {
+        // Phase 1 #6: fan out the per-shard reserves concurrently instead of
+        // awaiting each before the next. Each shard leader holds its own lease,
+        // so the 3 reserves overlap rather than serialize (~3x latency cut on a
+        // 3-shard cluster). Partial-failure compensation below is preserved:
+        // any shard that DID succeed is released before we move to the next
+        // candidate plan.
+        let shard_futures = shard_plan.iter().map(|(route, shard_fragment_count)| {
+            let route = route.clone();
+            let shard_fragment_count = *shard_fragment_count;
+            let kas_channels = kas_channels.clone();
+            async move {
+                let result = reserve_stripe_batch_via_channels(
+                    vec![route.channel.clone()],
+                    1,
+                    batch_size,
+                    shard_fragment_count,
+                    profile.failure_domain,
+                    reservation_ttl_ms,
+                    rpc_timeout,
+                    attempt_timeout,
+                    reservation_mutation_batch_size,
+                    route.shard_id.clone(),
+                    kas_channels,
+                )
+                .await;
+                (route, result)
+            }
+        });
+        let shard_results = futures_util::future::join_all(shard_futures).await;
+
+        // Partition the fan-out into successes and failures. Successes must be
+        // released if ANY shard in the plan failed (compensating action), so we
+        // collect their reservation IDs up front.
         let mut partial_batches = Vec::with_capacity(shard_plan.len());
         let mut reservation_ids_for_release = Vec::new();
         let mut seen_reservation_ids = HashSet::new();
-        for (route, shard_fragment_count) in &shard_plan {
-            let reservations = match reserve_stripe_batch_via_channels(
-                vec![route.channel.clone()],
-                1,
-                batch_size,
-                *shard_fragment_count,
-                profile.failure_domain,
-                reservation_ttl_ms,
-                rpc_timeout,
-                attempt_timeout,
-                reservation_mutation_batch_size,
-                route.shard_id.clone(),
-                kas_channels.clone(),
-            )
-            .await
-            {
-                Ok(reservations) => reservations,
-                Err(err) => {
-                    if !reservation_ids_for_release.is_empty() {
-                        let _ = release_reservation_ids(
-                            kas_channels.clone(),
-                            &reservation_ids_for_release,
-                            reservation_mutation_batch_size,
-                            rpc_timeout.saturating_mul(3),
-                        )
-                        .await;
+        let mut plan_error: Option<String> = None;
+        let mut saw_route_change = false;
+        for (route, result) in shard_results {
+            match result {
+                Ok(reservations) => {
+                    for reservation_id in collect_reservation_ids_for_release(&reservations) {
+                        if seen_reservation_ids.insert(reservation_id.clone()) {
+                            reservation_ids_for_release.push(reservation_id);
+                        }
                     }
-                    last_error = Some(format!(
-                        "allocator shard plan {} failed on {} via {}: {}",
-                        format_shard_plan(&shard_plan),
-                        route.shard_id,
-                        route.endpoint,
-                        err
-                    ));
-                    continue 'candidate;
+                    partial_batches.push((route, reservations));
                 }
-            };
-            for reservation_id in collect_reservation_ids_for_release(&reservations) {
-                if seen_reservation_ids.insert(reservation_id.clone()) {
-                    reservation_ids_for_release.push(reservation_id);
+                Err(err) => {
+                    // A demoted/superseded leader after a KAS failover surfaces
+                    // here and we must force a route re-discovery so the next
+                    // reserve does not retry the stale route for the TTL window
+                    // (design §4/§7). Three signals mean "this is no longer the
+                    // shard leader, re-route now":
+                    //   * UNAVAILABLE   — leader-resident wrapper refused (not leader);
+                    //   * ABORTED       — the always-on epoch fence aborted the commit
+                    //                     (a newer leader bumped the epoch);
+                    //   * FAILED_PRECONDITION — superseded/not-leader precondition.
+                    // FIX C: invalidating on ABORTED/FAILED_PRECONDITION (not just
+                    // UNAVAILABLE) stops KMS burning seconds retrying a reachable but
+                    // demoted leader until the route TTL expires.
+                    if route_change_should_invalidate(&err) {
+                        saw_route_change = true;
+                    }
+                    if plan_error.is_none() {
+                        plan_error = Some(format!(
+                            "allocator shard plan {} failed on {} via {}: {}",
+                            format_shard_plan(&shard_plan),
+                            route.shard_id,
+                            route.endpoint,
+                            err
+                        ));
+                    }
                 }
             }
-            partial_batches.push((route.clone(), reservations));
+        }
+
+        if let Some(err) = plan_error {
+            // Partial failure: release every shard reservation that DID succeed
+            // before trying the next candidate plan.
+            if !reservation_ids_for_release.is_empty() {
+                let _ = release_reservation_ids(
+                    kas_channels.clone(),
+                    &reservation_ids_for_release,
+                    reservation_mutation_batch_size,
+                    rpc_timeout.saturating_mul(3),
+                )
+                .await;
+            }
+            if saw_route_change {
+                route_cache.invalidate();
+            }
+            last_error = Some(err);
+            continue;
         }
 
         match merge_sharded_reservation_batches(fragment_count, batch_size, &partial_batches) {
@@ -4221,6 +4452,27 @@ async fn reclaim_target_granules(
     granules: Vec<TargetGranule>,
     rpc_timeout: Duration,
 ) -> Result<u64, Status> {
+    // FIX A (DESIGN_KAS_WRITE_SCALE.md §3 #2) — KMS-side routing, PARTIAL.
+    //
+    // reclaim mutates allocator free spans, so it MUST land on the owning
+    // shard's KAS leader. This still uses the round-robin `kas_channels.client()`
+    // (NOT shard-aware): a `TargetGranule` carries only `target_id`, and KMS has
+    // no target -> allocation_shard_id map here, so resolving the owning shard
+    // would need either a target->shard lookup cache or a shard hint on the
+    // granule — a larger change deferred to a follow-up.
+    //
+    // This is SAFE today because the KAS side now runs reclaim under the
+    // allocator mutation lease and persists `EpochFence::Leased` (see
+    // kas/fdb_store.rs::reclaim_target_granules): a reclaim that lands on a
+    // non-leader / wrong-shard KAS deterministically ABORTS (no held epoch /
+    // epoch mismatch) instead of clobbering the rightful leader's committed
+    // reservations. The cost of the misroute is a failed reclaim (surfaced as a
+    // cleanup error and retried), not corruption.
+    //
+    // TODO(write-scale): route ReclaimTargetGranules shard-aware to the owning
+    // shard's KAS leader via the AllocationRouteCache once a target->shard
+    // resolution exists, so reclaim succeeds first-try instead of relying on the
+    // fence to reject misroutes.
     let mut client = kas_channels.client();
     let reply = timeout(
         rpc_timeout,
@@ -4669,6 +4921,13 @@ impl ReservationCache {
         let now_ms = now_unix_ms();
         let min_usable_until = now_ms.saturating_add(self.config.min_usable_ttl.as_millis() as u64);
         let mut inner = self.inner.lock().unwrap();
+        // Phase 1 #1 memory bound: `high_watermark` is the GLOBAL pool budget,
+        // partitioned across distinct `(bucket, ec_profile, failure_domain)`
+        // keys rather than applied per-key. Multi-shard makes the cache eligible
+        // for many keys, so a per-key cap would let total RAM grow as
+        // `num_keys * high_watermark`. We track the running global depth and
+        // refuse new entries once the whole pool reaches the budget.
+        let mut global_depth = inner.depth();
         let queue = inner.queues.entry(key.clone()).or_default();
         for reservation in reservations {
             if reservation.expires_at_unix_ms != 0
@@ -4676,10 +4935,15 @@ impl ReservationCache {
             {
                 continue;
             }
-            if queue.len() >= self.config.high_watermark {
+            // Per-key ceiling (keeps any one key from monopolizing the pool) and
+            // the global budget ceiling (bounds total memory across all keys).
+            if queue.len() >= self.config.high_watermark
+                || global_depth >= self.config.high_watermark
+            {
                 break;
             }
             queue.push_back(reservation);
+            global_depth += 1;
         }
         stats.set_reservation_cache_depth(inner.depth());
     }
@@ -5082,9 +5346,20 @@ fn shared_reservation_cache_enabled(
     small_object_max_stripes: usize,
     allocation_shard_count: usize,
 ) -> bool {
-    remaining_after_window == 0
-        && window_stripe_count <= small_object_max_stripes
-        && allocation_shard_count <= 1
+    // Phase 1 #1: the foreground reserve drains a pre-staged RAM pool on
+    // multi-shard clusters too. Previously this required
+    // `allocation_shard_count <= 1`, which made the cache dead code on the
+    // 3-shard prod/lab topology and forced every foreground reserve into a
+    // synchronous KAS `reserve_stripe_batch`. A cached
+    // `PlacementReservationRecord` is a FULL assembled stripe (its `placements`
+    // already span all shards — see `merge_sharded_reservation_batches`), so the
+    // existing (bucket, ec_profile, failure_domain) cache key is correct on
+    // multi-shard; "shard-aware" here means the BACKGROUND refill assembles
+    // stripes via the sharded reserve path. We therefore drop the shard-count
+    // clause and keep the cache eligible whenever the whole object fits one
+    // window of small-object stripes.
+    let _ = allocation_shard_count;
+    remaining_after_window == 0 && window_stripe_count <= small_object_max_stripes
 }
 
 fn profile_matches_family(candidate: &EcProfile, base: &EcProfile) -> bool {
@@ -5168,11 +5443,20 @@ mod tests {
     }
 
     #[test]
-    fn shared_reservation_cache_is_disabled_for_multi_shard_allocator() {
+    fn shared_reservation_cache_is_enabled_for_small_objects_on_any_shard_count() {
+        // Phase 1 #1: the pool is now the foreground source on multi-shard too,
+        // so the shard count no longer gates eligibility. What still gates it is
+        // "the whole object fits one small-object window" (no remaining stripes
+        // after the window, and the window is within small_object_max_stripes).
         assert!(shared_reservation_cache_enabled(0, 1, 16, 1));
-        assert!(!shared_reservation_cache_enabled(0, 1, 16, 3));
+        assert!(shared_reservation_cache_enabled(0, 1, 16, 3));
+        assert!(shared_reservation_cache_enabled(0, 16, 16, 8));
+        // Still disabled when the object spills past the first window...
         assert!(!shared_reservation_cache_enabled(1, 1, 16, 1));
+        assert!(!shared_reservation_cache_enabled(1, 1, 16, 3));
+        // ...or when the window itself exceeds the small-object threshold.
         assert!(!shared_reservation_cache_enabled(0, 32, 16, 1));
+        assert!(!shared_reservation_cache_enabled(0, 32, 16, 3));
     }
 
     #[test]
@@ -5473,5 +5757,265 @@ mod tests {
         invalidate_local_object_cache(&cache, "lab-8p2", "dir/object.bin");
 
         assert!(cache.get("lab-8p2", "dir/object.bin").is_none());
+    }
+
+    fn seed_route(shard_id: &str) -> AllocationShardRoute {
+        // Channels are not exercised by the TTL logic under test; any
+        // well-formed lazy channel suffices to populate the cache.
+        let channel = Endpoint::from_static("http://127.0.0.1:55061").connect_lazy();
+        AllocationShardRoute {
+            shard_id: shard_id.to_string(),
+            endpoint: "http://127.0.0.1:55061".to_string(),
+            channel,
+        }
+    }
+
+    fn seed_route_cache(cache: &AllocationRouteCache, shards: usize, fetched_at: Instant) {
+        let routes = (0..shards)
+            .map(|index| seed_route(&format!("alloc-shard-{index:02}")))
+            .collect();
+        *cache.inner.cached.lock().unwrap() = Some(CachedAllocationRoutes { routes, fetched_at });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_cache_serves_fresh_snapshot_within_ttl() {
+        // Phase 1 #5: a freshly-fetched route set is served from RAM (no RPC),
+        // and the cached shard count is what the foreground reserve reads.
+        let cache = AllocationRouteCache::new(Duration::from_secs(5), test_stats());
+        seed_route_cache(&cache, 3, Instant::now());
+        let snapshot = cache.fresh_snapshot().expect("fresh routes within TTL");
+        assert_eq!(snapshot.len(), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_cache_expires_after_ttl() {
+        // An entry older than the TTL is not served; the next resolve must
+        // re-discover. Modeled by back-dating fetched_at past the TTL.
+        let cache = AllocationRouteCache::new(Duration::from_millis(50), test_stats());
+        let stale_at = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .expect("instant in range");
+        seed_route_cache(&cache, 3, stale_at);
+        assert!(
+            cache.fresh_snapshot().is_none(),
+            "expired routes must not be served from the TTL cache"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_cache_invalidate_forces_rediscovery() {
+        // Failover net (design §4/§7): an UNAVAILABLE per-shard reserve calls
+        // invalidate(), which drops the cached routes so the NEXT resolve picks
+        // up the new leadership instead of retrying a demoted leader.
+        let cache = AllocationRouteCache::new(Duration::from_secs(60), test_stats());
+        seed_route_cache(&cache, 3, Instant::now());
+        assert!(cache.fresh_snapshot().is_some());
+        cache.invalidate();
+        assert!(
+            cache.fresh_snapshot().is_none(),
+            "invalidate() must drop the cached routes even while within TTL"
+        );
+    }
+
+    fn full_stripe_reservation(expires_at_unix_ms: u64) -> PlacementReservationRecord {
+        // A cached reservation is a FULL assembled stripe: its placements span
+        // every shard (see merge_sharded_reservation_batches). The shard-aware
+        // pool keys on (bucket, ec_profile, failure_domain) and stores these
+        // whole stripes — the test only needs the count + expiry to exercise the
+        // budget bound.
+        PlacementReservationRecord {
+            reservation_id: format!("merged-{}", Uuid::new_v4()),
+            placements: vec![
+                PlacementReservation {
+                    reservation_id: "alloc-shard-00/r".to_string(),
+                    ..PlacementReservation::default()
+                },
+                PlacementReservation {
+                    reservation_id: "alloc-shard-01/r".to_string(),
+                    ..PlacementReservation::default()
+                },
+            ],
+            expires_at_unix_ms,
+            ..PlacementReservationRecord::default()
+        }
+    }
+
+    fn small_budget_cache(high_watermark: usize) -> ReservationCache {
+        ReservationCache::new(ReservationCacheConfig {
+            high_watermark,
+            low_watermark: high_watermark / 4,
+            refill_batch: high_watermark,
+            reservation_ttl: Duration::from_secs(30),
+            min_usable_ttl: Duration::from_secs(5),
+            refill_concurrency: 8,
+            wait_timeout: Duration::from_secs(15),
+            stale_refill_after: Duration::from_secs(5),
+            small_object_max_stripes: 16,
+            single_window_seed_batch: 1_024,
+            initiate_write_window_max_stripes: 256,
+        })
+    }
+
+    #[test]
+    fn pool_memory_budget_is_global_not_per_key() {
+        // Phase 1 #1 memory bound: high_watermark is the GLOBAL pool budget,
+        // partitioned across distinct keys. Storing into many keys must not let
+        // total depth exceed the budget (which a per-key cap would allow:
+        // num_keys * high_watermark).
+        let cache = small_budget_cache(4);
+        let stats = test_stats();
+        let expires = now_unix_ms().saturating_add(60_000);
+        for shard in 0..8 {
+            let key = ReservationCacheKey {
+                bucket_id: format!("bucket-{shard}"),
+                ec_profile_id: "lab-rs-8p2-1m".to_string(),
+                failure_domain: 1,
+            };
+            let batch = (0..4).map(|_| full_stripe_reservation(expires)).collect();
+            cache.store_batch(&key, batch, &stats);
+        }
+        let total_depth = cache.inner.lock().unwrap().depth();
+        assert_eq!(
+            total_depth, 4,
+            "global pool depth must be capped at high_watermark across all keys"
+        );
+    }
+
+    #[test]
+    fn pool_take_then_store_round_trips_full_stripe() {
+        // Sanity: a stored full stripe is the same one popped back out, keyed by
+        // (bucket, ec_profile, failure_domain) — confirming the cache stores
+        // assembled stripes, not per-shard fragments.
+        let cache = small_budget_cache(8);
+        let stats = test_stats();
+        let key = test_key();
+        let expires = now_unix_ms().saturating_add(60_000);
+        let mut record = full_stripe_reservation(expires);
+        record.reservation_id = "merged-fixed".to_string();
+        cache.store_batch(&key, vec![record], &stats);
+        let popped = cache.take(&key, &stats).expect("stored stripe is available");
+        assert_eq!(popped.reservation_id, "merged-fixed");
+        assert_eq!(popped.placements.len(), 2);
+        assert!(cache.take(&key, &stats).is_none(), "pool drains to empty");
+    }
+
+    /// One per-shard reservation (the fragment a single shard contributes to a
+    /// stripe) with a chosen expiry. `merge_sharded_reservation_batches` combines
+    /// one of these per shard into a full stripe.
+    fn shard_fragment_reservation(
+        shard_id: &str,
+        expires_at_unix_ms: u64,
+    ) -> PlacementReservationRecord {
+        PlacementReservationRecord {
+            reservation_id: format!("{shard_id}/reserve-x"),
+            state: keinctl::proto::ReservationState::Reserved as i32,
+            placements: vec![PlacementReservation {
+                target_id: format!("{shard_id}-target"),
+                reservation_id: format!("{shard_id}/reserve-x"),
+                reservation_placement_index: 0,
+                ..PlacementReservation::default()
+            }],
+            expires_at_unix_ms,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_uses_min_fragment_expiry_across_shards() {
+        // FIX #1 (DESIGN_KAS_WRITE_SCALE.md §3): a merged full-stripe reservation
+        // is only usable while EVERY per-shard fragment is still valid, so its
+        // cached expiry must be the EARLIEST (MIN), never the MAX. shard-0
+        // expires soon, shard-1 late -> merged expiry == shard-0's (the min).
+        let now = now_unix_ms();
+        let shard0_expiry = now.saturating_add(2_000); // soon
+        let shard1_expiry = now.saturating_add(120_000); // late
+        let route0 = seed_route("alloc-shard-00");
+        let route1 = seed_route("alloc-shard-01");
+        let partial_batches = vec![
+            (route0, vec![shard_fragment_reservation("alloc-shard-00", shard0_expiry)]),
+            (route1, vec![shard_fragment_reservation("alloc-shard-01", shard1_expiry)]),
+        ];
+
+        // fragment_count = 2 (one fragment per shard), batch_size = 1 stripe.
+        let merged = merge_sharded_reservation_batches(2, 1, &partial_batches)
+            .expect("merge succeeds");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].expires_at_unix_ms, shard0_expiry,
+            "merged stripe expiry must be the MIN fragment expiry (shard-0), not the MAX"
+        );
+        assert_ne!(
+            merged[0].expires_at_unix_ms, shard1_expiry,
+            "merged stripe must NOT carry the later (max) shard-1 expiry"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn merge_treats_zero_expiry_as_no_expiry_not_min() {
+        // A fragment with expires_at == 0 ("no expiry") must NOT collapse the min
+        // to 0; the merged expiry is the min of the NON-zero fragment expiries.
+        let now = now_unix_ms();
+        let late = now.saturating_add(90_000);
+        let route0 = seed_route("alloc-shard-00");
+        let route1 = seed_route("alloc-shard-01");
+        let partial_batches = vec![
+            (route0, vec![shard_fragment_reservation("alloc-shard-00", 0)]),
+            (route1, vec![shard_fragment_reservation("alloc-shard-01", late)]),
+        ];
+        let merged = merge_sharded_reservation_batches(2, 1, &partial_batches)
+            .expect("merge succeeds");
+        assert_eq!(
+            merged[0].expires_at_unix_ms, late,
+            "a 0 (no-expiry) fragment must not pull the merged expiry to 0"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pool_prunes_stripe_carrying_min_shard_expiry_near_min_usable_ttl() {
+        // Companion to the merge MIN test: a stored stripe whose (merged, MIN)
+        // expiry is the soon-expiring shard-0 fragment is pruned out of the pool
+        // once it falls inside min_usable_ttl, so the foreground never hands out a
+        // stripe that shard-0 is about to invalidate. small_budget_cache uses a
+        // 5s min_usable_ttl.
+        let cache = small_budget_cache(8);
+        let stats = test_stats();
+        let key = test_key();
+        let now = now_unix_ms();
+        // MIN expiry is shard-0's = now + 1s, well inside the 5s min_usable_ttl.
+        let near_min = now.saturating_add(1_000);
+        let merged = merge_sharded_reservation_batches(
+            2,
+            1,
+            &[
+                (seed_route("alloc-shard-00"), vec![shard_fragment_reservation("alloc-shard-00", near_min)]),
+                (seed_route("alloc-shard-01"), vec![shard_fragment_reservation("alloc-shard-01", now.saturating_add(120_000))]),
+            ],
+        )
+        .expect("merge succeeds");
+        assert_eq!(merged[0].expires_at_unix_ms, near_min);
+
+        // store_batch itself rejects entries already inside min_usable_ttl, and
+        // take()/begin_async_refill prune the front — either way the pool must not
+        // serve this stripe.
+        cache.store_batch(&key, merged, &stats);
+        assert!(
+            cache.take(&key, &stats).is_none(),
+            "a stripe whose MIN (shard-0) expiry is inside min_usable_ttl must be pruned, not handed out"
+        );
+    }
+
+    #[test]
+    fn route_change_invalidation_covers_failover_signals() {
+        // FIX C (DESIGN_KAS_WRITE_SCALE.md §4/§7): with the always-on epoch fence,
+        // a demoted-but-reachable leader returns Aborted (epoch mismatch) or
+        // FailedPrecondition (not-leader), not just Unavailable. All three must
+        // force a route-cache invalidate so KMS re-discovers immediately instead
+        // of retrying the stale leader for the TTL.
+        assert!(route_change_should_invalidate(&Status::unavailable("x")));
+        assert!(route_change_should_invalidate(&Status::aborted("epoch fence")));
+        assert!(route_change_should_invalidate(&Status::failed_precondition("not leader")));
+        // Errors that are NOT a leadership-change signal must not blow the cache.
+        assert!(!route_change_should_invalidate(&Status::internal("x")));
+        assert!(!route_change_should_invalidate(&Status::deadline_exceeded("x")));
+        assert!(!route_change_should_invalidate(&Status::resource_exhausted("x")));
     }
 }
