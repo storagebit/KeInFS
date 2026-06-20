@@ -33,7 +33,12 @@ impl ObjectEngine {
         pool_size: usize,
     ) -> Result<Self, DynError> {
         let read_clients = Self::connect_pool(kms_endpoints, &options, pool_size).await?;
-        let write_clients = Self::connect_pool(kms_endpoints, &options, pool_size).await?;
+        // The write pool shares ONE EC-encode-buffer recycling registry across all
+        // its clients, so per-client buffer retention does not multiply by the
+        // pool size (the 2026-06 write-RAM growth). Read clients never encode, so
+        // they keep their own (unused) per-client free-lists.
+        let write_clients =
+            Self::connect_write_pool(kms_endpoints, &options, pool_size).await?;
         Ok(Self {
             read_clients,
             write_clients,
@@ -50,6 +55,28 @@ impl ObjectEngine {
         let mut clients = Vec::with_capacity(pool_size);
         for _ in 0..pool_size.max(1) {
             let client = ObjectClient::connect_with_options(kms_endpoints, options.clone()).await?;
+            clients.push(Arc::new(tokio::sync::Mutex::new(client)));
+        }
+        Ok(clients)
+    }
+
+    /// Like [`Self::connect_pool`] but every client shares one EC-encode-buffer
+    /// recycling registry, bounding write-path buffer retention to a single
+    /// working set instead of `pool_size` copies.
+    async fn connect_write_pool(
+        kms_endpoints: &[String],
+        options: &ObjectClientOptions,
+        pool_size: usize,
+    ) -> Result<Vec<SharedClient>, DynError> {
+        let shared = ksc::object::new_shared_shard_freelists();
+        let mut clients = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size.max(1) {
+            let client = ObjectClient::connect_with_options_sharing_shard_pool(
+                kms_endpoints,
+                options.clone(),
+                shared.clone(),
+            )
+            .await?;
             clients.push(Arc::new(tokio::sync::Mutex::new(client)));
         }
         Ok(clients)

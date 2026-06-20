@@ -210,6 +210,11 @@ pub struct ObjectClient {
     bucket_profiles: HashMap<String, EcProfile>,
     shared_read_cache: SharedObjectMetadataCache,
     prepared_encoders: HashMap<String, PreparedEncodeWorkspace>,
+    /// When `Some`, this client recycles EC encode buffers through a free-list
+    /// registry shared with the rest of its write-client pool (see
+    /// [`SharedShardFreelists`]) so per-client retention does not multiply by the
+    /// pool size. `None` for standalone/read clients (own per-client free-list).
+    shared_shard_freelists: Option<SharedShardFreelists>,
     session_options: TargetSessionOptions,
     write_window_max_stripes: usize,
     write_window_inflight_stripes: usize,
@@ -330,6 +335,26 @@ struct KmsEndpointBalancer {
     grpc_max_message_bytes: usize,
 }
 
+/// Cap on each recycling free-list's length, in shard sets (one set = all EC
+/// fragments for one stripe). The free-list is shared across kfc-core's
+/// round-robin write-client pool via [`SharedShardFreelists`]; without this
+/// bound a burst of concurrent encodes would leave it holding every buffer ever
+/// taken — the 2026-06 write-RAM growth, which retained roughly
+/// `pool_size x one-put-working-set` (~5 GiB on a 16-core client). Sized to the
+/// pipeline's per-put working set (current batch + prefetched next batch).
+const SHARD_POOL_FREELIST_CAP: usize = 2 * DEFAULT_WRITE_WINDOW_INFLIGHT_STRIPES;
+
+/// A per-EC-profile registry of shard recycling free-lists, shared across a pool
+/// of `ObjectClient`s so they recycle encode buffers through ONE bounded pool
+/// per profile instead of each client retaining its own working set forever.
+pub type SharedShardFreelists = Arc<Mutex<HashMap<String, Arc<Mutex<Vec<Vec<Vec<u8>>>>>>>>;
+
+/// Create an empty shared shard free-list registry to pass to a pool of write
+/// clients via [`ObjectClient::connect_with_options_sharing_shard_pool`].
+pub fn new_shared_shard_freelists() -> SharedShardFreelists {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
 /// Thread-safe pool of reusable EC shard buffer sets.
 ///
 /// The encode/reconstruct work runs on `spawn_blocking` worker threads, so the
@@ -343,10 +368,10 @@ struct ShardPool {
 }
 
 impl ShardPool {
-    fn new(plan: PreparedEcPlan) -> Self {
+    fn new(plan: PreparedEcPlan, reusable_shards: Arc<Mutex<Vec<Vec<Vec<u8>>>>>) -> Self {
         Self {
             plan,
-            reusable_shards: Arc::new(Mutex::new(Vec::new())),
+            reusable_shards,
         }
     }
 
@@ -359,7 +384,14 @@ impl ShardPool {
     }
 
     fn return_shards(&self, shards: Vec<Vec<u8>>) {
-        self.reusable_shards.lock().unwrap().push(shards);
+        // Bound the (possibly shared) free-list at the per-put working set;
+        // buffers beyond the cap are dropped (freed) rather than retained, so a
+        // burst of concurrent encodes cannot grow the recycling pool without
+        // limit. See [`SHARD_POOL_FREELIST_CAP`].
+        let mut reusable = self.reusable_shards.lock().unwrap();
+        if reusable.len() < SHARD_POOL_FREELIST_CAP {
+            reusable.push(shards);
+        }
     }
 }
 
@@ -484,9 +516,9 @@ impl From<ObjectClientOptions> for TargetSessionOptions {
 }
 
 impl PreparedEncodeWorkspace {
-    fn new(plan: PreparedEcPlan) -> Self {
+    fn new(plan: PreparedEcPlan, reusable_shards: Arc<Mutex<Vec<Vec<Vec<u8>>>>>) -> Self {
         Self {
-            pool: ShardPool::new(plan),
+            pool: ShardPool::new(plan, reusable_shards),
         }
     }
 }
@@ -763,6 +795,7 @@ impl ObjectClient {
             bucket_profiles: HashMap::new(),
             shared_read_cache,
             prepared_encoders: HashMap::new(),
+            shared_shard_freelists: None,
             session_options,
             write_window_max_stripes: options.write_window_max_stripes,
             write_window_inflight_stripes: options.write_window_inflight_stripes,
@@ -770,6 +803,21 @@ impl ObjectClient {
                 options.write_window_inflight_stripes,
             )),
         })
+    }
+
+    /// Like [`Self::connect_with_options`] but recycles EC encode buffers through
+    /// the caller-provided shared free-list registry, so a pool of write clients
+    /// shares ONE bounded recycling pool per profile instead of each retaining
+    /// its own working set. Use [`new_shared_shard_freelists`] to create the
+    /// registry once and pass a clone to every client in the pool.
+    pub async fn connect_with_options_sharing_shard_pool(
+        kms_endpoints: &[String],
+        options: ObjectClientOptions,
+        shared_shard_freelists: SharedShardFreelists,
+    ) -> Result<Self, ObjectError> {
+        let mut client = Self::connect_with_options(kms_endpoints, options).await?;
+        client.shared_shard_freelists = Some(shared_shard_freelists);
+        Ok(client)
     }
 
     pub async fn put_object_single_stripe(
@@ -2200,9 +2248,30 @@ impl ObjectClient {
         let kee_profile = kee_profile_from_control(profile)?;
         let engine = KeeEngine::new(kee_profile)?;
         let prepared = engine.prepared_plan()?;
-        self.prepared_encoders
-            .insert(profile.id.clone(), PreparedEncodeWorkspace::new(prepared));
+        let reusable_shards = self.shard_freelist_for(&profile.id);
+        self.prepared_encoders.insert(
+            profile.id.clone(),
+            PreparedEncodeWorkspace::new(prepared, reusable_shards),
+        );
         Ok(())
+    }
+
+    /// Resolve the recycling free-list for `profile_id`. When this client is part
+    /// of a shared write pool (`shared_shard_freelists` is `Some`), every client
+    /// shares ONE free-list per profile, so encode-buffer recycling is bounded to
+    /// a single working set instead of multiplying by the pool size (the 2026-06
+    /// write-RAM growth: up to 16 write clients each retaining ~320 MiB).
+    /// Standalone/read clients get their own fresh free-list.
+    fn shard_freelist_for(&self, profile_id: &str) -> Arc<Mutex<Vec<Vec<Vec<u8>>>>> {
+        match &self.shared_shard_freelists {
+            Some(shared) => shared
+                .lock()
+                .unwrap()
+                .entry(profile_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
+                .clone(),
+            None => Arc::new(Mutex::new(Vec::new())),
+        }
     }
 }
 
@@ -3764,6 +3833,7 @@ mod tests {
             bucket_profiles: HashMap::new(),
             shared_read_cache,
             prepared_encoders: HashMap::new(),
+            shared_shard_freelists: None,
             session_options: TargetSessionOptions::default(),
             write_window_max_stripes: 1,
             write_window_inflight_stripes: 1,
@@ -3982,7 +4052,7 @@ mod tests {
         let kee_profile = kee_profile_from_control(&test_profile()).expect("kee profile");
         let engine = KeeEngine::new(kee_profile).expect("kee engine");
         let plan = engine.prepared_plan().expect("prepared plan");
-        ShardPool::new(plan)
+        ShardPool::new(plan, Arc::new(Mutex::new(Vec::new())))
     }
 
     #[test]
@@ -4029,6 +4099,116 @@ mod tests {
         // No buffers leaked or duplicated: at least the two seeded sets remain, and the
         // pool never panicked on a poisoned lock.
         assert!(pool.reusable_shards.lock().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn shard_pool_is_bounded_plateau_across_many_puts() {
+        // Regression guard for the 2026-06 write-pipeline RAM audit. The audit
+        // ruled the ShardPool free-list OUT as the source of the ~380 MiB/put RSS
+        // growth: take_shards (one per stripe) and return_prepared_shards (one per
+        // stripe on the happy path, and on every abort/retry branch) are exactly
+        // balanced, so the free-list is a hard PLATEAU, not a monotonic grower.
+        // A single take+return cycle is the steady-state shape of one stripe's
+        // lifecycle; repeating it thousands of times must keep the free-list at
+        // that plateau. An unbounded climb here would be a genuine pool leak (a
+        // take without a matching return, or a double-return) — exactly what the
+        // audit traced every path to exclude.
+        let pool = test_shard_pool();
+        let frag_bytes = pool.plan.profile().fragment_bytes;
+        for _ in 0..1000 {
+            let shards = pool.take_shards();
+            assert_eq!(shards.len(), 10); // 8 data + 2 parity slots
+            // Recycled buffers come back INTACT at full fragment capacity, so a
+            // reused set never carries per-put growth in its buffer sizes.
+            for shard in &shards {
+                assert_eq!(shard.len(), frag_bytes);
+            }
+            pool.return_shards(shards);
+            // After each balanced cycle the free-list holds exactly the set just
+            // returned — a plateau independent of iteration count.
+            assert!(
+                pool.reusable_shards.lock().unwrap().len() <= 1,
+                "ShardPool free-list grew unbounded across puts => pool leak"
+            );
+        }
+        assert_eq!(pool.reusable_shards.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn build_endpoint_write_batches_preserves_pooled_originals() {
+        // build_endpoint_write_batches CLONES each fragment into the per-endpoint
+        // request so the pooled originals survive the network write for the
+        // failure-retry path (which re-reads stripe_result.prepared.fragments).
+        // This guards that contract: building batches must NOT drain/empty the
+        // source fragments. A future move/Arc-based churn-reduction fix (deleting
+        // the clone) must consciously update this expectation.
+        let prepared_batch = vec![PreparedStripeWrite {
+            stripe_index: 0,
+            plans: (0..10)
+                .map(|fragment_index| test_fragment_plan("http://t0", 0, fragment_index))
+                .collect(),
+            fragments: (0..10).map(|i| vec![i as u8; 4096]).collect(),
+        }];
+        let before: Vec<usize> = prepared_batch
+            .iter()
+            .flat_map(|stripe| stripe.fragments.iter().map(|fragment| fragment.len()))
+            .collect();
+
+        let batches = build_endpoint_write_batches("intent-x", &prepared_batch).unwrap();
+
+        let after: Vec<usize> = prepared_batch
+            .iter()
+            .flat_map(|stripe| stripe.fragments.iter().map(|fragment| fragment.len()))
+            .collect();
+        assert_eq!(
+            before, after,
+            "build must not drain pooled originals (the retry path needs them)"
+        );
+        // All 10 fragments route to the single endpoint (one batch, 10 entries).
+        let routed: usize = batches.iter().map(|batch| batch.len()).sum();
+        assert_eq!(routed, 10);
+    }
+
+    #[test]
+    fn shard_pool_free_list_is_capped() {
+        // A burst of concurrent takes larger than the cap, all returned, must
+        // leave the free-list bounded at SHARD_POOL_FREELIST_CAP — the overflow
+        // is dropped/freed. This is the 2026-06 write-RAM leak guard: without the
+        // cap the (shared) free-list would retain every buffer ever taken.
+        let pool = test_shard_pool();
+        let burst: Vec<_> = (0..SHARD_POOL_FREELIST_CAP + 8)
+            .map(|_| pool.take_shards())
+            .collect();
+        for set in burst {
+            pool.return_shards(set);
+        }
+        assert_eq!(
+            pool.reusable_shards.lock().unwrap().len(),
+            SHARD_POOL_FREELIST_CAP
+        );
+    }
+
+    #[test]
+    fn shared_free_list_recycles_across_pools() {
+        // Two ShardPools sharing one free-list (as kfc-core's write-client pool
+        // does) recycle each other's returned buffers instead of each allocating
+        // its own — the fix for per-client retention multiplying by pool size.
+        let shared = Arc::new(Mutex::new(Vec::new()));
+        let plan = {
+            let kee_profile = kee_profile_from_control(&test_profile()).expect("kee profile");
+            KeeEngine::new(kee_profile)
+                .expect("kee engine")
+                .prepared_plan()
+                .expect("prepared plan")
+        };
+        let pool_a = ShardPool::new(plan.clone(), Arc::clone(&shared));
+        let pool_b = ShardPool::new(plan, Arc::clone(&shared));
+        let set = pool_a.take_shards();
+        pool_a.return_shards(set);
+        assert_eq!(shared.lock().unwrap().len(), 1);
+        // pool_b pops the set pool_a returned (shared recycling), not a fresh alloc.
+        let _reused = pool_b.take_shards();
+        assert_eq!(shared.lock().unwrap().len(), 0);
     }
 
     fn encode_test_plans(stripe_count: u32, endpoint: &str) -> Vec<FragmentPlan> {
