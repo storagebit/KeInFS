@@ -44,7 +44,16 @@ fn run_mount(config: MountConfig) -> Result<(), DynError> {
         tier_c_budget_bytes: config.tier_c_budget_bytes,
         stripe_cache_budget_bytes: config.stripe_cache_budget_bytes,
     };
-    kfc_transport::run_mount(fs_config, mountpoint, kfc_transport::MountOpts::default())
+    // Thread the io_uring footprint caps from config into MountOpts (the other
+    // fields keep their defaults). These fields are Option<usize> (Copy), so
+    // reading them after `fs_config` moved the owned config fields is fine; they
+    // are honored only by the io_uring backend.
+    let mount_opts = kfc_transport::MountOpts {
+        io_uring_workers: config.io_uring_workers,
+        io_uring_queue_depth: config.io_uring_queue_depth,
+        ..kfc_transport::MountOpts::default()
+    };
+    kfc_transport::run_mount(fs_config, mountpoint, mount_opts)
         .map_err(|err| boxed_error(err.to_string()))
 }
 

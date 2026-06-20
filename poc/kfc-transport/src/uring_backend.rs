@@ -146,6 +146,26 @@ impl FuseBackend for UringBackend {
             .write_back(want.want_writeback_cache)
             .custom_options("noatime");
         let session = Session::new(mountpoint, mount_options)?;
+        // Cap the io_uring ring-buffer footprint. Measured directly on
+        // fractal-fuse 0.4.0 (32-core box, max_write=1 MiB): idle RSS scales with
+        // the per-ring SUBMISSION QUEUE DEPTH, NOT worker count — 1/2/4/32
+        // workers all sat at ~8 GiB, while queue_depth 32 -> ~1 GiB, 128 -> ~4
+        // GiB, and fractal-fuse's default (~8192) -> ~8 GiB. The rings share one
+        // buffer arena sized by queue depth. So we bound the queue depth by
+        // default (the real lever) to keep the backend usable out of the box;
+        // the --io-uring-workers override does NOT change RSS and is applied only
+        // when set (it can bound CPU/context-switch on many-core hosts). Both are
+        // fractal-fuse builder methods that consume and return the Session;
+        // with_queue_depth takes a u16, so clamp into range.
+        const DEFAULT_IO_URING_QUEUE_DEPTH: usize = 32; // ~1 GiB idle vs ~8 GiB uncapped
+        let queue_depth = opts
+            .io_uring_queue_depth
+            .unwrap_or(DEFAULT_IO_URING_QUEUE_DEPTH)
+            .clamp(1, u16::MAX as usize) as u16;
+        let mut session = session.with_queue_depth(queue_depth);
+        if let Some(workers) = opts.io_uring_workers {
+            session = session.with_worker_count(workers.max(1));
+        }
 
         let adapter = UringAdapter {
             core: Arc::clone(&core),

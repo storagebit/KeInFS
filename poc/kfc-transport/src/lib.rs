@@ -55,6 +55,18 @@ pub struct MountOpts {
     pub fs_name: String,
     pub allow_other: bool,
     pub auto_unmount: bool,
+    /// io_uring backend only: cap the number of fractal-fuse worker threads.
+    /// Measured on fractal-fuse 0.4.0, worker count does NOT affect idle RSS
+    /// (1/2/4/32 workers all ~8 GiB) — it is a CPU/parallelism knob, not the
+    /// memory lever (see `io_uring_queue_depth`). `None` => fractal-fuse default
+    /// (one worker per CPU). Ignored by other backends.
+    pub io_uring_workers: Option<usize>,
+    /// io_uring backend only: per-ring submission queue depth — THE memory lever.
+    /// Idle RSS scales with it (fractal-fuse 0.4.0: depth 32 ~= 1 GiB, 128 ~= 4
+    /// GiB, the ~8192 default ~= 8 GiB). `None` => the backend applies a bounded
+    /// default (32, ~1 GiB) instead of fractal-fuse's huge default. Ignored by
+    /// other backends.
+    pub io_uring_queue_depth: Option<usize>,
 }
 
 impl Default for MountOpts {
@@ -63,6 +75,8 @@ impl Default for MountOpts {
             fs_name: "keinfs".to_string(),
             allow_other: false,
             auto_unmount: false,
+            io_uring_workers: None,
+            io_uring_queue_depth: None,
         }
     }
 }

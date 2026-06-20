@@ -40,6 +40,10 @@ pub(crate) struct MountConfig {
     pub(crate) tier_c_cache_dir: Option<PathBuf>,
     pub(crate) tier_c_budget_bytes: u64,
     pub(crate) stripe_cache_budget_bytes: u64,
+    // io_uring backend (Linux, --features io-uring): operator caps on the
+    // worker/ring footprint. None => the backend's built-in default cap.
+    pub(crate) io_uring_workers: Option<usize>,
+    pub(crate) io_uring_queue_depth: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +91,8 @@ fn parse_mount_args(args: &[String]) -> Result<MountConfig, Box<dyn Error>> {
     let mut tier_c_cache_dir = None;
     let mut tier_c_budget_bytes = DEFAULT_TIER_C_BUDGET_BYTES;
     let mut stripe_cache_budget_bytes = DEFAULT_STRIPE_CACHE_BUDGET_BYTES as u64;
+    let mut io_uring_workers: Option<usize> = None;
+    let mut io_uring_queue_depth: Option<usize> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -169,6 +175,22 @@ fn parse_mount_args(args: &[String]) -> Result<MountConfig, Box<dyn Error>> {
                     .parse()?;
                 stripe_cache_budget_bytes = mib * 1024 * 1024;
             }
+            "--io-uring-workers" => {
+                i += 1;
+                let n: usize = args
+                    .get(i)
+                    .ok_or_else(|| missing_value("--io-uring-workers"))?
+                    .parse()?;
+                io_uring_workers = Some(n.max(1));
+            }
+            "--io-uring-queue-depth" => {
+                i += 1;
+                let n: usize = args
+                    .get(i)
+                    .ok_or_else(|| missing_value("--io-uring-queue-depth"))?
+                    .parse()?;
+                io_uring_queue_depth = Some(n.max(1));
+            }
             "--help" | "-h" => return Err(arg_error(mount_usage())),
             other => return Err(arg_error(format!("unknown KFC mount argument `{other}`"))),
         }
@@ -192,6 +214,8 @@ fn parse_mount_args(args: &[String]) -> Result<MountConfig, Box<dyn Error>> {
         tier_c_cache_dir,
         tier_c_budget_bytes,
         stripe_cache_budget_bytes,
+        io_uring_workers,
+        io_uring_queue_depth,
     })
 }
 
@@ -385,7 +409,7 @@ fn arg_error(message: impl Into<String>) -> Box<dyn Error> {
 
 fn mount_usage() -> String {
     format!(
-        "kfc mount [options]\n  --kms-endpoint <uri[,uri...]>  KMS gRPC endpoint(s), default {DEFAULT_KMS_ENDPOINT}\n  --namespace-id <id>            namespace id that owns the bucket\n  --bucket <id>                  bucket id to mount as the filesystem root\n  --bucket-id <id>               alias for --bucket, matches the rest of the CLI surface\n  --mountpoint <path>            mountpoint path\n  --read-completion-mode <mode>  interrupt|hot-poll, default {}\n  --write-completion-mode <mode> interrupt|hot-poll, default {}\n  --metadata-notification-nats-url <uri> subscribe to KMS invalidation events via NATS\n  --metadata-notification-subject <name> invalidation subject, default {}\n  --tier-c-cache-dir <path>      enable the Tier-C disk stripe cache in this dir (default off)\n  --tier-c-budget-mib <n>        Tier-C disk cache budget in MiB, default {}\n  --stripe-cache-budget-mib <n>  Tier-B RAM stripe-cache budget in MiB, default {}\n",
+        "kfc mount [options]\n  --kms-endpoint <uri[,uri...]>  KMS gRPC endpoint(s), default {DEFAULT_KMS_ENDPOINT}\n  --namespace-id <id>            namespace id that owns the bucket\n  --bucket <id>                  bucket id to mount as the filesystem root\n  --bucket-id <id>               alias for --bucket, matches the rest of the CLI surface\n  --mountpoint <path>            mountpoint path\n  --read-completion-mode <mode>  interrupt|hot-poll, default {}\n  --write-completion-mode <mode> interrupt|hot-poll, default {}\n  --metadata-notification-nats-url <uri> subscribe to KMS invalidation events via NATS\n  --metadata-notification-subject <name> invalidation subject, default {}\n  --tier-c-cache-dir <path>      enable the Tier-C disk stripe cache in this dir (default off)\n  --tier-c-budget-mib <n>        Tier-C disk cache budget in MiB, default {}\n  --stripe-cache-budget-mib <n>  Tier-B RAM stripe-cache budget in MiB, default {}\n  --io-uring-workers <n>         io_uring backend: cap worker threads (CPU knob; does NOT lower RSS)\n  --io-uring-queue-depth <n>     io_uring backend: ring queue depth = the RSS lever (default 32 ~=1 GiB; higher=more RAM)\n",
         DEFAULT_MOUNT_READ_COMPLETION_MODE.as_str(),
         DEFAULT_MOUNT_WRITE_COMPLETION_MODE.as_str(),
         DEFAULT_METADATA_NOTIFICATION_SUBJECT,
