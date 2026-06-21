@@ -4,7 +4,7 @@
   "tags": ["keinfs", "kix", "detail"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "15s",
   "time": { "from": "now-30m", "to": "now" },
   "templating": {
@@ -14,19 +14,24 @@
         "name": "instance", "label": "KIX Instance", "type": "query",
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
         "query": "label_values(keinfs_kix_up, instance)",
-        "refresh": 2, "includeAll": false
+        "refresh": 2, "includeAll": false, "current": {}
       }
     ]
   },
   "links": [
-    { "title": "KIX Overview", "type": "link", "url": "/d/keinfs-kix-overview", "icon": "external link" }
+    { "title": "KIX Overview", "type": "link", "url": "/d/keinfs-kix-overview", "icon": "external link", "tooltip": "Index fleet view" },
+    { "title": "KST Storage", "type": "link", "url": "/d/keinfs-kst-overview", "icon": "external link", "tooltip": "Storage targets served by this index" },
+    { "title": "KAS Allocator", "type": "link", "url": "/d/keinfs-kas-detail", "icon": "external link", "tooltip": "Allocator / reservation deep dive" },
+    { "title": "I/O Lifecycle", "type": "link", "url": "/d/keinfs-io-lifecycle", "icon": "external link", "tooltip": "End-to-end write/read funnel" }
   ],
   "panels": [
     {
       "type": "stat", "title": "Up / Shards / Drives",
+      "description": "Liveness plus the shard and drive fan-out of this KIX arena.",
       "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "text" } }, "overrides": [ { "matcher": { "id": "byFrameRefID", "options": "A" }, "properties": [ { "id": "color", "value": { "mode": "thresholds" } }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } ] } ] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
       "targets": [
         { "expr": "keinfs_kix_up{instance=\"$instance\"}", "refId": "A", "legendFormat": "up" },
         { "expr": "keinfs_kix_shard_count{instance=\"$instance\"}", "refId": "B", "legendFormat": "shards" },
@@ -35,17 +40,20 @@
     },
     {
       "type": "stat", "title": "Live Entries",
+      "description": "Live chunk-location entries held in this arena's in-memory map.",
       "gridPos": { "h": 4, "w": 5, "x": 6, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
       "targets": [ { "expr": "keinfs_kix_total_live_entries{instance=\"$instance\"}", "refId": "A" } ]
     },
     {
       "type": "stat", "title": "Upsert / Delete (ops/s)",
+      "description": "Live write-side index mutation rate on this arena (rate 2m).",
       "gridPos": { "h": 4, "w": 6, "x": 11, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "fixed", "fixedColor": "green" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
       "targets": [
         { "expr": "rate(keinfs_kix_total_upsert_ops{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "upsert/s" },
         { "expr": "rate(keinfs_kix_total_delete_ops{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "delete/s" }
@@ -53,10 +61,11 @@
     },
     {
       "type": "stat", "title": "Errors / Retries",
+      "description": "Shard errors, delta-log/checkpoint write errors, and enqueue retries. Errors must be 0; retries rising = durability queue backpressure.",
       "gridPos": { "h": 4, "w": 7, "x": 17, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
       "targets": [
         { "expr": "keinfs_kix_total_shard_errors{instance=\"$instance\"}", "refId": "A", "legendFormat": "shard err" },
         { "expr": "keinfs_kix_total_write_errors{instance=\"$instance\"}", "refId": "B", "legendFormat": "write err" },
@@ -69,9 +78,11 @@
     },
     {
       "type": "timeseries", "title": "Index op rate (get / upsert / delete, ops/s)",
+      "description": "Full op mix on this arena. get/s is read-path lookups, upsert/s + delete/s is write-path mutation.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 14, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "rate(keinfs_kix_total_get_ops{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "get/s" },
         { "expr": "rate(keinfs_kix_total_upsert_ops{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "upsert/s" },
@@ -80,9 +91,11 @@
     },
     {
       "type": "timeseries", "title": "Get hit vs miss (ops/s)",
+      "description": "Live-map hits vs misses. Misses force a cold lookup / delta replay; a sustained miss band means the working set is churning.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } } },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 25, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity", "stacking": { "mode": "normal" } } }, "overrides": [ { "matcher": { "id": "byName", "options": "misses/s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] }, { "matcher": { "id": "byName", "options": "hits/s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] } ] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "rate(keinfs_kix_total_get_hits{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "hits/s" },
         { "expr": "rate(keinfs_kix_total_get_misses{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "misses/s" }
@@ -94,22 +107,27 @@
     },
     {
       "type": "timeseries", "title": "Append batches + appended deltas (ops/s)",
+      "description": "Delta-log flush activity. append_batches/s is the batched fsync cadence; appended_deltas/s is the per-entry delta rate persisted to the raw arena.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 14, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "rate(keinfs_kix_total_append_batches{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "append batches/s" },
         { "expr": "rate(keinfs_kix_total_appended_deltas{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "appended deltas/s" }
       ]
     },
     {
-      "type": "timeseries", "title": "Checkpoints + checkpoint entries (ops/s)",
+      "type": "timeseries", "title": "Checkpoints / entries / snapshots (ops/s)",
+      "description": "Checkpoint compaction activity that bounds delta-log replay on restart. checkpoint_ops/s + snapshot_ops/s should be a slow background cadence; checkpoint_entries/s is how many entries each checkpoint folds in.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 14, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "rate(keinfs_kix_total_checkpoint_ops{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "checkpoints/s" },
-        { "expr": "rate(keinfs_kix_total_checkpoint_entries{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "checkpoint entries/s" }
+        { "expr": "rate(keinfs_kix_total_checkpoint_entries{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "checkpoint entries/s" },
+        { "expr": "rate(keinfs_kix_total_snapshot_ops{instance=\"$instance\"}[2m])", "refId": "C", "legendFormat": "snapshots/s" }
       ]
     },
 
@@ -118,12 +136,14 @@
     },
     {
       "type": "table", "title": "KIX build/capability info",
+      "description": "Static identity of this arena: CRC32 backend + acceleration, CPU arch, and whether any drive is flagged rebuild-required.",
       "gridPos": { "h": 6, "w": 24, "x": 0, "y": 23 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "transformations": [
         { "id": "labelsToFields", "options": { "mode": "columns" } },
         { "id": "organize", "options": { "excludeByName": { "Value": true, "Time": true, "__name__": true, "job": true } } }
       ],
+      "options": { "showHeader": true },
       "targets": [ { "expr": "keinfs_kix_info{instance=\"$instance\"}", "refId": "A", "format": "table", "instant": true } ]
     }
   ]

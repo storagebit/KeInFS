@@ -4,7 +4,7 @@
   "tags": ["keinfs", "lifecycle", "overview"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "15s",
   "time": { "from": "now-30m", "to": "now" },
   "templating": {
@@ -18,8 +18,31 @@
       }
     ]
   },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "name": "Annotations & Alerts",
+        "type": "dashboard",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" }
+      },
+      {
+        "name": "Notes",
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": false,
+        "iconColor": "yellow",
+        "type": "dashboard",
+        "tags": ["keinfs"]
+      }
+    ]
+  },
   "links": [
-    { "title": "Lifecycle Drill-Down", "type": "dashboards", "tags": ["lifecycle"], "asDropdown": true, "icon": "external link" },
+    { "title": "Lifecycle Drill-Down", "type": "link", "url": "/d/keinfs-io-drilldown", "icon": "external link", "tooltip": "Per-phase deep dive, templated by service/rpc/instance" },
+    { "title": "KMS Detail", "type": "link", "url": "/d/keinfs-kms-detail", "icon": "external link", "tooltip": "Deep KMS metadata-service drill-down" },
     { "title": "KST", "type": "dashboards", "tags": ["kst"], "asDropdown": true, "icon": "external link" },
     { "title": "KIX", "type": "dashboards", "tags": ["kix"], "asDropdown": true, "icon": "external link" }
   ],
@@ -29,42 +52,47 @@
     },
     {
       "type": "stat", "title": "Services Up",
+      "description": "Count of KMS + KAS + KST instances reporting `up`. A drop here is the first sign of a node loss; healthy = the full expected service count, color goes red at 0.",
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value", "justifyMode": "center" },
       "targets": [ { "expr": "count(keinfs_kms_up) + count(keinfs_kas_up) + count(keinfs_kst_up)", "refId": "A", "legendFormat": "up" } ]
     },
     {
       "type": "stat", "title": "Total Errors (all RPCs)",
+      "description": "Cumulative RPC errors across KMS, KAS, and KST. Healthy = 0 (green). Any non-zero value turns the panel red — drill into the lifecycle Drill-Down or KMS Detail to find the offending rpc.",
       "gridPos": { "h": 4, "w": 5, "x": 4, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "textMode": "value", "justifyMode": "center" },
       "targets": [ { "expr": "sum(keinfs_kms_total_errors) + sum(keinfs_kas_total_errors) + sum(keinfs_kst_total_errors)", "refId": "A", "legendFormat": "errors" } ]
     },
     {
       "type": "gauge", "title": "Cluster Capacity Used %",
+      "description": "Highest per-target capacity utilisation reported by KAS. Healthy < 75% (green), watch 75-90% (yellow), urgent ≥ 90% (red) — at that point allocator headroom for new reservations is thin.",
       "gridPos": { "h": 4, "w": 5, "x": 9, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 75 }, { "color": "red", "value": 90 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "min": 0, "max": 100, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 75 }, { "color": "red", "value": 90 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "showThresholdLabels": false, "showThresholdMarkers": true },
       "targets": [ { "expr": "max(keinfs_kas_capacity_used_pct)", "refId": "A", "legendFormat": "used %" } ]
     },
     {
-      "type": "stat", "title": "Reserve Shard Bypasses (fix health: want 0)",
+      "type": "stat", "title": "Reserve Shard Bypasses",
+      "description": "Times the KMS reservation cache fell through to a direct KAS reserve instead of serving from the local stripe pool. After the write-scale fix this should stay at 0 (green). Sustained growth means the reservation cache is starved and reserve latency will spike.",
       "gridPos": { "h": 4, "w": 5, "x": 14, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value", "justifyMode": "center" },
       "targets": [ { "expr": "sum(keinfs_kms_reservation_cache_shard_bypasses)", "refId": "A", "legendFormat": "bypasses" } ]
     },
     {
       "type": "stat", "title": "KAS Fence Aborts",
+      "description": "Commits aborted by KAS because the allocation-shard lease was fenced (a stale leader tried to mutate). Healthy = 0; non-zero (orange) is expected briefly during a leader failover but should not grow steadily.",
       "gridPos": { "h": 4, "w": 5, "x": 19, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value", "justifyMode": "center" },
       "targets": [ { "expr": "sum(keinfs_kas_fenced_commit_aborts)", "refId": "A", "legendFormat": "fence aborts" } ]
     },
 
@@ -73,9 +101,17 @@
     },
     {
       "type": "timeseries", "title": "Storage Throughput (bytes/s on the wire, by direction)",
+      "description": "Aggregate KST payload bytes/s, write (ingest) stacked over read (serve). This is the real data-plane bandwidth — KP2 bytes that travel client↔target directly, never through a coordinator.",
       "gridPos": { "h": 7, "w": 12, "x": 0, "y": 6 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } } },
+      "fieldConfig": {
+        "defaults": { "unit": "Bps", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 25, "gradientMode": "opacity", "showPoints": "never", "stacking": { "mode": "normal", "group": "A" }, "axisLabel": "bytes/s" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "write (ingest)" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } } ] },
+          { "matcher": { "id": "byName", "options": "read (serve)" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "sum(rate(keinfs_kst_write_payload_bytes[2m]))", "refId": "A", "legendFormat": "write (ingest)" },
         { "expr": "sum(rate(keinfs_kst_read_payload_bytes[2m]))", "refId": "B", "legendFormat": "read (serve)" }
@@ -83,9 +119,13 @@
     },
     {
       "type": "timeseries", "title": "Object Op Rate (KMS, ops/s)",
+      "description": "KMS object control-flow rate: initiate (start of a write), commit (durable finalize), resolve (read path). The initiate↔commit ratio should track 1:1 in steady state; a growing gap means writes are starting but not committing.",
       "gridPos": { "h": 7, "w": 12, "x": 12, "y": 6 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 12, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "ops/s" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "sum(rate(keinfs_kms_initiate_object_write_requests[2m]))", "refId": "A", "legendFormat": "initiate (write)" },
         { "expr": "sum(rate(keinfs_kms_commit_object_write_requests[2m]))", "refId": "B", "legendFormat": "commit" },
@@ -98,25 +138,28 @@
     },
     {
       "type": "timeseries", "title": "WRITE lifecycle phases (KMS reserve → commit → KST media), p99",
-      "description": "Each line is one stage an object write passes through. The reserve phases (route-resolve, cache-acquire) should be ~1µs after the write-scale fix; the dominant cost should be the KST media/network stage, not the KMS reserve.",
+      "description": "Each line is one stage an object write passes through. The KMS reserve phases (route-resolve, pool-acquire) should be ~1µs after the write-scale fix; the dominant cost should be the KST media/network stage, not the KMS reserve. If a reserve phase climbs into the hundreds of µs, the reservation cache is starving — check Reserve Shard Bypasses above and the KMS Detail dashboard.",
       "gridPos": { "h": 9, "w": 16, "x": 0, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "µs", "custom": { "fillOpacity": 5, "lineWidth": 2 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 6, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99)" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "max(keinfs_kms_phase_latency_microseconds{rpc=\"initiate_object_write\",phase=\"reserve_route_resolve\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "1. KMS reserve: route-resolve" },
         { "expr": "max(keinfs_kms_phase_latency_microseconds{rpc=\"initiate_object_write\",phase=\"reservation_cache_acquire\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "2. KMS reserve: pool-acquire" },
-        { "expr": "max(keinfs_kms_phase_latency_microseconds{rpc=\"initiate_object_write\",phase=\"reserve_stripe_batch_sync\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "2b. KMS reserve: sync KAS (bypass)" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{rpc=\"initiate_object_write\",phase=\"reserve_cache_direct_reserve\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "2b. KMS reserve: direct KAS reserve (cache-miss)" },
         { "expr": "max(keinfs_kst_phase_latency_microseconds{rpc=\"write\",phase=\"execution_queue_wait\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "3. KST: exec queue wait" },
         { "expr": "max(keinfs_kst_phase_latency_microseconds{rpc=\"write\",phase=\"media_fsync\",quantile=\"0.99\"})", "refId": "E", "legendFormat": "4. KST: media fsync" }
       ]
     },
     {
       "type": "bargauge", "title": "WRITE phase budget (last p99, µs)",
+      "description": "Where the p99 microseconds of a write go right now. The reserve phases should be a thin sliver; the bar should be dominated by commit and media fsync. Gradient runs green→red as a phase consumes more of the budget.",
       "gridPos": { "h": 9, "w": 8, "x": 16, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "µs" } },
-      "options": { "displayMode": "gradient", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "µs", "decimals": 0, "min": 0, "color": { "mode": "continuous-GrYlRd" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1000 }, { "color": "red", "value": 50000 } ] } } },
+      "options": { "displayMode": "gradient", "orientation": "horizontal", "valueMode": "color", "reduceOptions": { "calcs": ["lastNotNull"] }, "showUnfilled": true },
       "targets": [
         { "expr": "max(keinfs_kms_phase_latency_microseconds{rpc=\"initiate_object_write\",phase=\"reserve_route_resolve\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "route-resolve" },
         { "expr": "max(keinfs_kms_phase_latency_microseconds{rpc=\"initiate_object_write\",phase=\"reservation_cache_acquire\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "pool-acquire" },
@@ -130,10 +173,13 @@
     },
     {
       "type": "timeseries", "title": "READ lifecycle phases (KMS resolve → KST read), p99",
+      "description": "Read path: KMS resolves the object→fragment→target index (should be fast, served from cache), then KST serves the bytes. A healthy read is dominated by the KST read total; if KMS resolve climbs, inspect the read cache phases on the KMS Detail dashboard.",
       "gridPos": { "h": 9, "w": 16, "x": 0, "y": 24 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "µs", "custom": { "fillOpacity": 5, "lineWidth": 2 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 6, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99)" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "max(keinfs_kms_rpc_latency_microseconds{rpc=\"resolve_object_read\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "1. KMS resolve (total)" },
         { "expr": "max(keinfs_kst_phase_latency_microseconds{rpc=\"read\",phase=\"execution_queue_wait\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "2. KST: exec queue wait" },
@@ -142,10 +188,11 @@
     },
     {
       "type": "stat", "title": "Read fast-path vs degraded (KST read rate)",
+      "description": "Aggregate KST read RPC rate. In steady state this tracks client demand; a sudden collapse alongside rising read-path latency is the signature of a degraded (EC-reconstruct) read path rather than a direct serve.",
       "gridPos": { "h": 9, "w": 8, "x": 16, "y": 24 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value_and_name" },
+      "fieldConfig": { "defaults": { "unit": "ops", "decimals": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value_and_name", "justifyMode": "center" },
       "targets": [
         { "expr": "sum(rate(keinfs_kst_rpc_requests_total{rpc=\"read\"}[2m]))", "refId": "A", "legendFormat": "read RPC/s" }
       ]

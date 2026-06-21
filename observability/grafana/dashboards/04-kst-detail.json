@@ -4,7 +4,7 @@
   "tags": ["keinfs", "kst", "detail"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "15s",
   "time": { "from": "now-30m", "to": "now" },
   "templating": {
@@ -20,49 +20,58 @@
         "name": "rpc", "label": "RPC", "type": "query",
         "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
         "query": "label_values(keinfs_kst_phase_latency_microseconds{target_id=\"$target\"}, rpc)",
-        "refresh": 2, "includeAll": false, "current": { "text": "write", "value": "write" }
+        "refresh": 2, "includeAll": false, "current": {}
       }
     ]
   },
   "links": [
-    { "title": "KST Overview", "type": "link", "url": "/d/keinfs-kst-overview", "icon": "external link" }
+    { "title": "KST Overview", "type": "link", "url": "/d/keinfs-kst-overview", "icon": "external link", "tooltip": "Fleet view across all targets" },
+    { "title": "KIX Detail", "type": "link", "url": "/d/keinfs-kix-detail", "icon": "external link", "tooltip": "The chunk index this target publishes to" },
+    { "title": "KAS Allocator", "type": "link", "url": "/d/keinfs-kas-detail", "icon": "external link", "tooltip": "Where this target's free spans are reserved" },
+    { "title": "I/O Lifecycle", "type": "link", "url": "/d/keinfs-io-lifecycle", "icon": "external link", "tooltip": "End-to-end write/read funnel" }
   ],
   "panels": [
     {
-      "type": "stat", "title": "Up", "gridPos": { "h": 4, "w": 3, "x": 0, "y": 0 },
+      "type": "stat", "title": "Up", "description": "1 = target healthy and serving. 0 = down/unreachable.",
+      "gridPos": { "h": 4, "w": 3, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value" },
       "targets": [ { "expr": "keinfs_kst_up{target_id=\"$target\"}", "refId": "A" } ]
     },
     {
-      "type": "stat", "title": "Write B/s", "gridPos": { "h": 4, "w": 5, "x": 3, "y": 0 },
+      "type": "stat", "title": "Write B/s", "description": "Write payload bytes/s landing on this drive's media (rate 2m).",
+      "gridPos": { "h": 4, "w": 5, "x": 3, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "Bps" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "color": { "mode": "fixed", "fixedColor": "blue" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
       "targets": [ { "expr": "rate(keinfs_kst_write_payload_bytes{target_id=\"$target\"}[2m])", "refId": "A" } ]
     },
     {
-      "type": "stat", "title": "Read B/s", "gridPos": { "h": 4, "w": 5, "x": 8, "y": 0 },
+      "type": "stat", "title": "Read B/s", "description": "Read payload bytes/s served from this drive's media (rate 2m).",
+      "gridPos": { "h": 4, "w": 5, "x": 8, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "Bps" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "color": { "mode": "fixed", "fixedColor": "green" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
       "targets": [ { "expr": "rate(keinfs_kst_read_payload_bytes{target_id=\"$target\"}[2m])", "refId": "A" } ]
     },
     {
-      "type": "stat", "title": "Inflight / Peak", "gridPos": { "h": 4, "w": 5, "x": 13, "y": 0 },
+      "type": "stat", "title": "Inflight / Peak", "description": "Current vs peak concurrently-executing requests on this target. Inflight pinned at peak = admission-bound; check execution_queue_wait below.",
+      "gridPos": { "h": 4, "w": 5, "x": 13, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "purple" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
       "targets": [
         { "expr": "keinfs_kst_inflight_requests{target_id=\"$target\"}", "refId": "A", "legendFormat": "inflight" },
         { "expr": "keinfs_kst_peak_inflight_requests{target_id=\"$target\"}", "refId": "B", "legendFormat": "peak" }
       ]
     },
     {
-      "type": "stat", "title": "Errors / Handshake fails", "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "type": "stat", "title": "Errors / Handshake fails", "description": "Cumulative request errors and KP2 handshake failures on this target. Healthy = 0.",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
       "targets": [
         { "expr": "keinfs_kst_total_errors{target_id=\"$target\"}", "refId": "A", "legendFormat": "errors" },
         { "expr": "keinfs_kst_total_handshake_failures{target_id=\"$target\"}", "refId": "B", "legendFormat": "handshake" }
@@ -70,52 +79,137 @@
     },
 
     {
-      "type": "row", "title": "$target — rpc=$rpc phase decomposition", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 4 }
+      "type": "row", "title": "Storage execution group — every phase ($target / rpc=$rpc)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 4 }
     },
     {
-      "type": "timeseries", "title": "$rpc phase latency p99 (µs) — every phase",
-      "description": "The full execution-group breakdown of a $rpc on this target: queue wait, media CRC, media fsync, slot publish, etc. This is the on-target half of the I/O lifecycle.",
-      "gridPos": { "h": 10, "w": 16, "x": 0, "y": 5 },
+      "type": "timeseries", "title": "$rpc — all phases p99 (µs)",
+      "description": "The complete on-target execution-group decomposition of a $rpc: ingress_queue_wait → execution_queue_wait → request_decode → body_collect/stream_receive → location_map → kix_lookup → media_write_prepare → media_header_validate → media_payload_read/copy → media_crc → media_write_io → media_fsync → kix_publish/publication_retry → route_execute → response_encode/send. This is where a storage op spends its time. Healthy: media_fsync p50 ~1µs, execution_queue_wait ~2µs; a rising queue_wait means admission saturation.",
+      "gridPos": { "h": 11, "w": 16, "x": 0, "y": 5 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "µs", "custom": { "fillOpacity": 4, "lineWidth": 2 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 6, "lineWidth": 2, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [ { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{phase}}" } ]
     },
     {
       "type": "bargauge", "title": "$rpc phase budget (p99, µs)",
-      "gridPos": { "h": 10, "w": 8, "x": 16, "y": 5 },
+      "description": "Where the p99 latency budget of a $rpc is spent, phase by phase. The longest bar is the bottleneck — media_write_io / media_fsync for write-bound drives, queue_wait when admission-bound.",
+      "gridPos": { "h": 11, "w": 8, "x": 16, "y": 5 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "µs" } },
-      "options": { "displayMode": "gradient", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "continuous-GrYlRd" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1000 }, { "color": "red", "value": 10000 } ] } } },
+      "options": { "displayMode": "gradient", "orientation": "horizontal", "valueMode": "color", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" } },
       "targets": [ { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{phase}}" } ]
     },
 
     {
-      "type": "row", "title": "RPC latency percentiles & rates", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 }
+      "type": "row", "title": "Media subsystem (CRC / fsync / write-IO / payload)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 16 }
+    },
+    {
+      "type": "timeseries", "title": "Media durability path p99 — write_io / fsync / crc (µs)",
+      "description": "The raw-device write path: media_write_io (direct-I/O submit), media_fsync (durability barrier — p50 ~1µs healthy on the lab), media_crc (checksum). Rising media_write_io = drive pressure; rising media_fsync = barrier stall.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"media_write_io\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "media_write_io" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"media_fsync\",quantile=\"0.99\"}", "refId": "B", "legendFormat": "media_fsync" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"media_crc\",quantile=\"0.99\"}", "refId": "C", "legendFormat": "media_crc" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Media payload path p99 — prepare / header / read / copy (µs)",
+      "description": "Buffer staging before the device write: media_write_prepare, media_header_validate (fragment header check), media_payload_read, media_payload_copy. Should be tiny (single-digit µs); spikes here point at memory-bandwidth or NUMA-locality issues, not the drive.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 17 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"media_write_prepare\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "media_write_prepare" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"media_header_validate\",quantile=\"0.99\"}", "refId": "B", "legendFormat": "media_header_validate" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"media_payload_read\",quantile=\"0.99\"}", "refId": "C", "legendFormat": "media_payload_read" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"media_payload_copy\",quantile=\"0.99\"}", "refId": "D", "legendFormat": "media_payload_copy" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Ingress, admission & index publish", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 }
+    },
+    {
+      "type": "timeseries", "title": "Ingress / admission p99 — ingress & execution queue wait (µs)",
+      "description": "Time the request sits in queues before execution: ingress_queue_wait (HTTP/2 stream admission) and execution_queue_wait (storage execution-group admission — ~2µs healthy). Sustained rise = the target is admission-saturated; correlate with stream rejections to the right.",
+      "gridPos": { "h": 9, "w": 8, "x": 0, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"ingress_queue_wait\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "ingress_queue_wait" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"execution_queue_wait\",quantile=\"0.99\"}", "refId": "B", "legendFormat": "execution_queue_wait" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Body & decode p99 — decode / collect / stream_receive (µs)",
+      "description": "Request ingestion: request_decode (KP2 header parse), body_collect (buffer the frame), body_stream_receive (read payload off the wire). body_stream_receive tracks payload size and link RTT.",
+      "gridPos": { "h": 9, "w": 8, "x": 8, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"request_decode\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "request_decode" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"body_collect\",quantile=\"0.99\"}", "refId": "B", "legendFormat": "body_collect" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"body_stream_receive\",quantile=\"0.99\"}", "refId": "C", "legendFormat": "body_stream_receive" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Index & response p99 — location/lookup/publish/route/encode/send (µs)",
+      "description": "KIX-facing and response-emitting phases: location_map, kix_lookup, kix_publish + publication_retry (slot publication to the chunk index — retries here signal KIX backpressure), route_execute, response_encode, response_send_headers/body.",
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 6, "lineWidth": 2, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"location_map\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "location_map" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"kix_lookup\",quantile=\"0.99\"}", "refId": "B", "legendFormat": "kix_lookup" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"kix_publish\",quantile=\"0.99\"}", "refId": "C", "legendFormat": "kix_publish" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"publication_retry\",quantile=\"0.99\"}", "refId": "D", "legendFormat": "publication_retry" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"route_execute\",quantile=\"0.99\"}", "refId": "E", "legendFormat": "route_execute" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"response_encode\",quantile=\"0.99\"}", "refId": "F", "legendFormat": "response_encode" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"response_send_headers\",quantile=\"0.99\"}", "refId": "G", "legendFormat": "response_send_headers" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\",phase=\"response_send_body\",quantile=\"0.99\"}", "refId": "H", "legendFormat": "response_send_body" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "RPC latency percentiles & rates", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 }
     },
     {
       "type": "timeseries", "title": "$rpc total latency (p50/p95/p99/max, µs)",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "description": "End-to-end on-target latency of a $rpc across the percentile spread. A wide p99-vs-p50 gap = tail latency from queueing or a slow phase above.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 37 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "µs", "custom": { "fillOpacity": 3 } } },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 4, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [ { "expr": "keinfs_kst_rpc_latency_microseconds{target_id=\"$target\",rpc=\"$rpc\"}", "refId": "A", "legendFormat": "p{{quantile}}" } ]
     },
     {
       "type": "timeseries", "title": "RPC rate by type (ops/s)",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "description": "Per-RPC request rate on this target (write/read/head/delete/stats). The traffic mix the drive is actually serving.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 37 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 14, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity", "stacking": { "mode": "normal" } } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [ { "expr": "rate(keinfs_kst_rpc_requests_total{target_id=\"$target\"}[2m])", "refId": "A", "legendFormat": "{{rpc}}" } ]
     },
 
     {
-      "type": "row", "title": "Connections & admission", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 }
+      "type": "row", "title": "Connections & admission", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 45 }
     },
     {
       "type": "timeseries", "title": "Connections accepted/rejected (rate)",
-      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 25 },
+      "description": "HTTP/2 session accept vs reject rate. Any rejected/s > 0 = the target hit its connection ceiling.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 46 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 14, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "rate(keinfs_kst_total_connections_accepted{target_id=\"$target\"}[2m])", "refId": "A", "legendFormat": "accepted/s" },
         { "expr": "rate(keinfs_kst_total_connections_rejected{target_id=\"$target\"}[2m])", "refId": "B", "legendFormat": "rejected/s" }
@@ -123,9 +217,11 @@
     },
     {
       "type": "timeseries", "title": "Stream rejections (read/write admission)",
-      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 25 },
+      "description": "Per-direction stream-admission rejections/s. Non-zero = the execution group is shedding load; pair with execution_queue_wait above to confirm admission saturation.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 46 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 14, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "rate(keinfs_kst_read_stream_rejections{target_id=\"$target\"}[2m])", "refId": "A", "legendFormat": "read rej/s" },
         { "expr": "rate(keinfs_kst_write_stream_rejections{target_id=\"$target\"}[2m])", "refId": "B", "legendFormat": "write rej/s" }

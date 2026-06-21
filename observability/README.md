@@ -32,9 +32,12 @@ series; a central Prometheus scrapes them and Grafana renders the dashboards.
 | `keinfs-kst-detail` | KST Target Detail | Single target (templated): full per-RPC phase decomposition, latency percentiles, admission/stream rejections. |
 | `keinfs-kix-overview` | KIX Index Overview | Fleet index health: live entries, upsert rate, get hit ratio, rebuild-required, errors. |
 | `keinfs-kix-detail` | KIX Index Detail | Single KIX instance: op rates, delta-log/checkpoint durability activity, build info. |
+| `keinfs-kms-detail` | KMS Metadata Detail | Deep KMS drill-down: the full reserve path (route-resolve, pool-acquire, cache hit/miss/wait, direct reserve), cache effectiveness (reservation + route caches, discovery rates), the bucket-context / ec-profile / object-parent metadata caches, store internals, write-intent lifecycle, and per-RPC totals. |
+| `keinfs-kas-detail` | KAS Allocator Detail | Deep KAS drill-down: capacity (free/total/used %), the reserve path + its FDB-persist phase, finalize/release/reclaim, the epoch-fence & leadership health (fenced-commit-aborts + renew-failures, must be 0), reservation reaper, and per-RPC totals. |
 
 The two lifecycle dashboards are the entry point — start at the Overview, then
-drill into the Drill-Down / KST / KIX dashboards via the header links.
+drill into the Drill-Down, the per-service detail dashboards (KMS / KAS / KST /
+KIX), via the header links.
 
 ## Deploy the central stack (Docker)
 

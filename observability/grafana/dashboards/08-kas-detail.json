@@ -1,0 +1,286 @@
+{
+  "uid": "keinfs-kas-detail",
+  "title": "KeInFS — KAS Allocator Detail",
+  "tags": ["keinfs", "kas", "detail"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus", "current": { "text": "Prometheus", "value": "keinfs-prom" } },
+      {
+        "name": "instance", "label": "KAS Instance", "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(keinfs_kas_up, instance)",
+        "refresh": 2, "includeAll": false, "current": {}
+      },
+      {
+        "name": "rpc", "label": "RPC", "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(keinfs_kas_rpc_latency_microseconds{instance=\"$instance\"}, rpc)",
+        "refresh": 2, "includeAll": false, "multi": false, "current": {}
+      }
+    ]
+  },
+  "links": [
+    { "title": "I/O Lifecycle", "type": "link", "url": "/d/keinfs-io-lifecycle", "icon": "external link", "tooltip": "End-to-end write/read funnel" },
+    { "title": "KMS Detail", "type": "link", "url": "/d/keinfs-kms-detail", "icon": "external link", "tooltip": "Metadata service — the caller of this allocator" },
+    { "title": "KST Storage", "type": "link", "url": "/d/keinfs-kst-overview", "icon": "external link", "tooltip": "Storage targets whose free spans KAS owns" },
+    { "title": "KIX Index", "type": "link", "url": "/d/keinfs-kix-overview", "icon": "external link", "tooltip": "Chunk-location index fleet" }
+  ],
+  "panels": [
+    {
+      "type": "stat", "title": "Up",
+      "description": "1 = this KAS allocator leader is healthy. One KAS leader mutates one allocation shard.",
+      "gridPos": { "h": 4, "w": 3, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value" },
+      "targets": [ { "expr": "keinfs_kas_up{instance=\"$instance\"}", "refId": "A" } ]
+    },
+    {
+      "type": "stat", "title": "Capacity Used",
+      "description": "Fraction of granule capacity reserved/allocated on this shard. Climbing toward 100% means free spans are running out — reserve_stripe_batch will start failing before that.",
+      "gridPos": { "h": 4, "w": 5, "x": 3, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "decimals": 3, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 80 }, { "color": "red", "value": 95 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area" },
+      "targets": [ { "expr": "keinfs_kas_capacity_used_pct{instance=\"$instance\"}", "refId": "A" } ]
+    },
+    {
+      "type": "stat", "title": "Free Granules",
+      "description": "Free allocatable granules remaining on this shard. The reserve path draws down from here.",
+      "gridPos": { "h": 4, "w": 5, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "green" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
+      "targets": [ { "expr": "keinfs_kas_capacity_free_granules{instance=\"$instance\"}", "refId": "A" } ]
+    },
+    {
+      "type": "stat", "title": "Targets / Reserve rate",
+      "description": "Targets this shard accounts for, and live reserve_stripe_batch request rate (the hot allocator path on the write funnel).",
+      "gridPos": { "h": 4, "w": 6, "x": 13, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+      "targets": [
+        { "expr": "keinfs_kas_capacity_target_count{instance=\"$instance\"}", "refId": "A", "legendFormat": "targets" },
+        { "expr": "rate(keinfs_kas_reserve_stripe_batch_requests{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "reserve batch/s" }
+      ]
+    },
+    {
+      "type": "stat", "title": "Fence aborts / Renew fails",
+      "description": "Epoch-fence health. fenced_commit_aborts and leader_renew_failures MUST be 0 — non-zero means a stale leader was fenced or a lease renewal failed, i.e. a split-brain risk on the allocation shard.",
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "targets": [
+        { "expr": "keinfs_kas_fenced_commit_aborts{instance=\"$instance\"}", "refId": "A", "legendFormat": "fence aborts" },
+        { "expr": "keinfs_kas_leader_renew_failures{instance=\"$instance\"}", "refId": "B", "legendFormat": "renew fails" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Capacity", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 4 }
+    },
+    {
+      "type": "timeseries", "title": "Granule capacity — total / free / used",
+      "description": "Total, free and used (total - free) granules over time. The gap between total and free is live reservations + allocations. A converging free line = the shard is filling.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "min"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kas_capacity_total_granules{instance=\"$instance\"}", "refId": "A", "legendFormat": "total" },
+        { "expr": "keinfs_kas_capacity_free_granules{instance=\"$instance\"}", "refId": "B", "legendFormat": "free" },
+        { "expr": "keinfs_kas_capacity_total_granules{instance=\"$instance\"} - keinfs_kas_capacity_free_granules{instance=\"$instance\"}", "refId": "C", "legendFormat": "used" }
+      ]
+    },
+    {
+      "type": "gauge", "title": "Capacity used %",
+      "description": "Headroom gauge for this allocation shard. Green < 80%, amber 80-95%, red > 95% — reserve failures and write back-pressure begin in the red band.",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "decimals": 3, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 80 }, { "color": "red", "value": 95 } ] } } },
+      "options": { "showThresholdLabels": false, "showThresholdMarkers": true, "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "expr": "keinfs_kas_capacity_used_pct{instance=\"$instance\"}", "refId": "A" } ]
+    },
+    {
+      "type": "stat", "title": "Targets accounted",
+      "description": "capacity_target_count — number of storage targets whose free spans this shard tracks. Should equal the fleet target count assigned to this shard.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [ { "expr": "keinfs_kas_capacity_target_count{instance=\"$instance\"}", "refId": "A", "legendFormat": "targets" } ]
+    },
+
+    {
+      "type": "row", "title": "Reserve path", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 }
+    },
+    {
+      "type": "timeseries", "title": "Reserve request rate (ops/s)",
+      "description": "The allocator's hot path. reserve_stripe_batch is the batched stripe reservation KMS calls on initiate-write; reserve_stripe is the single-stripe form; reserve_replacement/reserve_rebuild feed the KRS rebuild path.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 14, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(keinfs_kas_reserve_stripe_batch_requests{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "reserve_stripe_batch/s" },
+        { "expr": "rate(keinfs_kas_reserve_stripe_requests{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "reserve_stripe/s" },
+        { "expr": "rate(keinfs_kas_reserve_replacement_requests{instance=\"$instance\"}[2m])", "refId": "C", "legendFormat": "reserve_replacement/s" },
+        { "expr": "rate(keinfs_kas_reserve_rebuild_requests{instance=\"$instance\"}[2m])", "refId": "D", "legendFormat": "reserve_rebuild/s" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "reserve_stripe_batch phase latency (p99, µs)",
+      "description": "Decomposition of a reserve_stripe_batch: request_validate, plan_in_memory (placement planning), persist_fdb (the FoundationDB write — usually the dominant phase), and the _total. If persist_fdb dominates, FDB is the allocator bottleneck.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 8, "lineWidth": 2, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "keinfs_kas_phase_latency_microseconds{instance=\"$instance\",rpc=\"reserve_stripe_batch\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{phase}}" } ]
+    },
+    {
+      "type": "bargauge", "title": "reserve_stripe_batch phase budget (p99, µs)",
+      "description": "Where a reserve_stripe_batch spends its p99 latency. The longest bar is the allocator bottleneck — typically persist_fdb.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "continuous-GrYlRd" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 5000 }, { "color": "red", "value": 50000 } ] } } },
+      "options": { "displayMode": "gradient", "orientation": "horizontal", "valueMode": "color", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" } },
+      "targets": [ { "expr": "keinfs_kas_phase_latency_microseconds{instance=\"$instance\",rpc=\"reserve_stripe_batch\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{phase}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Finalize / release / reclaim rate (ops/s)",
+      "description": "The reserve-lifecycle tail. finalize promotes reservations into allocations on commit; release returns un-finalized reservations; reclaim_target_granules pulls granules back from a draining/failed target.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 14, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(keinfs_kas_finalize_requests{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "finalize/s" },
+        { "expr": "rate(keinfs_kas_release_requests{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "release/s" },
+        { "expr": "rate(keinfs_kas_reclaim_target_granules_requests{instance=\"$instance\"}[2m])", "refId": "C", "legendFormat": "reclaim/s" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Fence & leadership health", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 29 }
+    },
+    {
+      "type": "stat", "title": "Fenced commit aborts",
+      "description": "ALERT METRIC. Reservations aborted because the leader epoch was fenced. MUST stay 0 — any increase means a stale leader tried to commit on the allocation shard.",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 30 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "textMode": "value_and_name" },
+      "targets": [ { "expr": "keinfs_kas_fenced_commit_aborts{instance=\"$instance\"}", "refId": "A", "legendFormat": "fenced_commit_aborts" } ]
+    },
+    {
+      "type": "stat", "title": "Leader renew failures",
+      "description": "ALERT METRIC. Allocation-shard lease renewals that failed. MUST stay 0 — a rising count precedes a leadership handover and a fencing event.",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 30 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "textMode": "value_and_name" },
+      "targets": [ { "expr": "keinfs_kas_leader_renew_failures{instance=\"$instance\"}", "refId": "A", "legendFormat": "leader_renew_failures" } ]
+    },
+    {
+      "type": "timeseries", "title": "Fence-health deltas (events/s)",
+      "description": "Rate-of-change of the two epoch-fence counters. Any blip above 0 is an active fence/renewal event worth investigating immediately. Flat zero = a stable single leader.",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 30 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 20, "lineWidth": 2, "showPoints": "auto", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(keinfs_kas_fenced_commit_aborts{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "fence aborts/s" },
+        { "expr": "rate(keinfs_kas_leader_renew_failures{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "renew fails/s" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Reservation lifecycle", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 }
+    },
+    {
+      "type": "timeseries", "title": "Reservation reaper — runs / released (ops/s)",
+      "description": "The background reaper that expires abandoned reservations and returns their granules. reservation_reaper_runs/s is the sweep cadence; reservation_reaper_released/s is how many reservations it reclaimed. A high released rate = clients are reserving and not finalizing (write churn or aborts).",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 14, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(keinfs_kas_reservation_reaper_runs{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "reaper runs/s" },
+        { "expr": "rate(keinfs_kas_reservation_reaper_released{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "reaper released/s" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Reservation reaper — cumulative released",
+      "description": "Total reservations the reaper has reclaimed since start. A steep slope indicates a high reserve-without-finalize ratio worth correlating with KMS commit failures.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "orange" }, "custom": { "fillOpacity": 14, "lineWidth": 2, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
+      "targets": [ { "expr": "keinfs_kas_reservation_reaper_released{instance=\"$instance\"}", "refId": "A", "legendFormat": "released total" } ]
+    },
+
+    {
+      "type": "row", "title": "RPC totals & latency", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 45 }
+    },
+    {
+      "type": "timeseries", "title": "RPC request rate by type (ops/s)",
+      "description": "Per-RPC request rate across the full KAS surface: reserve_stripe_batch, finalize_reservations, heartbeat_target, register_target, list_targets, list_service_instances, etc. The control-plane mix the allocator is serving.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 14, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity", "stacking": { "mode": "normal" } } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "rate(keinfs_kas_rpc_requests_total{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "{{rpc}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Heartbeat / register / list RPC rate (ops/s)",
+      "description": "Target-inventory control traffic: heartbeat_target keeps targets live, register_target onboards a target, list_targets / list_service_instances are inventory reads. A heartbeat drop precedes a target being marked down.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 46 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(keinfs_kas_heartbeat_requests{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "heartbeat/s" },
+        { "expr": "rate(keinfs_kas_register_target_requests{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "register_target/s" },
+        { "expr": "rate(keinfs_kas_list_targets_requests{instance=\"$instance\"}[2m])", "refId": "C", "legendFormat": "list_targets/s" },
+        { "expr": "rate(keinfs_kas_list_service_instances_requests{instance=\"$instance\"}[2m])", "refId": "D", "legendFormat": "list_service_instances/s" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "$rpc latency (p50/p95/p99/max, µs)",
+      "description": "End-to-end latency percentile spread for the selected RPC. reserve_stripe_batch and finalize_reservations are FDB-bound, so their tail tracks FoundationDB commit latency.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 4, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "keinfs_kas_rpc_latency_microseconds{instance=\"$instance\",rpc=\"$rpc\"}", "refId": "A", "legendFormat": "p{{quantile}}" } ]
+    },
+    {
+      "type": "table", "title": "Per-RPC totals (requests, errors, p99 µs)",
+      "description": "One row per RPC. rpc_errors_total must be 0 across the board; p99 lets you spot the slow RPCs at a glance.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "requests" }, "properties": [ { "id": "displayName", "value": "Requests" } ] },
+          { "matcher": { "id": "byName", "options": "errors" }, "properties": [ { "id": "displayName", "value": "Errors" }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } } ] },
+          { "matcher": { "id": "byName", "options": "p99_us" }, "properties": [ { "id": "unit", "value": "µs" }, { "id": "displayName", "value": "p99 (µs)" }, { "id": "custom.cellOptions", "value": { "type": "gauge", "mode": "gradient" } } ] }
+        ]
+      },
+      "transformations": [ { "id": "joinByLabels", "options": { "join": ["rpc"] } } ],
+      "options": { "showHeader": true, "sortBy": [ { "displayName": "Requests", "desc": true } ] },
+      "targets": [
+        { "expr": "keinfs_kas_rpc_requests_total{instance=\"$instance\"}", "refId": "requests", "format": "table", "instant": true },
+        { "expr": "keinfs_kas_rpc_errors_total{instance=\"$instance\"}", "refId": "errors", "format": "table", "instant": true },
+        { "expr": "keinfs_kas_rpc_latency_microseconds{instance=\"$instance\",quantile=\"0.99\"}", "refId": "p99_us", "format": "table", "instant": true }
+      ]
+    }
+  ]
+}

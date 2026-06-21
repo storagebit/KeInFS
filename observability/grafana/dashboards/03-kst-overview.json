@@ -4,7 +4,7 @@
   "tags": ["keinfs", "kst", "overview"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "15s",
   "time": { "from": "now-30m", "to": "now" },
   "templating": {
@@ -13,47 +13,56 @@
     ]
   },
   "links": [
-    { "title": "KST Detail", "type": "link", "url": "/d/keinfs-kst-detail", "icon": "external link" },
-    { "title": "KIX", "type": "dashboards", "tags": ["kix"], "asDropdown": true, "icon": "external link" }
+    { "title": "KST Detail", "type": "link", "url": "/d/keinfs-kst-detail", "icon": "external link", "tooltip": "Single-target full phase decomposition" },
+    { "title": "KIX Index", "type": "link", "url": "/d/keinfs-kix-overview", "icon": "external link", "tooltip": "Chunk-location index fleet" },
+    { "title": "KAS Allocator", "type": "link", "url": "/d/keinfs-kas-detail", "icon": "external link", "tooltip": "Allocator / reservation deep dive" },
+    { "title": "I/O Lifecycle", "type": "link", "url": "/d/keinfs-io-lifecycle", "icon": "external link", "tooltip": "End-to-end write/read funnel" },
+    { "title": "More KIX", "type": "dashboards", "tags": ["kix"], "asDropdown": true, "icon": "external link" }
   ],
   "panels": [
     {
       "type": "stat", "title": "Targets Up",
+      "description": "Number of KST storage targets reporting up. One KST = one physical drive. Healthy lab = 12. Any drop = a drive/target out of the data path.",
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 12 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 1 }, { "color": "green", "value": 12 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value" },
       "targets": [ { "expr": "count(keinfs_kst_up)", "refId": "A", "legendFormat": "up" } ]
     },
     {
       "type": "stat", "title": "Total Write Ingest",
+      "description": "Aggregate write payload bytes/s landing on media across all targets (rate over 2m). This is post-EC fragment bytes, not client logical bytes.",
       "gridPos": { "h": 4, "w": 5, "x": 4, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "Bps" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "color": { "mode": "fixed", "fixedColor": "blue" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
       "targets": [ { "expr": "sum(rate(keinfs_kst_write_payload_bytes[2m]))", "refId": "A", "legendFormat": "write B/s" } ]
     },
     {
       "type": "stat", "title": "Total Read Serve",
+      "description": "Aggregate read payload bytes/s served from media across all targets (rate over 2m).",
       "gridPos": { "h": 4, "w": 5, "x": 9, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "Bps" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "color": { "mode": "fixed", "fixedColor": "green" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
       "targets": [ { "expr": "sum(rate(keinfs_kst_read_payload_bytes[2m]))", "refId": "A", "legendFormat": "read B/s" } ]
     },
     {
       "type": "stat", "title": "Inflight Requests (fleet)",
+      "description": "Sum of currently-executing storage requests across all targets. Sustained growth without throughput growth = admission saturation; cross-check stream rejections and execution_queue_wait in KST Detail.",
       "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "purple" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
       "targets": [ { "expr": "sum(keinfs_kst_inflight_requests)", "refId": "A", "legendFormat": "inflight" } ]
     },
     {
       "type": "stat", "title": "Errors + Stream Rejections",
+      "description": "Cumulative fleet errors plus admission stream rejections. Healthy = 0. Any non-zero = look at the fleet table and KST Detail admission row.",
       "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value" },
       "targets": [ { "expr": "sum(keinfs_kst_total_errors) + sum(keinfs_kst_total_stream_rejections)", "refId": "A", "legendFormat": "errors+rej" } ]
     },
 
@@ -62,18 +71,20 @@
     },
     {
       "type": "timeseries", "title": "Write ingest per target (B/s)",
+      "description": "Per-target write payload bytes/s. A flat target while others move = a hot/cold imbalance or a stalled drive.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 8 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "Bps", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never", "stacking": { "mode": "none" } } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [ { "expr": "rate(keinfs_kst_write_payload_bytes[2m])", "refId": "A", "legendFormat": "{{target_id}}" } ]
     },
     {
       "type": "timeseries", "title": "Read serve per target (B/s)",
+      "description": "Per-target read payload bytes/s served from media.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 8 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "Bps", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [ { "expr": "rate(keinfs_kst_read_payload_bytes[2m])", "refId": "A", "legendFormat": "{{target_id}}" } ]
     },
 
@@ -82,18 +93,20 @@
     },
     {
       "type": "timeseries", "title": "Write RPC p99 latency per target (µs)",
+      "description": "Per-target write RPC p99. Healthy media-bound write is single-digit ms at p99; one target diverging upward = that drive is the laggard. Click into KST Detail for the phase breakdown.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "µs", "custom": { "fillOpacity": 0 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [ { "expr": "keinfs_kst_rpc_latency_microseconds{rpc=\"write\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{target_id}}" } ]
     },
     {
       "type": "timeseries", "title": "Active connections per target",
+      "description": "Live HTTP/2 sessions (KSC↔KST) per target. Should track the number of active smart clients × sessions.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 8 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [ { "expr": "keinfs_kst_active_connections", "refId": "A", "legendFormat": "{{target_id}}" } ]
     },
 
@@ -101,12 +114,24 @@
       "type": "row", "title": "Fleet health table", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }
     },
     {
-      "type": "table", "title": "Per-target status (write B/s, inflight, errors, handshake failures)",
+      "type": "table", "title": "Per-target status (write B/s, inflight, errors, handshake failures, stream rej)",
+      "description": "One row per target. Errors / handshake failures / stream rejections should all be 0. Sort by any column to find the outlier drive.",
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 23 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "write_Bps" }, "properties": [ { "id": "unit", "value": "Bps" }, { "id": "displayName", "value": "Write B/s" }, { "id": "custom.cellOptions", "value": { "type": "gauge", "mode": "gradient" } } ] },
+          { "matcher": { "id": "byName", "options": "inflight" }, "properties": [ { "id": "displayName", "value": "Inflight" } ] },
+          { "matcher": { "id": "byName", "options": "errors" }, "properties": [ { "id": "displayName", "value": "Errors" }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } } ] },
+          { "matcher": { "id": "byName", "options": "handshake_fail" }, "properties": [ { "id": "displayName", "value": "Handshake fails" }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } } ] },
+          { "matcher": { "id": "byName", "options": "stream_rej" }, "properties": [ { "id": "displayName", "value": "Stream rej" }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 100 } ] } }, { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } } ] }
+        ]
+      },
       "transformations": [
         { "id": "joinByLabels", "options": { "join": ["target_id"] } }
       ],
+      "options": { "showHeader": true, "sortBy": [ { "displayName": "Write B/s", "desc": true } ] },
       "targets": [
         { "expr": "rate(keinfs_kst_write_payload_bytes[2m])", "refId": "write_Bps", "format": "table", "instant": true },
         { "expr": "keinfs_kst_inflight_requests", "refId": "inflight", "format": "table", "instant": true },

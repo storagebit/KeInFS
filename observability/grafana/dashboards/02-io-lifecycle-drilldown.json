@@ -4,7 +4,7 @@
   "tags": ["keinfs", "lifecycle", "drilldown"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "15s",
   "time": { "from": "now-30m", "to": "now" },
   "templating": {
@@ -29,8 +29,33 @@
       }
     ]
   },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "name": "Annotations & Alerts",
+        "type": "dashboard",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" }
+      },
+      {
+        "name": "Notes",
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": false,
+        "iconColor": "yellow",
+        "type": "dashboard",
+        "tags": ["keinfs"]
+      }
+    ]
+  },
   "links": [
-    { "title": "Lifecycle Overview", "type": "link", "url": "/d/keinfs-io-lifecycle", "icon": "external link" }
+    { "title": "Lifecycle Overview", "type": "link", "url": "/d/keinfs-io-lifecycle", "icon": "external link", "tooltip": "Top-of-funnel throughput + WRITE/READ lifecycle" },
+    { "title": "KMS Detail", "type": "link", "url": "/d/keinfs-kms-detail", "icon": "external link", "tooltip": "Deep KMS metadata-service drill-down" },
+    { "title": "KST Detail", "type": "link", "url": "/d/keinfs-kst-detail", "icon": "external link" },
+    { "title": "KIX Detail", "type": "link", "url": "/d/keinfs-kix-detail", "icon": "external link" }
   ],
   "panels": [
     {
@@ -38,11 +63,13 @@
     },
     {
       "type": "timeseries", "title": "Phase latency p99 (µs) — every phase, $service rpc=$rpc",
-      "description": "One line per (rpc, phase). This is the authoritative phase decomposition of an I/O: where every microsecond of an operation is spent inside $service.",
+      "description": "One line per (rpc, phase). This is the authoritative phase decomposition of an I/O: where every microsecond of an operation is spent inside $service. Sort the legend table by max to find the dominant phase; a healthy KMS reserve phase sits at ~1µs.",
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "µs", "custom": { "fillOpacity": 3, "lineWidth": 1 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] } },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 1, "fillOpacity": 4, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99)" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "max by (rpc, phase) (keinfs_${service}_phase_latency_microseconds{rpc=~\"$rpc\",instance=~\"$instance\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "{{rpc}} / {{phase}}" }
       ]
@@ -51,18 +78,29 @@
       "type": "row", "title": "Percentile spread per phase", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 11 }
     },
     {
-      "type": "heatmap", "title": "Phase latency heatmap (p50/p95/p99/max stacked by phase)",
+      "type": "heatmap", "title": "Phase latency heatmap (p99 per phase over time)",
+      "description": "p99 of each phase rendered as a heatmap — bright cells are slow phases. Use it to spot a phase that occasionally spikes even if its average is fine.",
       "gridPos": { "h": 10, "w": 12, "x": 0, "y": 12 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "calculate": false, "cellGap": 1, "color": { "scheme": "Spectral", "mode": "scheme" } },
+      "options": { "calculate": false, "cellGap": 1, "yAxis": { "unit": "µs" }, "color": { "scheme": "Spectral", "mode": "scheme", "reverse": true }, "tooltip": { "show": true, "yHistogram": false }, "legend": { "show": true } },
       "targets": [
         { "expr": "max by (phase) (keinfs_${service}_phase_latency_microseconds{rpc=~\"$rpc\",instance=~\"$instance\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "{{phase}}", "format": "time_series" }
       ]
     },
     {
       "type": "table", "title": "Phase percentile table (latest, µs)",
+      "description": "Latest p50/p95/p99/max for every phase. The gauge cells make the p99 column read at a glance; green ≤ 1ms, yellow ≤ 50ms, red above.",
       "gridPos": { "h": 10, "w": 12, "x": 12, "y": 12 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 0, "custom": { "align": "auto", "cellOptions": { "type": "auto" } } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Value" }, "properties": [
+            { "id": "custom.cellOptions", "value": { "type": "gauge", "mode": "gradient" } },
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1000 }, { "color": "red", "value": 50000 } ] } }
+          ] }
+        ]
+      },
       "transformations": [
         { "id": "labelsToFields", "options": { "mode": "columns", "keepLabels": ["phase", "quantile"] } },
         { "id": "groupBy", "options": { "fields": {
@@ -80,18 +118,26 @@
     },
     {
       "type": "timeseries", "title": "RPC request rate by rpc (ops/s)",
+      "description": "Per-rpc request rate for $service. Use it to see which control-plane call dominates the offered load.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 12, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "ops/s" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "sum by (rpc) (rate(keinfs_${service}_rpc_requests_total{instance=~\"$instance\"}[2m]))", "refId": "A", "legendFormat": "{{rpc}}" }
       ]
     },
     {
       "type": "timeseries", "title": "RPC error rate by rpc (errors/s)",
+      "description": "Per-rpc error rate for $service. Healthy = flat zero across the board; any rpc lifting off the floor here is the first place to look on an incident.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 }, "color": { "mode": "palette-classic" } } },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "decimals": 2, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 18, "gradientMode": "opacity", "showPoints": "auto", "axisLabel": "errors/s" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "sum by (rpc) (rate(keinfs_${service}_rpc_errors_total{instance=~\"$instance\"}[2m]))", "refId": "A", "legendFormat": "{{rpc}}" }
       ]

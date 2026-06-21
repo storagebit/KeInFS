@@ -4,7 +4,7 @@
   "tags": ["keinfs", "kix", "overview"],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "15s",
   "time": { "from": "now-30m", "to": "now" },
   "templating": {
@@ -13,47 +13,55 @@
     ]
   },
   "links": [
-    { "title": "KIX Detail", "type": "link", "url": "/d/keinfs-kix-detail", "icon": "external link" },
-    { "title": "KST", "type": "dashboards", "tags": ["kst"], "asDropdown": true, "icon": "external link" }
+    { "title": "KIX Detail", "type": "link", "url": "/d/keinfs-kix-detail", "icon": "external link", "tooltip": "Single KIX instance deep dive" },
+    { "title": "KST Storage", "type": "link", "url": "/d/keinfs-kst-overview", "icon": "external link", "tooltip": "The storage targets this index serves" },
+    { "title": "KAS Allocator", "type": "link", "url": "/d/keinfs-kas-detail", "icon": "external link", "tooltip": "Allocator / reservation deep dive" },
+    { "title": "I/O Lifecycle", "type": "link", "url": "/d/keinfs-io-lifecycle", "icon": "external link", "tooltip": "End-to-end write/read funnel" }
   ],
   "panels": [
     {
       "type": "stat", "title": "KIX Instances Up",
+      "description": "Number of KIX index arenas reporting up. One KIX arena = one drive. Healthy lab = 12.",
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 12 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 1 }, { "color": "green", "value": 12 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value" },
       "targets": [ { "expr": "count(keinfs_kix_up)", "refId": "A" } ]
     },
     {
       "type": "stat", "title": "Total Live Entries (fleet)",
+      "description": "Sum of live chunk-location entries across all KIX arenas. This is the working-set size of the chunk index.",
       "gridPos": { "h": 4, "w": 5, "x": 4, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
       "targets": [ { "expr": "sum(keinfs_kix_total_live_entries)", "refId": "A", "legendFormat": "live entries" } ]
     },
     {
       "type": "stat", "title": "Upsert Rate (fleet, ops/s)",
+      "description": "Fleet-wide index upsert rate (rate 2m). Tracks the write op rate landing on the storage targets.",
       "gridPos": { "h": 4, "w": 5, "x": 9, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops" } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "fixed", "fixedColor": "green" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area", "colorMode": "value" },
       "targets": [ { "expr": "sum(rate(keinfs_kix_total_upsert_ops[2m]))", "refId": "A", "legendFormat": "upsert/s" } ]
     },
     {
       "type": "stat", "title": "Rebuild-Required Drives",
+      "description": "Count of KIX arenas flagged as needing rebuild (rebuild_required_drives != none). Healthy = 0. Non-zero = KRS should be reconstructing fragments.",
       "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value" },
       "targets": [ { "expr": "count(keinfs_kix_info{rebuild_required_drives!=\"none\"}) or vector(0)", "refId": "A", "legendFormat": "rebuild" } ]
     },
     {
       "type": "stat", "title": "Shard + Write Errors (fleet)",
+      "description": "Cumulative shard errors plus delta-log/checkpoint write errors across all arenas. Healthy = 0; any non-zero = durability path trouble, check the fleet table.",
       "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
-      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value" },
       "targets": [ { "expr": "sum(keinfs_kix_total_shard_errors) + sum(keinfs_kix_total_write_errors)", "refId": "A", "legendFormat": "errors" } ]
     },
 
@@ -62,18 +70,20 @@
     },
     {
       "type": "timeseries", "title": "Live entries per KIX instance",
+      "description": "Per-arena live entry count. Even balance across arenas = healthy fragment distribution; one arena far above the rest = a hot drive.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 8 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [ { "expr": "keinfs_kix_total_live_entries", "refId": "A", "legendFormat": "{{instance}}" } ]
     },
     {
-      "type": "timeseries", "title": "Upsert + delta append rate per instance (ops/s)",
+      "type": "timeseries", "title": "Upsert rate per instance (ops/s)",
+      "description": "Per-arena index upsert rate. This is the write-side index pressure on each drive.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 8 } } },
-      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "rate(keinfs_kix_total_upsert_ops[2m])", "refId": "A", "legendFormat": "{{instance}} upsert" }
       ]
@@ -84,18 +94,22 @@
     },
     {
       "type": "timeseries", "title": "Get hit ratio (fleet)",
+      "description": "Fleet get-hit ratio = get_hits / get_ops. Near 1.0 means lookups are served from the live map. A sustained dip means cold-lookup / delta-replay churn.",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "fillOpacity": 10 } } },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 0.9 }, { "color": "green", "value": 0.99 } ] }, "custom": { "fillOpacity": 16, "lineWidth": 2, "showPoints": "never", "gradientMode": "scheme", "thresholdsStyle": { "mode": "off" } } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single" } },
       "targets": [
         { "expr": "sum(rate(keinfs_kix_total_get_hits[2m])) / clamp_min(sum(rate(keinfs_kix_total_get_ops[2m])), 1)", "refId": "A", "legendFormat": "hit ratio" }
       ]
     },
     {
-      "type": "timeseries", "title": "Checkpoint + append-batch rate (fleet, ops/s)",
+      "type": "timeseries", "title": "Durability rate (fleet, ops/s) — append batches / checkpoints / enqueue retries",
+      "description": "Delta-log and checkpoint durability activity. append_batches/s and checkpoints/s are normal background flushing; enqueue retries/s rising = the durability queue is backing up.",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
-      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 8 } } },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "showPoints": "never", "gradientMode": "opacity" } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "sum(rate(keinfs_kix_total_append_batches[2m]))", "refId": "A", "legendFormat": "append batches/s" },
         { "expr": "sum(rate(keinfs_kix_total_checkpoint_ops[2m]))", "refId": "B", "legendFormat": "checkpoints/s" },
@@ -107,10 +121,21 @@
       "type": "row", "title": "Fleet table", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }
     },
     {
-      "type": "table", "title": "KIX per-instance (live entries, upsert/s, errors, crc backend)",
+      "type": "table", "title": "KIX per-instance (live entries, upsert/s, shard/write errors)",
+      "description": "One row per KIX arena. Errors should be 0; upsert/s should track write load. Sort to find the outlier arena.",
       "gridPos": { "h": 10, "w": 24, "x": 0, "y": 23 },
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "live" }, "properties": [ { "id": "displayName", "value": "Live entries" }, { "id": "custom.cellOptions", "value": { "type": "gauge", "mode": "gradient" } } ] },
+          { "matcher": { "id": "byName", "options": "upsert_s" }, "properties": [ { "id": "unit", "value": "ops" }, { "id": "displayName", "value": "Upsert/s" } ] },
+          { "matcher": { "id": "byName", "options": "shard_err" }, "properties": [ { "id": "displayName", "value": "Shard errors" }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } } ] },
+          { "matcher": { "id": "byName", "options": "write_err" }, "properties": [ { "id": "displayName", "value": "Write errors" }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } }, { "id": "custom.cellOptions", "value": { "type": "color-background", "mode": "gradient" } } ] }
+        ]
+      },
       "transformations": [ { "id": "joinByLabels", "options": { "join": ["instance"] } } ],
+      "options": { "showHeader": true, "sortBy": [ { "displayName": "Live entries", "desc": true } ] },
       "targets": [
         { "expr": "keinfs_kix_total_live_entries", "refId": "live", "format": "table", "instant": true },
         { "expr": "rate(keinfs_kix_total_upsert_ops[2m])", "refId": "upsert_s", "format": "table", "instant": true },
