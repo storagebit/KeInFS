@@ -69,6 +69,10 @@ pub(crate) struct KasSnapshot {
     pub(crate) reservation_reaper_released: u64,
     pub(crate) fenced_commit_aborts: u64,
     pub(crate) leader_renew_failures: u64,
+    pub(crate) capacity_free_granules: u64,
+    pub(crate) capacity_total_granules: u64,
+    pub(crate) capacity_target_count: u64,
+    pub(crate) capacity_used_pct: f64,
     pub(crate) rpcs: BTreeMap<String, RpcSnapshot>,
     pub(crate) last_error: Option<String>,
 }
@@ -226,6 +230,15 @@ pub(crate) struct KasStats {
     // (lost lease, epoch advanced under us, or renewal RPC error). Makes a
     // step-down visible instead of silent (the renewer is a detached spawn).
     leader_renew_failures: AtomicU64,
+    // Capacity gauge (observability gap-fix). Free/total granules across this
+    // shard's targets, refreshed on the heartbeat interval so CLUSTER FILL is
+    // readable from the always-available summary FILE. Previously free space
+    // was only reachable via `keinctl target list` (a gRPC that starves under
+    // write load), so during a sustained fill there was no way to see how full
+    // the targets were without competing with the data path.
+    capacity_free_granules: AtomicU64,
+    capacity_total_granules: AtomicU64,
+    capacity_target_count: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
 
@@ -260,8 +273,24 @@ impl KasStats {
             reservation_reaper_released: AtomicU64::new(0),
             fenced_commit_aborts: AtomicU64::new(0),
             leader_renew_failures: AtomicU64::new(0),
+            capacity_free_granules: AtomicU64::new(0),
+            capacity_total_granules: AtomicU64::new(0),
+            capacity_target_count: AtomicU64::new(0),
             last_error: Mutex::new(None),
         })
+    }
+
+    /// Observability gap-fix: publish the aggregate free/total granule capacity
+    /// across this shard's targets into the summary file. Called periodically
+    /// (heartbeat interval) so cluster fill is readable under load without a
+    /// gRPC `list_targets`.
+    pub(crate) fn set_capacity(&self, free_granules: u64, total_granules: u64, target_count: u64) {
+        self.capacity_free_granules
+            .store(free_granules, Ordering::Relaxed);
+        self.capacity_total_granules
+            .store(total_granules, Ordering::Relaxed);
+        self.capacity_target_count
+            .store(target_count, Ordering::Relaxed);
     }
 
     pub(crate) fn record_request(&self, kind: RpcKind) {
@@ -343,6 +372,18 @@ impl KasStats {
             reservation_reaper_released: self.reservation_reaper_released.load(Ordering::Relaxed),
             fenced_commit_aborts: self.fenced_commit_aborts.load(Ordering::Relaxed),
             leader_renew_failures: self.leader_renew_failures.load(Ordering::Relaxed),
+            capacity_free_granules: self.capacity_free_granules.load(Ordering::Relaxed),
+            capacity_total_granules: self.capacity_total_granules.load(Ordering::Relaxed),
+            capacity_target_count: self.capacity_target_count.load(Ordering::Relaxed),
+            capacity_used_pct: {
+                let total = self.capacity_total_granules.load(Ordering::Relaxed);
+                let free = self.capacity_free_granules.load(Ordering::Relaxed);
+                if total > 0 {
+                    100.0 * (total.saturating_sub(free)) as f64 / total as f64
+                } else {
+                    0.0
+                }
+            },
             rpcs,
             last_error: self.last_error.lock().unwrap().clone(),
         }

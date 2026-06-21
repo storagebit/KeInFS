@@ -125,6 +125,13 @@ pub(crate) struct ObjectBenchmarkConfig {
     pub(crate) kms_grpc_max_message_bytes: usize,
     pub(crate) metadata_notification_nats_url: Option<String>,
     pub(crate) metadata_notification_subject: String,
+    // Live observability gap-fix: when `progress_interval` > 0, the benchmark
+    // prints a periodic progress line and (if `stats_root` is set) writes a JSON
+    // snapshot so the CLIENT side of a load test is observable WHILE it runs,
+    // not just from the final stdout summary. Default off preserves prior
+    // stdout-only behavior.
+    pub(crate) progress_interval: Duration,
+    pub(crate) stats_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -906,6 +913,8 @@ fn parse_object_benchmark_args(args: &[String]) -> Result<ObjectBenchmarkConfig,
     let mut kms_grpc_max_message_bytes = DEFAULT_KMS_GRPC_MAX_MESSAGE_BYTES;
     let mut metadata_notification_nats_url = None;
     let mut metadata_notification_subject = DEFAULT_METADATA_NOTIFICATION_SUBJECT.to_string();
+    let mut progress_interval_secs = 0_u64;
+    let mut stats_root: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -989,6 +998,19 @@ fn parse_object_benchmark_args(args: &[String]) -> Result<ObjectBenchmarkConfig,
                     .get(i)
                     .ok_or_else(|| missing_value("--key-prefix"))?
                     .clone();
+            }
+            "--progress-secs" => {
+                i += 1;
+                progress_interval_secs = args
+                    .get(i)
+                    .ok_or_else(|| missing_value("--progress-secs"))?
+                    .parse()?;
+            }
+            "--stats-root" => {
+                i += 1;
+                stats_root = Some(PathBuf::from(
+                    args.get(i).ok_or_else(|| missing_value("--stats-root"))?,
+                ));
             }
             "--key-shape" => {
                 i += 1;
@@ -1162,6 +1184,8 @@ fn parse_object_benchmark_args(args: &[String]) -> Result<ObjectBenchmarkConfig,
         kms_grpc_max_message_bytes,
         metadata_notification_nats_url,
         metadata_notification_subject,
+        progress_interval: Duration::from_secs(progress_interval_secs),
+        stats_root,
     })
 }
 
@@ -1501,6 +1525,8 @@ fn object_benchmark_usage() -> &'static str {
         "  --metadata-notification-nats-url <uri> subscribe to KMS invalidation events via NATS\n",
         "  --metadata-notification-subject <name> NATS subject for invalidations, default keinfs.kms.events\n",
         "  --verify-reads | --no-verify-reads compare read payloads to the input bytes, default verify\n",
+        "  --progress-secs <n>   print a live progress line every n s during the run, default 0 (off)\n",
+        "  --stats-root <dir>    write a live JSON snapshot (object-benchmark.json) to dir each progress interval\n",
     )
 }
 

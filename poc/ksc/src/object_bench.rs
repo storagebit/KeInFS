@@ -8,10 +8,58 @@ use crate::config::{
 use crate::object_cli::print_phase_line;
 use ksc::client::CompletionMode as ClientCompletionMode;
 use ksc::object::{ObjectClient, ObjectClientOptions, ObjectPhaseTimes};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Barrier;
 use tokio::task::JoinSet;
+
+/// Live, lock-free counters updated by every worker during the measured phase
+/// so the CLIENT side of a load test is observable WHILE it runs. Previously the
+/// benchmark emitted nothing until the final stdout summary — during a long
+/// sustained run (e.g. a multi-TiB fill) there was no way to see client-side
+/// ops/s, bytes, or error count without waiting for the end. A background
+/// reporter snapshots these on an interval to stdout and (optionally) a JSON
+/// file. Default off (interval 0) preserves prior behavior exactly.
+#[derive(Default)]
+struct BenchLiveStats {
+    write_ops: AtomicU64,
+    write_bytes: AtomicU64,
+    read_ops: AtomicU64,
+    read_bytes: AtomicU64,
+    errors: AtomicU64,
+    last_write_us: AtomicU64,
+    last_read_us: AtomicU64,
+}
+
+impl BenchLiveStats {
+    fn record_write(&self, bytes: u64, elapsed: Duration) {
+        self.write_ops.fetch_add(1, Ordering::Relaxed);
+        self.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.last_write_us
+            .store(elapsed.as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+    }
+    fn record_read(&self, bytes: u64, elapsed: Duration) {
+        self.read_ops.fetch_add(1, Ordering::Relaxed);
+        self.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.last_read_us
+            .store(elapsed.as_micros().min(u64::MAX as u128) as u64, Ordering::Relaxed);
+    }
+    fn record_error(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+    fn snapshot(&self) -> (u64, u64, u64, u64, u64, u64, u64) {
+        (
+            self.write_ops.load(Ordering::Relaxed),
+            self.write_bytes.load(Ordering::Relaxed),
+            self.read_ops.load(Ordering::Relaxed),
+            self.read_bytes.load(Ordering::Relaxed),
+            self.errors.load(Ordering::Relaxed),
+            self.last_write_us.load(Ordering::Relaxed),
+            self.last_read_us.load(Ordering::Relaxed),
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 enum OpKind {
@@ -120,6 +168,7 @@ pub(crate) async fn run_object_benchmark(
 
     let bench_barrier = matches!(config.run_mode, ObjectBenchmarkRunMode::Timed { .. })
         .then(|| Arc::new(Barrier::new(config.workers + 1)));
+    let live_stats = Arc::new(BenchLiveStats::default());
     let mut joins = JoinSet::new();
     for worker_index in 0..config.workers {
         let worker_config = config.clone();
@@ -127,6 +176,7 @@ pub(crate) async fn run_object_benchmark(
         let worker_run_prefix = run_prefix.clone();
         let worker_prefill_keys = prefill_keys.clone();
         let worker_barrier = bench_barrier.clone();
+        let worker_live_stats = live_stats.clone();
         joins.spawn(async move {
             run_worker(
                 worker_index,
@@ -135,6 +185,7 @@ pub(crate) async fn run_object_benchmark(
                 worker_prefill_keys,
                 worker_payload,
                 worker_barrier,
+                worker_live_stats,
             )
             .await
         });
@@ -143,6 +194,24 @@ pub(crate) async fn run_object_benchmark(
         barrier.wait().await;
     }
     let bench_started = Instant::now();
+
+    // Live progress reporter: snapshots the shared counters every interval to
+    // stdout + an optional JSON file, so a long sustained run is observable
+    // client-side while it runs. Cancelled as soon as the workers finish.
+    let progress_handle = (!config.progress_interval.is_zero()).then(|| {
+        let reporter_stats = live_stats.clone();
+        let interval = config.progress_interval;
+        let stats_root = config.stats_root.clone();
+        let started = bench_started;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await; // consume the immediate first tick
+            loop {
+                ticker.tick().await;
+                emit_progress(&reporter_stats, started, stats_root.as_deref());
+            }
+        })
+    });
 
     let mut totals = WorkerTotals::default();
     while let Some(result) = joins.join_next().await {
@@ -154,6 +223,11 @@ pub(crate) async fn run_object_benchmark(
         merge_bench_totals(&mut totals.writes, worker.writes);
     }
     let bench_elapsed = bench_started.elapsed();
+    if let Some(handle) = progress_handle {
+        handle.abort();
+        // One final snapshot so the JSON/stdout progress reflects the full run.
+        emit_progress(&live_stats, bench_started, config.stats_root.as_deref());
+    }
 
     let total_ops = totals.reads.ops + totals.writes.ops;
     let total_bytes = totals.reads.bytes + totals.writes.bytes;
@@ -216,6 +290,7 @@ pub(crate) async fn run_object_benchmark(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_worker(
     worker_index: usize,
     config: ObjectBenchmarkConfig,
@@ -223,6 +298,7 @@ async fn run_worker(
     prefill_keys: Vec<String>,
     payload: Vec<u8>,
     bench_barrier: Option<Arc<Barrier>>,
+    live_stats: Arc<BenchLiveStats>,
 ) -> Result<WorkerTotals, Box<dyn std::error::Error + Send + Sync>> {
     let mut totals = WorkerTotals::default();
     let mut client = ObjectClient::connect_with_options(
@@ -254,6 +330,7 @@ async fn run_worker(
                     worker_index,
                     op_index,
                     &mut totals,
+                    Some(&live_stats),
                 )
                 .await;
                 op_index += 1;
@@ -264,6 +341,7 @@ async fn run_worker(
                 let mut warmup_totals = WorkerTotals::default();
                 let warmup_deadline = Instant::now() + warmup;
                 while Instant::now() < warmup_deadline {
+                    // Warmup ops are excluded from the measured live counters.
                     run_one_op(
                         &mut client,
                         &config,
@@ -273,6 +351,7 @@ async fn run_worker(
                         worker_index,
                         op_index,
                         &mut warmup_totals,
+                        None,
                     )
                     .await;
                     op_index += 1;
@@ -292,6 +371,7 @@ async fn run_worker(
                     worker_index,
                     op_index,
                     &mut totals,
+                    Some(&live_stats),
                 )
                 .await;
                 op_index += 1;
@@ -301,6 +381,7 @@ async fn run_worker(
     Ok(totals)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one_op(
     client: &mut ObjectClient,
     config: &ObjectBenchmarkConfig,
@@ -310,6 +391,7 @@ async fn run_one_op(
     worker_index: usize,
     op_index: usize,
     totals: &mut WorkerTotals,
+    live_stats: Option<&BenchLiveStats>,
 ) {
     let op_kind = choose_kind(config.write_percent, worker_index, op_index);
     match op_kind {
@@ -327,17 +409,21 @@ async fn run_one_op(
                 .await
             {
                 Ok(result) => {
-                    record_success(
-                        &mut totals.writes,
-                        payload.len() as u64,
-                        started.elapsed(),
-                        result.phases,
-                    );
+                    let elapsed = started.elapsed();
+                    record_success(&mut totals.writes, payload.len() as u64, elapsed, result.phases);
+                    if let Some(s) = live_stats {
+                        s.record_write(payload.len() as u64, elapsed);
+                    }
                 }
-                Err(err) => totals.writes.errors.push(format!(
-                    "worker={} op={} kind=write key={} err={}",
-                    worker_index, op_index, key, err
-                )),
+                Err(err) => {
+                    if let Some(s) = live_stats {
+                        s.record_error();
+                    }
+                    totals.writes.errors.push(format!(
+                        "worker={} op={} kind=write key={} err={}",
+                        worker_index, op_index, key, err
+                    ));
+                }
             }
         }
         OpKind::Read => {
@@ -349,18 +435,25 @@ async fn run_one_op(
             {
                 Ok(result) => {
                     if config.verify_reads && result.payload != payload {
+                        if let Some(s) = live_stats {
+                            s.record_error();
+                        }
                         totals.reads.errors.push(format!(
                             "worker={} op={} kind=read key={} err=payload-mismatch",
                             worker_index, op_index, key
                         ));
                         return;
                     }
+                    let elapsed = started.elapsed();
                     record_success(
                         &mut totals.reads,
                         result.payload.len() as u64,
-                        started.elapsed(),
+                        elapsed,
                         result.phases,
                     );
+                    if let Some(s) = live_stats {
+                        s.record_read(result.payload.len() as u64, elapsed);
+                    }
                     totals.reads.data_fragment_reads += result.data_fragment_reads;
                     totals.reads.parity_fragment_reads += result.parity_fragment_reads;
                     if result.reconstructed {
@@ -370,11 +463,44 @@ async fn run_one_op(
                         totals.reads.fast_path_reads += 1;
                     }
                 }
-                Err(err) => totals.reads.errors.push(format!(
-                    "worker={} op={} kind=read key={} err={}",
-                    worker_index, op_index, key, err
-                )),
+                Err(err) => {
+                    if let Some(s) = live_stats {
+                        s.record_error();
+                    }
+                    totals.reads.errors.push(format!(
+                        "worker={} op={} kind=read key={} err={}",
+                        worker_index, op_index, key, err
+                    ));
+                }
             }
+        }
+    }
+}
+
+/// Snapshot the shared live counters to stdout and, if a stats root is set, to
+/// `<stats_root>/object-benchmark.json` (atomic write via tmp+rename). Mirrors
+/// the daemon stats trees so a load test's client side is observable live.
+fn emit_progress(stats: &BenchLiveStats, started: Instant, stats_root: Option<&std::path::Path>) {
+    let elapsed = started.elapsed();
+    let secs = elapsed.as_secs_f64().max(1e-6);
+    let (wops, wbytes, rops, rbytes, errors, last_w_us, last_r_us) = stats.snapshot();
+    let total_bytes = wbytes + rbytes;
+    let mib_s = (total_bytes as f64) / (1024.0 * 1024.0) / secs;
+    let ops_s = ((wops + rops) as f64) / secs;
+    println!(
+        "ksc_object_benchmark_progress elapsed_s={:.1} write_ops={} read_ops={} logical_bytes={} throughput_mib_s={:.2} ops_s={:.0} errors={} last_write_us={} last_read_us={}",
+        secs, wops, rops, total_bytes, mib_s, ops_s, errors, last_w_us, last_r_us
+    );
+    if let Some(root) = stats_root {
+        let json = format!(
+            "{{\"elapsed_s\":{:.1},\"write_ops\":{},\"write_bytes\":{},\"read_ops\":{},\"read_bytes\":{},\"logical_bytes\":{},\"throughput_mib_s\":{:.2},\"ops_s\":{:.0},\"errors\":{},\"last_write_us\":{},\"last_read_us\":{}}}\n",
+            secs, wops, wbytes, rops, rbytes, total_bytes, mib_s, ops_s, errors, last_w_us, last_r_us
+        );
+        let _ = std::fs::create_dir_all(root);
+        let final_path = root.join("object-benchmark.json");
+        let tmp_path = root.join("object-benchmark.json.tmp");
+        if std::fs::write(&tmp_path, json.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &final_path);
         }
     }
 }

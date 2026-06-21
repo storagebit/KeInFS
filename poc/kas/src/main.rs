@@ -330,6 +330,21 @@ async fn service_registration_loop(
         if let Err(err) = store.upsert_service_instance(instance.clone()).await {
             stats.set_last_error(format!("KAS service registration failed: {err}"));
         }
+        // Observability gap-fix: refresh the capacity gauge on the heartbeat
+        // interval so cluster fill (free/total granules, used %) is readable
+        // from the always-available summary FILE under load. This is off the hot
+        // reserve path (heartbeat cadence), so it does not compete with the data
+        // plane the way a foreground `keinctl target list` gRPC does.
+        match store.list_targets().await {
+            Ok(targets) => {
+                let free: u64 = targets.iter().map(|t| t.free_granules).sum();
+                let total: u64 = targets.iter().map(|t| t.granule_count).sum();
+                stats.set_capacity(free, total, targets.len() as u64);
+            }
+            Err(err) => {
+                stats.set_last_error(format!("KAS capacity gauge refresh failed: {err}"));
+            }
+        }
     }
 }
 
