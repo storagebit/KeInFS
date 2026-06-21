@@ -1,0 +1,22 @@
+[Unit]
+Description=KeInFS Prometheus exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{SERVICE_USER}}
+Group={{SERVICE_GROUP}}
+# The exporter is a read-only sidecar: it scans the runtime stat trees every
+# scrape and serves Prometheus exposition text on :9909/metrics. It adds no
+# load to any service hot path. Point one Prometheus job at <node>:9909.
+ExecStart={{BINDIR}}/keinexport --listen 0.0.0.0:9909 --root {{RUNSTATEDIR}}/keinfs --root {{LOCALSTATEDIR}}/lib/keinfs/run
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+WorkingDirectory={{LOCALSTATEDIR}}/lib
+
+[Install]
+WantedBy=multi-user.target

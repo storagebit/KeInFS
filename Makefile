@@ -80,6 +80,7 @@ build: ensure-config preflight-build
 	"$(CARGO)" build --manifest-path "$(ROOT_DIR)/poc/krs/Cargo.toml" --bin krs $(KRS_FEATURES) $(PROFILE_FLAG)
 	"$(CARGO)" build --manifest-path "$(ROOT_DIR)/poc/ksc/Cargo.toml" --bin ksc $(KSC_FEATURES) $(PROFILE_FLAG)
 	"$(CARGO)" build --manifest-path "$(ROOT_DIR)/poc/kst/Cargo.toml" --bin kst $(PROFILE_FLAG)
+	"$(CARGO)" build --manifest-path "$(ROOT_DIR)/poc/keinexport/Cargo.toml" --bin keinexport $(PROFILE_FLAG)
 ifeq ($(ENABLE_FUSE),1)
 	"$(CARGO)" build --manifest-path "$(ROOT_DIR)/poc/kfc/Cargo.toml" --bin kfc $(KFC_FEATURES) $(PROFILE_FLAG)
 endif
@@ -130,6 +131,7 @@ install: build render
 	install -m 0755 "$(CARGO_TARGET_DIR)/$(PROFILE_DIR)/krs" "$(DESTDIR)$(BINDIR)/krs"
 	install -m 0755 "$(CARGO_TARGET_DIR)/$(PROFILE_DIR)/ksc" "$(DESTDIR)$(BINDIR)/ksc"
 	install -m 0755 "$(CARGO_TARGET_DIR)/$(PROFILE_DIR)/kst" "$(DESTDIR)$(BINDIR)/kst"
+	install -m 0755 "$(CARGO_TARGET_DIR)/$(PROFILE_DIR)/keinexport" "$(DESTDIR)$(BINDIR)/keinexport"
 ifeq ($(ENABLE_FUSE),1)
 	install -m 0755 "$(CARGO_TARGET_DIR)/$(PROFILE_DIR)/kfc" "$(DESTDIR)$(BINDIR)/kfc"
 endif
