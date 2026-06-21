@@ -215,6 +215,10 @@ pub(crate) struct Kp2StatsSnapshot {
     pub packed_read_requests: u64,
     pub packed_read_chunks: u64,
     pub packed_read_logical_payload_bytes: u64,
+    /// Guard D: writes refused because the target slot already held a live
+    /// committed chunk of a DIFFERENT chunk_id (an allocator-safety backstop;
+    /// must read 0 in a healthy cluster). See poc/kas/DESIGN_KAS_COMMITTED_OCCUPANCY.md.
+    pub committed_slot_write_rejections: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -592,6 +596,7 @@ pub(crate) struct TargetRuntimeStats {
     packed_read_requests: AtomicU64,
     packed_read_chunks: AtomicU64,
     packed_read_logical_payload_bytes: AtomicU64,
+    committed_slot_write_rejections: AtomicU64,
     handshake_latency: LatencyRuntimeStats,
     connection_lifetime: LatencyRuntimeStats,
     last_error: Mutex<Option<String>>,
@@ -647,6 +652,7 @@ impl TargetRuntimeStats {
             packed_read_requests: AtomicU64::new(0),
             packed_read_chunks: AtomicU64::new(0),
             packed_read_logical_payload_bytes: AtomicU64::new(0),
+            committed_slot_write_rejections: AtomicU64::new(0),
             handshake_latency: LatencyRuntimeStats::new(),
             connection_lifetime: LatencyRuntimeStats::new(),
             last_error: Mutex::new(None),
@@ -775,6 +781,14 @@ impl TargetRuntimeStats {
             .fetch_add(chunks as u64, Ordering::Relaxed);
         self.packed_write_logical_payload_bytes
             .fetch_add(logical_payload_bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Guard D fired: a write was refused because its target slot already held a
+    /// live committed chunk of a different identity (would have overwritten
+    /// committed object data). Must stay 0 in a healthy cluster.
+    pub(crate) fn record_committed_slot_write_rejection(&self) {
+        self.committed_slot_write_rejections
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_kp2_read(&self, chunks: usize, logical_payload_bytes: usize) {
@@ -924,6 +938,9 @@ impl TargetRuntimeStats {
                     packed_read_chunks: self.packed_read_chunks.load(Ordering::Relaxed),
                     packed_read_logical_payload_bytes: self
                         .packed_read_logical_payload_bytes
+                        .load(Ordering::Relaxed),
+                    committed_slot_write_rejections: self
+                        .committed_slot_write_rejections
                         .load(Ordering::Relaxed),
                 },
                 rpcs: RpcGroupSnapshot {
@@ -1079,6 +1096,7 @@ pub(crate) fn write_stats_tree(snapshot: &TargetLiveSnapshot, root: &Path) -> io
                 "write_stream_rejections={}\n",
                 "kp2_packed_write_requests={}\n",
                 "kp2_packed_read_requests={}\n",
+                "committed_slot_write_rejections={}\n",
                 "total_requests={}\n",
                 "total_errors={}\n",
                 "read_payload_bytes={}\n",
@@ -1107,6 +1125,7 @@ pub(crate) fn write_stats_tree(snapshot: &TargetLiveSnapshot, root: &Path) -> io
             snapshot.stats.streams.write_stream_rejections,
             snapshot.stats.kp2.packed_write_requests,
             snapshot.stats.kp2.packed_read_requests,
+            snapshot.stats.kp2.committed_slot_write_rejections,
             snapshot.stats.total_requests,
             snapshot.stats.total_errors,
             snapshot.stats.read_payload_bytes,
@@ -1368,6 +1387,7 @@ pub(crate) fn write_stats_tree(snapshot: &TargetLiveSnapshot, root: &Path) -> io
                 "packed_read_requests={}\n",
                 "packed_read_chunks={}\n",
                 "packed_read_logical_payload_bytes={}\n",
+                "committed_slot_write_rejections={}\n",
             ),
             snapshot.stats.kp2.packed_write_requests,
             snapshot.stats.kp2.packed_write_chunks,
@@ -1375,6 +1395,7 @@ pub(crate) fn write_stats_tree(snapshot: &TargetLiveSnapshot, root: &Path) -> io
             snapshot.stats.kp2.packed_read_requests,
             snapshot.stats.kp2.packed_read_chunks,
             snapshot.stats.kp2.packed_read_logical_payload_bytes,
+            snapshot.stats.kp2.committed_slot_write_rejections,
         ),
     )?;
     write_text(

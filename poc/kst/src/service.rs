@@ -477,6 +477,30 @@ impl TargetRouter {
             self.fresh_publication_lane(slot_index, baseline)
         })?;
 
+        // GUARD D (allocator-safety backstop). The slot already has a committed
+        // owner of a DIFFERENT identity → this write would overwrite committed
+        // object data. With the durable committed-occupancy fix the allocator never
+        // hands out an occupied granule, so this fires only on a safety breach:
+        // refuse loudly (formerly the prior owner was silently retired + overwritten).
+        // Rejecting here — before the media write and KIX upsert — leaves the
+        // committed owner fully intact. See poc/kas/DESIGN_KAS_COMMITTED_OCCUPANCY.md.
+        if let Some(owner) = reservation.current {
+            if owner.chunk_id != chunk_id {
+                slot_publication.rollback();
+                self.stats.record_committed_slot_write_rejection();
+                return Err(ServiceError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "KST refused to write chunk {:?} to slot {}: it already holds committed \
+                         chunk {:?}. Refusing to overwrite committed data (the allocator handed out \
+                         an occupied granule).",
+                        chunk_id, slot_index, owner.chunk_id
+                    ),
+                    false,
+                ));
+            }
+        }
+
         // From here on the reservation must be resolved (commit or rollback)
         // before returning so the slot does not stay busy.
         match self.publish_reserved(chunk_id, slot_index, generation, &body, reservation) {
@@ -777,6 +801,29 @@ impl TargetRouter {
                             )),
                         });
                         continue;
+                    }
+                    // GUARD D (packed path): refuse to overwrite a slot already
+                    // holding a committed chunk of a different identity. Rejected
+                    // before the KIX upsert/retire, so the committed owner is intact.
+                    // See poc/kas/DESIGN_KAS_COMMITTED_OCCUPANCY.md.
+                    if let Some(owner) = reservation.current {
+                        if owner.chunk_id != chunk_id {
+                            slot_publication.rollback();
+                            self.stats.record_committed_slot_write_rejection();
+                            entries.push(PackedWriteReplyEntry {
+                                chunk_id: kp2::ChunkId(chunk_id.0),
+                                slot_index,
+                                requested_generation: generation,
+                                status_code: 409,
+                                location: None,
+                                error: Some(format!(
+                                    "KST refused to write chunk {:?} to slot {}: it already holds \
+                                     committed chunk {:?}; refusing to overwrite committed data",
+                                    chunk_id, slot_index, owner.chunk_id
+                                )),
+                            });
+                            continue;
+                        }
                     }
                     let publish_started = Instant::now();
                     match self.client.upsert(chunk_id, record) {

@@ -88,6 +88,17 @@ mod imp {
         allocator_state_stamp: Option<String>,
         target_state_loaded: bool,
         reservation_state_loaded: bool,
+        /// Granules (per target) known to hold durably-committed object data and
+        /// therefore NEVER returnable to the free pool. The reaper populates this
+        /// for the batch it is about to release (from a targeted durable read of the
+        /// shared KCO1 committed-occupancy keyspace) and clears it right after, so
+        /// `release_record_placements` skips committed granules ONLY on the reaper
+        /// path — explicit release (client abort, uncommitted) and reclaim (object
+        /// delete, must free) intentionally see an empty set. This is the in-memory
+        /// closure of the reaper-frees-committed-granule race; the durable KCO1
+        /// markers (written by KMS in the commit txn) are the cross-restart truth.
+        /// See poc/kas/DESIGN_KAS_COMMITTED_OCCUPANCY.md.
+        committed_granules: HashMap<String, HashSet<u64>>,
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -599,6 +610,47 @@ mod imp {
                 }
             }
             Ok(values)
+        }
+
+        /// Durable point-read of the shared committed-occupancy keyspace (KCO1) for
+        /// a bounded set of `(target, granule)` candidates: returns those that carry
+        /// a committed marker (written by KMS in the object-commit transaction). The
+        /// reaper uses this to refuse to free a granule whose object committed before
+        /// its reservation's finalize landed. Off the hot path; the candidate set is
+        /// bounded by the reaper's release limit. See
+        /// poc/kas/DESIGN_KAS_COMMITTED_OCCUPANCY.md.
+        async fn committed_granules_present(
+            &self,
+            candidates: &[(String, u64)],
+        ) -> Result<HashSet<(String, u64)>, Status> {
+            if candidates.is_empty() {
+                return Ok(HashSet::new());
+            }
+            let unique: Vec<(String, u64)> =
+                candidates.iter().cloned().collect::<HashSet<_>>().into_iter().collect();
+            self.db
+                .run(move |trx, _| {
+                    let unique = unique.clone();
+                    async move {
+                        let mut present = HashSet::new();
+                        for (target_id, granule) in &unique {
+                            let key = keinctl::committed_occupancy::committed_granule_key(
+                                target_id, *granule,
+                            );
+                            if trx
+                                .get(&key, false)
+                                .await
+                                .map_err(FdbBindingError::from)?
+                                .is_some()
+                            {
+                                present.insert((target_id.clone(), *granule));
+                            }
+                        }
+                        Ok::<HashSet<(String, u64)>, FdbBindingError>(present)
+                    }
+                })
+                .await
+                .map_err(map_fdb_binding_error)
         }
 
         async fn load_all<T>(&self, begin: Vec<u8>, end: Vec<u8>) -> Result<Vec<T>, Status>
@@ -2608,7 +2660,7 @@ mod imp {
             limit: usize,
         ) -> Result<usize, Status> {
             self.with_allocator_mutation_lease_full_state(async move {
-                let mutations = {
+                let (mutations, candidate_granules) = {
                     let state = self.state.lock().await;
                     let mut expired = state
                         .reservations
@@ -2622,21 +2674,57 @@ mod imp {
                         .collect::<Vec<_>>();
                     expired.sort();
                     expired.truncate(limit);
-                    expired
+                    // Every (target, granule) the expired batch holds — checked
+                    // against the durable committed keyspace before we free anything.
+                    let candidate_granules = expired
+                        .iter()
+                        .filter_map(|id| state.reservations.get(id))
+                        .flat_map(|reservation| {
+                            reservation
+                                .placements
+                                .iter()
+                                .map(|placement| {
+                                    (placement.target_id.clone(), placement.granule_index)
+                                })
+                        })
+                        .collect::<Vec<(String, u64)>>();
+                    let mutations = expired
                         .into_iter()
                         .map(|reservation_id| ReservationMutationSpec {
                             reservation_id,
                             placement_indexes: Vec::new(),
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    (mutations, candidate_granules)
                 };
                 if mutations.is_empty() {
                     return Ok(0);
                 }
+                // Durable committed-occupancy check (the reap-before-finalize race
+                // closure): a granule whose object committed must NOT be returned to
+                // free even though its reservation expired before finalize. Populate
+                // the ephemeral committed set so `release_record_placements` skips
+                // those granules; clear it afterwards so the non-reaper release/reclaim
+                // paths (which DO free) are unaffected.
+                let committed = self.committed_granules_present(&candidate_granules).await?;
+                if !committed.is_empty() {
+                    let mut state = self.state.lock().await;
+                    for (target_id, granule) in &committed {
+                        state
+                            .committed_granules
+                            .entry(target_id.clone())
+                            .or_default()
+                            .insert(*granule);
+                    }
+                }
                 let released = self
                     .apply_reservation_mutations_locked(mutations, ReservationMutationKind::Release)
-                    .await?;
-                Ok(released.len())
+                    .await;
+                {
+                    let mut state = self.state.lock().await;
+                    state.committed_granules.clear();
+                }
+                Ok(released?.len())
             })
             .await
         }
@@ -2913,6 +3001,20 @@ mod imp {
             .cloned()
             .collect::<Vec<_>>();
         for placement in released {
+            // Never return a granule that holds durably-committed data to the free
+            // pool. `committed_granules` is populated ONLY on the reaper path (from a
+            // durable KCO1 read of the batch being reaped), so this guard fires only
+            // there — it is the in-memory closure of the reaper-frees-committed-granule
+            // race. The reservation record is still dropped by the caller; the granule
+            // simply stays out of free-span (it was removed at reserve and never
+            // re-added). See poc/kas/DESIGN_KAS_COMMITTED_OCCUPANCY.md.
+            let is_committed = state
+                .committed_granules
+                .get(&placement.target_id)
+                .is_some_and(|granules| granules.contains(&placement.granule_index));
+            if is_committed {
+                continue;
+            }
             let entry = state.targets.get_mut(&placement.target_id).ok_or_else(|| {
                 Status::not_found(format!("unknown target {}", placement.target_id))
             })?;

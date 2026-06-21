@@ -5,6 +5,8 @@ pub mod proto {
     tonic::include_proto!("keinfs.control");
 }
 
+pub mod committed_occupancy;
+
 use proto::{EcProfile, FailureDomain};
 use std::fmt;
 

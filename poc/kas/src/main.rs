@@ -94,6 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         service_instance.clone(),
         stats.clone(),
         config.service_heartbeat_interval,
+        config.allocation_shard_id.clone(),
     ));
     let reservation_bins = ReservationBinRegistry::default();
     let reservation_bin_gate = ReservationBinGate::default();
@@ -126,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.reservation_reap_interval,
         config.reservation_reap_limit,
         service_instance.instance_id.clone(),
+        config.allocation_shard_id.clone(),
     ));
     let bin_refiller = tokio::spawn(reservation_bin_refill_loop(
         store.clone(),
@@ -169,7 +171,18 @@ async fn reservation_reaper_loop(
     interval: std::time::Duration,
     limit: usize,
     leader_id: String,
+    allocation_shard_id: String,
 ) {
+    // Per-shard reaper lease. The base name is GLOBAL, so before this fix exactly
+    // one KAS won it cluster-wide and could only reap its own shard — leaving the
+    // other shards' expired reservations un-reaped (capacity leak) and masking the
+    // committed-granule freeing bug. Suffixing by allocation_shard_id (mirroring
+    // `allocator_mutation_lease_name`) gives every shard its own reaper. Safe to
+    // enable now that the reaper skips durably-committed granules.
+    let lease_name = match allocation_shard_id.trim() {
+        "" => RESERVATION_REAPER_LEASE_NAME.to_string(),
+        shard => format!("{RESERVATION_REAPER_LEASE_NAME}/{shard}"),
+    };
     let lease_ttl_ms = std::cmp::max(interval.as_millis().saturating_mul(32) as u64, 30_000);
     let lease_refresh_ms = std::cmp::max(lease_ttl_ms / 2, interval.as_millis() as u64);
     let retry_backoff_ms = interval.as_millis().clamp(250, 5_000) as u64;
@@ -182,11 +195,7 @@ async fn reservation_reaper_loop(
         let now_ms = now_unix_ms();
         if now_ms >= next_lease_check_at_ms {
             is_leader = match store
-                .try_acquire_coordination_lease(
-                    RESERVATION_REAPER_LEASE_NAME,
-                    &leader_id,
-                    lease_ttl_ms,
-                )
+                .try_acquire_coordination_lease(&lease_name, &leader_id, lease_ttl_ms)
                 .await
             {
                 Ok(value) => {
@@ -322,6 +331,7 @@ async fn service_registration_loop(
     mut instance: keinctl::proto::ServiceInstanceRecord,
     stats: std::sync::Arc<KasStats>,
     interval: std::time::Duration,
+    allocation_shard_id: String,
 ) {
     let mut ticker = tokio::time::interval(interval);
     loop {
@@ -337,9 +347,18 @@ async fn service_registration_loop(
         // plane the way a foreground `keinctl target list` gRPC does.
         match store.list_targets().await {
             Ok(targets) => {
-                let free: u64 = targets.iter().map(|t| t.free_granules).sum();
-                let total: u64 = targets.iter().map(|t| t.granule_count).sum();
-                stats.set_capacity(free, total, targets.len() as u64);
+                // Count ONLY this shard's targets. `list_targets()` returns the whole
+                // fleet (all targets KAS loaded), so the previous unfiltered sum made
+                // every shard report the cluster total (target_count=12 everywhere) —
+                // misleading per-shard capacity. Each shard now reports its own slice;
+                // the cluster total is the sum across shards.
+                let mine = targets
+                    .iter()
+                    .filter(|t| t.allocation_shard_id == allocation_shard_id);
+                let free: u64 = mine.clone().map(|t| t.free_granules).sum();
+                let total: u64 = mine.clone().map(|t| t.granule_count).sum();
+                let count = mine.count() as u64;
+                stats.set_capacity(free, total, count);
             }
             Err(err) => {
                 stats.set_last_error(format!("KAS capacity gauge refresh failed: {err}"));

@@ -2051,6 +2051,13 @@ pub(crate) fn clear_target_current_fragment_index(
                 fragment.stripe_index,
                 fragment.fragment_index,
             ));
+            // Release the durable committed-occupancy marker so the granule may be
+            // returned to the allocator free pool (KAS load drops committed granules
+            // from free-span; clearing the marker is what lets reclaim re-free it).
+            trx.clear(&keinctl::committed_occupancy::committed_granule_key(
+                &fragment.target_id,
+                fragment.granule_index,
+            ));
         }
     }
 }
@@ -2070,6 +2077,22 @@ pub(crate) fn write_target_current_fragment_index(
                     fragment.fragment_index,
                 ),
                 &[],
+            );
+            // Durable committed-occupancy marker (shared KCO1 keyspace, read by KAS
+            // as an allocation constraint). Written in THIS commit transaction so a
+            // granule becomes occupied atomically with the object becoming durable —
+            // there is no window in which the reservation reaper could free a granule
+            // that already holds committed data. See poc/kas/DESIGN_KAS_COMMITTED_OCCUPANCY.md.
+            trx.set(
+                &keinctl::committed_occupancy::committed_granule_key(
+                    &fragment.target_id,
+                    fragment.granule_index,
+                ),
+                &keinctl::committed_occupancy::CommittedGranule {
+                    version_id: manifest.version_id.clone(),
+                    generation: fragment.generation,
+                }
+                .encode(),
             );
         }
     }
