@@ -18,6 +18,13 @@
 //   top_phases              the N slowest phases cluster-wide by p99
 //   list_targets            per-KST-target status table
 //
+// Day-2 operations tools (see dayops.ts) — advisory runbooks + gated mutations:
+//   plan_target_replacement, plan_node_maintenance, plan_ip_change,
+//   plan_topology_change, capacity_forecast, drain_readiness, rebuild_status
+//   (read-only); drain_target, set_target_state, preview_rebalance,
+//   enqueue_rebalance (shell out to keinctl; mutating ones gated behind
+//   KEINFS_MCP_ALLOW_MUTATIONS=1).
+//
 // Resource:
 //   keinfs://metric-catalog documented metric catalog (name/type/labels/meaning)
 
@@ -36,6 +43,7 @@ import {
   type Direction,
   type LifecyclePhase,
 } from "./lifecycle.js";
+import { registerDayOpsTools } from "./dayops.js";
 
 const PROMETHEUS_URL = process.env.PROMETHEUS_URL ?? "http://localhost:9090";
 const prom = new PrometheusClient(PROMETHEUS_URL);
@@ -578,6 +586,12 @@ server.registerResource(
   }),
 );
 
+// --- Day-2 operations tools ------------------------------------------------
+// Hardware replacement / maintenance / topology-change tooling: advisory
+// runbook synthesizers (read-only) plus keinctl-shelling tools whose mutating
+// members are gated behind KEINFS_MCP_ALLOW_MUTATIONS=1 (default OFF).
+registerDayOpsTools(server, prom);
+
 // Also expose a per-service catalog helper as a tool-callable convenience is
 // unnecessary; catalogForService is used by the resource indirectly. Keep the
 // import meaningful by exporting it for testing.
@@ -591,8 +605,10 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Stderr is safe for diagnostics; stdout is the MCP channel.
+  const mutations = process.env.KEINFS_MCP_ALLOW_MUTATIONS === "1" ? "ON" : "OFF";
   process.stderr.write(
-    `[keinfs-observability-mcp] connected (PROMETHEUS_URL=${PROMETHEUS_URL})\n`,
+    `[keinfs-observability-mcp] connected (PROMETHEUS_URL=${PROMETHEUS_URL}, ` +
+      `mutations=${mutations})\n`,
   );
 }
 
