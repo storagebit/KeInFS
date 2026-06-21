@@ -1,0 +1,122 @@
+{
+  "uid": "keinfs-kix-overview",
+  "title": "KeInFS — KIX Index Overview",
+  "tags": ["keinfs", "kix", "overview"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus", "current": { "text": "Prometheus", "value": "keinfs-prom" } }
+    ]
+  },
+  "links": [
+    { "title": "KIX Detail", "type": "link", "url": "/d/keinfs-kix-detail", "icon": "external link" },
+    { "title": "KST", "type": "dashboards", "tags": ["kst"], "asDropdown": true, "icon": "external link" }
+  ],
+  "panels": [
+    {
+      "type": "stat", "title": "KIX Instances Up",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 12 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [ { "expr": "count(keinfs_kix_up)", "refId": "A" } ]
+    },
+    {
+      "type": "stat", "title": "Total Live Entries (fleet)",
+      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "targets": [ { "expr": "sum(keinfs_kix_total_live_entries)", "refId": "A", "legendFormat": "live entries" } ]
+    },
+    {
+      "type": "stat", "title": "Upsert Rate (fleet, ops/s)",
+      "gridPos": { "h": 4, "w": 5, "x": 9, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "targets": [ { "expr": "sum(rate(keinfs_kix_total_upsert_ops[2m]))", "refId": "A", "legendFormat": "upsert/s" } ]
+    },
+    {
+      "type": "stat", "title": "Rebuild-Required Drives",
+      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [ { "expr": "count(keinfs_kix_info{rebuild_required_drives!=\"none\"}) or vector(0)", "refId": "A", "legendFormat": "rebuild" } ]
+    },
+    {
+      "type": "stat", "title": "Shard + Write Errors (fleet)",
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [ { "expr": "sum(keinfs_kix_total_shard_errors) + sum(keinfs_kix_total_write_errors)", "refId": "A", "legendFormat": "errors" } ]
+    },
+
+    {
+      "type": "row", "title": "Index activity per instance", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 4 }
+    },
+    {
+      "type": "timeseries", "title": "Live entries per KIX instance",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 8 } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } },
+      "targets": [ { "expr": "keinfs_kix_total_live_entries", "refId": "A", "legendFormat": "{{instance}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Upsert + delta append rate per instance (ops/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 8 } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "rate(keinfs_kix_total_upsert_ops[2m])", "refId": "A", "legendFormat": "{{instance}} upsert" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Get hit/miss & durability activity", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 }
+    },
+    {
+      "type": "timeseries", "title": "Get hit ratio (fleet)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kix_total_get_hits[2m])) / clamp_min(sum(rate(keinfs_kix_total_get_ops[2m])), 1)", "refId": "A", "legendFormat": "hit ratio" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Checkpoint + append-batch rate (fleet, ops/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 8 } } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kix_total_append_batches[2m]))", "refId": "A", "legendFormat": "append batches/s" },
+        { "expr": "sum(rate(keinfs_kix_total_checkpoint_ops[2m]))", "refId": "B", "legendFormat": "checkpoints/s" },
+        { "expr": "sum(rate(keinfs_kix_total_enqueue_retries[2m]))", "refId": "C", "legendFormat": "enqueue retries/s" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Fleet table", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }
+    },
+    {
+      "type": "table", "title": "KIX per-instance (live entries, upsert/s, errors, crc backend)",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "transformations": [ { "id": "joinByLabels", "options": { "join": ["instance"] } } ],
+      "targets": [
+        { "expr": "keinfs_kix_total_live_entries", "refId": "live", "format": "table", "instant": true },
+        { "expr": "rate(keinfs_kix_total_upsert_ops[2m])", "refId": "upsert_s", "format": "table", "instant": true },
+        { "expr": "keinfs_kix_total_shard_errors", "refId": "shard_err", "format": "table", "instant": true },
+        { "expr": "keinfs_kix_total_write_errors", "refId": "write_err", "format": "table", "instant": true }
+      ]
+    }
+  ]
+}

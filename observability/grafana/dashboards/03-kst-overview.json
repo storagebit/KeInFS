@@ -1,0 +1,119 @@
+{
+  "uid": "keinfs-kst-overview",
+  "title": "KeInFS — KST Storage Targets Overview",
+  "tags": ["keinfs", "kst", "overview"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus", "current": { "text": "Prometheus", "value": "keinfs-prom" } }
+    ]
+  },
+  "links": [
+    { "title": "KST Detail", "type": "link", "url": "/d/keinfs-kst-detail", "icon": "external link" },
+    { "title": "KIX", "type": "dashboards", "tags": ["kix"], "asDropdown": true, "icon": "external link" }
+  ],
+  "panels": [
+    {
+      "type": "stat", "title": "Targets Up",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 12 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [ { "expr": "count(keinfs_kst_up)", "refId": "A", "legendFormat": "up" } ]
+    },
+    {
+      "type": "stat", "title": "Total Write Ingest",
+      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "Bps" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "targets": [ { "expr": "sum(rate(keinfs_kst_write_payload_bytes[2m]))", "refId": "A", "legendFormat": "write B/s" } ]
+    },
+    {
+      "type": "stat", "title": "Total Read Serve",
+      "gridPos": { "h": 4, "w": 5, "x": 9, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "Bps" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "targets": [ { "expr": "sum(rate(keinfs_kst_read_payload_bytes[2m]))", "refId": "A", "legendFormat": "read B/s" } ]
+    },
+    {
+      "type": "stat", "title": "Inflight Requests (fleet)",
+      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "targets": [ { "expr": "sum(keinfs_kst_inflight_requests)", "refId": "A", "legendFormat": "inflight" } ]
+    },
+    {
+      "type": "stat", "title": "Errors + Stream Rejections",
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [ { "expr": "sum(keinfs_kst_total_errors) + sum(keinfs_kst_total_stream_rejections)", "refId": "A", "legendFormat": "errors+rej" } ]
+    },
+
+    {
+      "type": "row", "title": "Per-target throughput", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 4 }
+    },
+    {
+      "type": "timeseries", "title": "Write ingest per target (B/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 8 } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } },
+      "targets": [ { "expr": "rate(keinfs_kst_write_payload_bytes[2m])", "refId": "A", "legendFormat": "{{target_id}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Read serve per target (B/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 8 } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] } },
+      "targets": [ { "expr": "rate(keinfs_kst_read_payload_bytes[2m])", "refId": "A", "legendFormat": "{{target_id}}" } ]
+    },
+
+    {
+      "type": "row", "title": "Per-target latency & load", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 }
+    },
+    {
+      "type": "timeseries", "title": "Write RPC p99 latency per target (µs)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "custom": { "fillOpacity": 0 } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "targets": [ { "expr": "keinfs_kst_rpc_latency_microseconds{rpc=\"write\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{target_id}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Active connections per target",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 8 } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "targets": [ { "expr": "keinfs_kst_active_connections", "refId": "A", "legendFormat": "{{target_id}}" } ]
+    },
+
+    {
+      "type": "row", "title": "Fleet health table", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }
+    },
+    {
+      "type": "table", "title": "Per-target status (write B/s, inflight, errors, handshake failures)",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "transformations": [
+        { "id": "joinByLabels", "options": { "join": ["target_id"] } }
+      ],
+      "targets": [
+        { "expr": "rate(keinfs_kst_write_payload_bytes[2m])", "refId": "write_Bps", "format": "table", "instant": true },
+        { "expr": "keinfs_kst_inflight_requests", "refId": "inflight", "format": "table", "instant": true },
+        { "expr": "keinfs_kst_total_errors", "refId": "errors", "format": "table", "instant": true },
+        { "expr": "keinfs_kst_total_handshake_failures", "refId": "handshake_fail", "format": "table", "instant": true },
+        { "expr": "keinfs_kst_total_stream_rejections", "refId": "stream_rej", "format": "table", "instant": true }
+      ]
+    }
+  ]
+}

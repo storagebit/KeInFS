@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "keinfs-observability": {
+      "command": "node",
+      "args": ["./observability/mcp/dist/index.js"],
+      "env": {
+        "PROMETHEUS_URL": "http://localhost:9090"
+      }
+    }
+  }
+}

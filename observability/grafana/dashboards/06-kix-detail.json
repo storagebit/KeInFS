@@ -1,0 +1,130 @@
+{
+  "uid": "keinfs-kix-detail",
+  "title": "KeInFS — KIX Index Detail",
+  "tags": ["keinfs", "kix", "detail"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus", "current": { "text": "Prometheus", "value": "keinfs-prom" } },
+      {
+        "name": "instance", "label": "KIX Instance", "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(keinfs_kix_up, instance)",
+        "refresh": 2, "includeAll": false
+      }
+    ]
+  },
+  "links": [
+    { "title": "KIX Overview", "type": "link", "url": "/d/keinfs-kix-overview", "icon": "external link" }
+  ],
+  "panels": [
+    {
+      "type": "stat", "title": "Up / Shards / Drives",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "keinfs_kix_up{instance=\"$instance\"}", "refId": "A", "legendFormat": "up" },
+        { "expr": "keinfs_kix_shard_count{instance=\"$instance\"}", "refId": "B", "legendFormat": "shards" },
+        { "expr": "keinfs_kix_drive_count{instance=\"$instance\"}", "refId": "C", "legendFormat": "drives" }
+      ]
+    },
+    {
+      "type": "stat", "title": "Live Entries",
+      "gridPos": { "h": 4, "w": 5, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "graphMode": "area" },
+      "targets": [ { "expr": "keinfs_kix_total_live_entries{instance=\"$instance\"}", "refId": "A" } ]
+    },
+    {
+      "type": "stat", "title": "Upsert / Delete (ops/s)",
+      "gridPos": { "h": 4, "w": 6, "x": 11, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "rate(keinfs_kix_total_upsert_ops{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "upsert/s" },
+        { "expr": "rate(keinfs_kix_total_delete_ops{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "delete/s" }
+      ]
+    },
+    {
+      "type": "stat", "title": "Errors / Retries",
+      "gridPos": { "h": 4, "w": 7, "x": 17, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "keinfs_kix_total_shard_errors{instance=\"$instance\"}", "refId": "A", "legendFormat": "shard err" },
+        { "expr": "keinfs_kix_total_write_errors{instance=\"$instance\"}", "refId": "B", "legendFormat": "write err" },
+        { "expr": "keinfs_kix_total_enqueue_retries{instance=\"$instance\"}", "refId": "C", "legendFormat": "retries" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Operation rates", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 4 }
+    },
+    {
+      "type": "timeseries", "title": "Index op rate (get / upsert / delete, ops/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "rate(keinfs_kix_total_get_ops{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "get/s" },
+        { "expr": "rate(keinfs_kix_total_upsert_ops{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "upsert/s" },
+        { "expr": "rate(keinfs_kix_total_delete_ops{instance=\"$instance\"}[2m])", "refId": "C", "legendFormat": "delete/s" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Get hit vs miss (ops/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } } },
+      "targets": [
+        { "expr": "rate(keinfs_kix_total_get_hits{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "hits/s" },
+        { "expr": "rate(keinfs_kix_total_get_misses{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "misses/s" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Durability (delta log + checkpoints)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 }
+    },
+    {
+      "type": "timeseries", "title": "Append batches + appended deltas (ops/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "rate(keinfs_kix_total_append_batches{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "append batches/s" },
+        { "expr": "rate(keinfs_kix_total_appended_deltas{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "appended deltas/s" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Checkpoints + checkpoint entries (ops/s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "rate(keinfs_kix_total_checkpoint_ops{instance=\"$instance\"}[2m])", "refId": "A", "legendFormat": "checkpoints/s" },
+        { "expr": "rate(keinfs_kix_total_checkpoint_entries{instance=\"$instance\"}[2m])", "refId": "B", "legendFormat": "checkpoint entries/s" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Index info", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 }
+    },
+    {
+      "type": "table", "title": "KIX build/capability info",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "transformations": [
+        { "id": "labelsToFields", "options": { "mode": "columns" } },
+        { "id": "organize", "options": { "excludeByName": { "Value": true, "Time": true, "__name__": true, "job": true } } }
+      ],
+      "targets": [ { "expr": "keinfs_kix_info{instance=\"$instance\"}", "refId": "A", "format": "table", "instant": true } ]
+    }
+  ]
+}

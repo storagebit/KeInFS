@@ -27,7 +27,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use convert::{json_snapshot_to_metrics, kst_kv_to_metrics, MetricSet};
+use convert::{json_snapshot_to_metrics, kix_kv_to_metrics, kst_kv_to_metrics, MetricSet};
 use discover::{discover, read_rpc_files};
 
 struct Config {
@@ -97,6 +97,10 @@ fn render_metrics(roots: &[PathBuf]) -> String {
                 }
                 Err(_) => continue,
             }
+        } else if inst.service == "kix" {
+            // KIX: flat key=value summary (raw-device chunk-location index).
+            kix_kv_to_metrics(&inst.instance_id, &raw, &mut set);
+            instance_count += 1;
         } else {
             // KST: flat key=value summary + a rpcs/ dir of per-RPC files.
             let rpc_files = inst

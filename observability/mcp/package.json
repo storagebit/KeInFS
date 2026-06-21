@@ -1,0 +1,31 @@
+{
+  "name": "keinfs-observability-mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for observing a live KeInFS distributed object-storage cluster via its central Prometheus.",
+  "license": "GPL-2.0-or-later",
+  "author": "Andreas Krause / storagebit",
+  "type": "module",
+  "bin": {
+    "keinfs-observability-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc --watch",
+    "prepare": "tsc"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}

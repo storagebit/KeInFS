@@ -329,6 +329,53 @@ pub fn kst_kv_to_metrics(
     }
 }
 
+/// Convert a KIX flat `key=value` summary into metrics. KIX is the raw-device
+/// chunk-location index embedded in each KST; one KIX instance per target. The
+/// summary carries the live-map size, get/upsert/delete op counters, append/
+/// checkpoint activity, and error/retry counters — the index-side view of the
+/// I/O lifecycle. String fields (cpu_arch, crc32_backend, rebuild_required) are
+/// surfaced as labels on an info gauge so they're queryable without polluting
+/// numeric series.
+pub fn kix_kv_to_metrics(instance: &str, summary_kv: &str, out: &mut MetricSet) {
+    let kv = parse_kv(summary_kv);
+    let base = base_labels("kix", instance, &[]);
+    out.add(
+        "keinfs_kix_up",
+        "gauge",
+        "1 if a snapshot was scraped for this KIX instance",
+        base.clone(),
+        1.0,
+    );
+    // Info gauge carrying the string identity fields as labels.
+    let crc_backend = kv.get("crc32_backend").cloned().unwrap_or_default();
+    let crc_accel = kv.get("crc32_accelerated").cloned().unwrap_or_default();
+    let cpu_arch = kv.get("cpu_arch").cloned().unwrap_or_default();
+    let rebuild = kv.get("rebuild_required_drives").cloned().unwrap_or_default();
+    let mut info_labels = base.clone();
+    info_labels.push(("crc32_backend".to_string(), crc_backend));
+    info_labels.push(("crc32_accelerated".to_string(), crc_accel));
+    info_labels.push(("cpu_arch".to_string(), cpu_arch));
+    info_labels.push(("rebuild_required_drives".to_string(), rebuild));
+    out.add(
+        "keinfs_kix_info",
+        "gauge",
+        "KIX build/capability info (labels carry crc backend, arch, rebuild state)",
+        info_labels,
+        1.0,
+    );
+    for (k, v) in &kv {
+        if let Ok(n) = v.parse::<f64>() {
+            out.add(
+                &format!("keinfs_kix_{}", sanitize(k)),
+                metric_kind(k),
+                &format!("kix {k}"),
+                base.clone(),
+                n,
+            );
+        }
+    }
+}
+
 fn emit_kst_rpc(
     base: &[(String, String)],
     rpc_name: &str,
@@ -457,6 +504,16 @@ fn metric_kind(name: &str) -> &'static str {
         "expired",
         "reads",
         "writes",
+        // KIX op/activity counters
+        "_ops",
+        "entries",
+        "batches",
+        "deltas",
+        "retries",
+        "rebuilt",
+        "leased",
+        "polls",
+        "tasks",
     ];
     if counterish.iter().any(|s| name.contains(s)) {
         "counter"
@@ -552,5 +609,25 @@ mod tests {
         assert!(text.contains("keinfs_kas_capacity_free_granules"));
         assert!(text.contains("keinfs_kas_capacity_used_pct"));
         assert!(text.contains("keinfs_kas_fenced_commit_aborts"));
+    }
+
+    #[test]
+    fn kix_kv_summary_becomes_metrics() {
+        let summary = "pid=2602559\nuptime_ms=2860396\nshard_count=4\ndrive_count=1\ncpu_arch=x86_64\ncrc32_backend=x86-pclmulqdq\ncrc32_accelerated=yes\nrebuild_required_drives=none\ntotal_live_entries=1290\ntotal_get_ops=1290\ntotal_get_hits=0\ntotal_get_misses=1290\ntotal_upsert_ops=1290\ntotal_delete_ops=0\ntotal_append_batches=1290\ntotal_appended_deltas=1290\ntotal_checkpoint_ops=0\ntotal_shard_errors=0\ntotal_write_errors=0\n";
+        let mut set = MetricSet::new();
+        kix_kv_to_metrics("kix-2602559", summary, &mut set);
+        let text = set.render();
+        // numeric gauges/counters present
+        assert!(text.contains("keinfs_kix_total_live_entries{service=\"kix\",instance=\"kix-2602559\"} 1290"));
+        assert!(text.contains("keinfs_kix_shard_count{service=\"kix\",instance=\"kix-2602559\"} 4"));
+        // op counters classified as counters
+        assert!(text.contains("# TYPE keinfs_kix_total_get_ops counter"));
+        assert!(text.contains("# TYPE keinfs_kix_total_upsert_ops counter"));
+        // info gauge carries string fields as labels
+        assert!(text.contains("keinfs_kix_info{") && text.contains("crc32_backend=\"x86-pclmulqdq\""));
+        assert!(text.contains("rebuild_required_drives=\"none\""));
+        // string fields are NOT emitted as numeric metrics
+        assert!(!text.contains("keinfs_kix_cpu_arch "));
+        assert!(text.contains("keinfs_kix_up{"));
     }
 }

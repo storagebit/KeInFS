@@ -1,0 +1,154 @@
+{
+  "uid": "keinfs-io-lifecycle",
+  "title": "KeInFS — I/O Lifecycle Overview",
+  "tags": ["keinfs", "lifecycle", "overview"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "keinfs-prom" },
+        "hide": 0
+      }
+    ]
+  },
+  "links": [
+    { "title": "Lifecycle Drill-Down", "type": "dashboards", "tags": ["lifecycle"], "asDropdown": true, "icon": "external link" },
+    { "title": "KST", "type": "dashboards", "tags": ["kst"], "asDropdown": true, "icon": "external link" },
+    { "title": "KIX", "type": "dashboards", "tags": ["kix"], "asDropdown": true, "icon": "external link" }
+  ],
+  "panels": [
+    {
+      "type": "row", "title": "Cluster Health", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false
+    },
+    {
+      "type": "stat", "title": "Services Up",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "targets": [ { "expr": "count(keinfs_kms_up) + count(keinfs_kas_up) + count(keinfs_kst_up)", "refId": "A", "legendFormat": "up" } ]
+    },
+    {
+      "type": "stat", "title": "Total Errors (all RPCs)",
+      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area" },
+      "targets": [ { "expr": "sum(keinfs_kms_total_errors) + sum(keinfs_kas_total_errors) + sum(keinfs_kst_total_errors)", "refId": "A", "legendFormat": "errors" } ]
+    },
+    {
+      "type": "gauge", "title": "Cluster Capacity Used %",
+      "gridPos": { "h": 4, "w": 5, "x": 9, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 75 }, { "color": "red", "value": 90 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [ { "expr": "max(keinfs_kas_capacity_used_pct)", "refId": "A", "legendFormat": "used %" } ]
+    },
+    {
+      "type": "stat", "title": "Reserve Shard Bypasses (fix health: want 0)",
+      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [ { "expr": "sum(keinfs_kms_reservation_cache_shard_bypasses)", "refId": "A", "legendFormat": "bypasses" } ]
+    },
+    {
+      "type": "stat", "title": "KAS Fence Aborts",
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "color": { "mode": "thresholds" }, "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background" },
+      "targets": [ { "expr": "sum(keinfs_kas_fenced_commit_aborts)", "refId": "A", "legendFormat": "fence aborts" } ]
+    },
+
+    {
+      "type": "row", "title": "Throughput & Op Rate", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }
+    },
+    {
+      "type": "timeseries", "title": "Storage Throughput (bytes/s on the wire, by direction)",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 20, "stacking": { "mode": "normal" } } } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kst_write_payload_bytes[2m]))", "refId": "A", "legendFormat": "write (ingest)" },
+        { "expr": "sum(rate(keinfs_kst_read_payload_bytes[2m]))", "refId": "B", "legendFormat": "read (serve)" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Object Op Rate (KMS, ops/s)",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_initiate_object_write_requests[2m]))", "refId": "A", "legendFormat": "initiate (write)" },
+        { "expr": "sum(rate(keinfs_kms_commit_object_write_requests[2m]))", "refId": "B", "legendFormat": "commit" },
+        { "expr": "sum(rate(keinfs_kms_resolve_object_read_requests[2m]))", "refId": "C", "legendFormat": "resolve (read)" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Life of a WRITE — phase latency (p99, µs)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 }
+    },
+    {
+      "type": "timeseries", "title": "WRITE lifecycle phases (KMS reserve → commit → KST media), p99",
+      "description": "Each line is one stage an object write passes through. The reserve phases (route-resolve, cache-acquire) should be ~1µs after the write-scale fix; the dominant cost should be the KST media/network stage, not the KMS reserve.",
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "custom": { "fillOpacity": 5, "lineWidth": 2 } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "targets": [
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{rpc=\"initiate_object_write\",phase=\"reserve_route_resolve\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "1. KMS reserve: route-resolve" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{rpc=\"initiate_object_write\",phase=\"reservation_cache_acquire\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "2. KMS reserve: pool-acquire" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{rpc=\"initiate_object_write\",phase=\"reserve_stripe_batch_sync\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "2b. KMS reserve: sync KAS (bypass)" },
+        { "expr": "max(keinfs_kst_phase_latency_microseconds{rpc=\"write\",phase=\"execution_queue_wait\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "3. KST: exec queue wait" },
+        { "expr": "max(keinfs_kst_phase_latency_microseconds{rpc=\"write\",phase=\"media_fsync\",quantile=\"0.99\"})", "refId": "E", "legendFormat": "4. KST: media fsync" }
+      ]
+    },
+    {
+      "type": "bargauge", "title": "WRITE phase budget (last p99, µs)",
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs" } },
+      "options": { "displayMode": "gradient", "orientation": "horizontal", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "targets": [
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{rpc=\"initiate_object_write\",phase=\"reserve_route_resolve\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "route-resolve" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{rpc=\"initiate_object_write\",phase=\"reservation_cache_acquire\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "pool-acquire" },
+        { "expr": "max(keinfs_kms_rpc_latency_microseconds{rpc=\"commit_object_write\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "commit (total)" },
+        { "expr": "max(keinfs_kst_phase_latency_microseconds{rpc=\"write\",phase=\"media_fsync\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "media fsync" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Life of a READ — phase latency (p99, µs)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 }
+    },
+    {
+      "type": "timeseries", "title": "READ lifecycle phases (KMS resolve → KST read), p99",
+      "gridPos": { "h": 9, "w": 16, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "custom": { "fillOpacity": 5, "lineWidth": 2 } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] } },
+      "targets": [
+        { "expr": "max(keinfs_kms_rpc_latency_microseconds{rpc=\"resolve_object_read\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "1. KMS resolve (total)" },
+        { "expr": "max(keinfs_kst_phase_latency_microseconds{rpc=\"read\",phase=\"execution_queue_wait\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "2. KST: exec queue wait" },
+        { "expr": "max(keinfs_kst_rpc_latency_microseconds{rpc=\"read\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "3. KST read (total)" }
+      ]
+    },
+    {
+      "type": "stat", "title": "Read fast-path vs degraded (KST read rate)",
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value_and_name" },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kst_rpc_requests_total{rpc=\"read\"}[2m]))", "refId": "A", "legendFormat": "read RPC/s" }
+      ]
+    }
+  ]
+}

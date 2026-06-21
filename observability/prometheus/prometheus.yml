@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Prometheus scrape config for the KeInFS stack (EXAMPLE / TEMPLATE).
+#
+# Each node runs a `keinexport` sidecar on :9909 that converts the per-service
+# runtime stat trees into Prometheus metrics covering the full read/write I/O
+# lifecycle. Point one Prometheus job at every node's exporter; the metrics are
+# self-labeled (service, instance, shard, target_id, rpc, phase) so a single
+# job scrapes the whole stack and Grafana slices by label.
+#
+# Replace the placeholder hostnames below with your own nodes (or, better, use a
+# file_sd_config / your service discovery so no addresses live in this file).
+# Do NOT commit real cluster addresses or node names to source control.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: keinfs
+
+scrape_configs:
+  # Control / metadata plane: KMS + KAS (+ their shards) run on these nodes.
+  - job_name: keinfs-meta
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "meta-node-1.example.internal:9909"
+          - "meta-node-2.example.internal:9909"
+          - "meta-node-3.example.internal:9909"
+        labels:
+          tier: meta
+
+  # Storage plane: each KST host exports all its targets + embedded KIX indexes
+  # (+ KRS if present) from a single exporter.
+  - job_name: keinfs-storage
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "storage-node-1.example.internal:9909"
+        labels:
+          tier: storage
+
+  # The exporter's own self-metrics + Prometheus self-monitoring.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
