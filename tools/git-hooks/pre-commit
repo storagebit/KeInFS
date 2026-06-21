@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andreas Krause / storagebit
+#
+# KeInFS pre-commit guard: refuse to commit operator / infrastructure data.
+#
+# FIRST_PRINCIPLES.md principle 18: the repo ships SOURCE CODE ONLY. No cluster
+# addresses, node names, lab cover-names, access tokens, cloud resource ids, or
+# other operator artifacts. This hook scans the STAGED diff (added lines only)
+# for those patterns and blocks the commit before they can be pushed.
+#
+# Install:  ./tools/git-hooks/install.sh   (sets core.hooksPath)
+# Bypass (discouraged, only for a verified false positive):
+#   git commit --no-verify
+#
+# Tune the allow/deny patterns below as the project evolves.
+
+set -uo pipefail
+
+RED=$'\033[0;31m'; YEL=$'\033[0;33m'; GRN=$'\033[0;32m'; NC=$'\033[0m'
+fail=0
+hits=""
+
+# Only scan added lines (leading '+', not the '+++' file header) in staged text.
+# Binary files are skipped by git diff's text handling. The hook directory itself
+# is excluded: it necessarily contains the deny-pattern literals (mithril,
+# node names, teleport.sh, ...) which are rule definitions, not leaks.
+added="$(git diff --cached --no-color -U0 --diff-filter=ACM \
+  -- . ':(exclude)tools/git-hooks/**' 2>/dev/null \
+  | grep -E '^\+[^+]' || true)"
+
+# Map a staged file list too, so we can name offending files in the report.
+staged_files="$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)"
+
+report() {
+  # $1 = human label, $2 = regex, $3 = optional allow-regex to exclude examples
+  local label="$1" rx="$2" allow="${3:-}"
+  local found
+  if [[ -n "$allow" ]]; then
+    found="$(printf '%s\n' "$added" | grep -nE "$rx" | grep -vE "$allow" || true)"
+  else
+    found="$(printf '%s\n' "$added" | grep -nE "$rx" || true)"
+  fi
+  if [[ -n "$found" ]]; then
+    fail=1
+    hits+=$'\n'"${RED}[${label}]${NC}"$'\n'"$found"$'\n'
+  fi
+}
+
+# --- Deny patterns -----------------------------------------------------------
+
+# Routable / internal cluster IPs. RFC1918 10.x is allowed ONLY as the generic
+# documentation prefixes 10.0.0.x and 10.1.x used throughout the public docs as
+# examples; any OTHER 10.x (real lab subnets like 10.54.x) is denied. Public/
+# other private ranges are denied outright when they look like real endpoints.
+report "internal IPv4 (non-doc 10.x / 172.16-31 / 192.168 real subnets)" \
+  '([^0-9]|^)(10\.(1[0-9]|[2-9][0-9]|[0-9][0-9][0-9])\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+)' \
+  '10\.0\.0\.|10\.1\.[0-9]+\.|example|placeholder|TEST-NET|RFC'
+
+# The lab cover-name (must never appear — see memory: no "keinfs"/cover names in
+# OCI resource names; "mithril" is the agreed cover prefix and is private).
+report "lab cover-name 'mithril'" '\bmithril[-_a-z0-9]*\b'
+
+# Real OCI / Teleport identifiers and the lab's real hostnames.
+report "OCI resource OCID" 'ocid1\.[a-z]+\.oc1\.'
+report "Teleport proxy / cloud tenant" 'teleport\.sh|nv-prd-dgxc'
+report "real lab hostnames" '\b(andreas-bm|nvlustre)[-_a-z0-9]*\b'
+report "lab VM node names" '\b(dropsy|jibby|unblush|cookee|nankin|muffet|goslet|sramana)\b'
+
+# Credentials / secrets.
+report "FoundationDB cluster secret (desc:id@ip)" '[A-Za-z0-9]+:[A-Za-z0-9]+@[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]+'
+report "node-join / bearer-looking token (32+ hex)" '\b[a-f0-9]{32,}\b' 'BuildID|sha1|sha256|[0-9a-f]{40}\.rcgu|git_sha|commit'
+report "private key block" 'BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY'
+report "AWS-style access key" '\bAKIA[0-9A-Z]{16}\b'
+
+# Operator artifact filenames that must never be tracked (principle 18).
+for f in $staged_files; do
+  case "$f" in
+    CLAUDE.md|*/CLAUDE.md|AGENTS.md|*/AGENTS.md|.claude/*|*HANDOVER_*.md|*DESIGN_*.md|.gitignore|*/.gitignore|.dockerignore|*/.dockerignore)
+      fail=1
+      hits+=$'\n'"${RED}[forbidden operator/assistant artifact]${NC} $f"$'\n'
+      ;;
+  esac
+done
+
+# --- Verdict -----------------------------------------------------------------
+
+if [[ "$fail" -ne 0 ]]; then
+  echo "${RED}========================================================================${NC}" >&2
+  echo "${RED} pre-commit BLOCKED: staged changes contain operator / infrastructure data${NC}" >&2
+  echo "${RED} (FIRST_PRINCIPLES.md principle 18 — the repo ships SOURCE CODE ONLY)${NC}" >&2
+  echo "${RED}========================================================================${NC}" >&2
+  echo "$hits" >&2
+  echo "${YEL}Fix: remove the data above (use placeholders like *.example.internal,${NC}" >&2
+  echo "${YEL}     10.0.0.x doc IPs, or a file_sd_config kept out of source control).${NC}" >&2
+  echo "${YEL}If this is a genuine false positive, refine tools/git-hooks/pre-commit,${NC}" >&2
+  echo "${YEL}or bypass once with:  git commit --no-verify${NC}" >&2
+  exit 1
+fi
+
+echo "${GRN}pre-commit: no operator/infra data detected in staged changes.${NC}" >&2
+exit 0
