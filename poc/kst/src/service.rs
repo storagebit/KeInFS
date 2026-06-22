@@ -709,8 +709,8 @@ impl TargetRouter {
                 reservation.lane,
                 chunk_id,
                 generation,
-                // Phase 2a: stamp the object identity carried on the KP2 write entry into
-                // the on-media slot header (object_id/version are 0 until KMS BeginObject).
+                // Stamp the object identity carried on the KP2 write entry into the
+                // on-media slot header.
                 ChunkSelfDescribingIdentity {
                     stripe: entry.identity.stripe,
                     object_id: entry.identity.object_id,

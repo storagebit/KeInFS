@@ -88,10 +88,10 @@ impl LocationKindCode {
     }
 }
 
-/// Self-describing object identity for a fragment write (TLA/SC+ Phase 2). Carried on
-/// the KP2 write request so the storage target stamps it into the on-media slot header.
-/// object_id/object_version are server-minted (KP2M.BeginObject); until that lands they
-/// are 0. stripe/frag are the fragment's position in the object's EC layout.
+/// Self-describing object identity for a fragment write. Carried on the KP2 write
+/// request so the storage target stamps it into the on-media slot header. object_id and
+/// object_version are server-minted (the KMS BeginObject RPC); stripe/frag are the
+/// fragment's position in the object's EC layout.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WriteIdentity {
     pub object_id: u32,

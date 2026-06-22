@@ -42,7 +42,7 @@ pub struct KixClient {
     shard_states: Arc<Vec<Arc<ShardState>>>,
     shard_stats: Arc<Vec<Arc<ShardRuntimeStats>>>,
     drive_arenas: Arc<DriveArenaSet>,
-    // granule->chunk inverse, one map per drive_id (TLA/SC+ Phase 0, Guard D backstop).
+    // granule->chunk inverse, one map per drive_id (the Guard D backstop).
     granule_inverse: Arc<HashMap<u16, DashMap<u64, GranuleOwner>>>,
 }
 

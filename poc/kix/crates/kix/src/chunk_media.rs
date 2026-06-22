@@ -311,10 +311,9 @@ pub struct ChunkMediaRebuildSummary {
     pub layout_mismatches: u64,
 }
 
-/// Self-describing fragment identity recovered from the on-media slot header
-/// (TLA/SC+ Phase 0). Zeros on the live write path until KST threads real values in
-/// Phase 1; surfaced here so media-rebuild and GC can reason about a fragment's
-/// owning object without a central index.
+/// Self-describing fragment identity recovered from the on-media slot header: the
+/// owning object's id/version and the fragment's stripe/frag position. Lets
+/// media-rebuild and GC reason about a fragment's owning object without a central index.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ChunkSelfDescribingIdentity {
     pub stripe: u16,
@@ -359,11 +358,9 @@ struct ChunkMediaSlotHeader {
     drive_id: u16,
     chunk_id: ChunkId,
     record: LocationRecord,
-    // Self-describing fragment identity (TLA/SC+ Phase 0). Carried in the on-media
-    // header so a fragment identifies its owning object for media-rebuild discovery
-    // and GC. Live writes carry zeros until KST threads real values in Phase 1;
-    // surfaced by rebuild_from_chunk_media as ChunkSelfDescribingIdentity. All
-    // within the CRC span [..80].
+    // Self-describing fragment identity carried in the on-media header so a fragment
+    // identifies its owning object for media-rebuild discovery and GC; surfaced by
+    // rebuild_from_chunk_media as ChunkSelfDescribingIdentity. All within the CRC span [..80].
     stripe: u16,
     object_id: u32,
     object_version: u16,
@@ -429,7 +426,7 @@ pub fn fill_chunk_media_slot_bytes(
         drive_id: record.drive_id,
         chunk_id,
         record,
-        // Phase 0: live writes carry zero identity until KST threads real values (Phase 1).
+        // Writers without object context (fill/record helpers) carry no identity.
         stripe: 0,
         object_id: 0,
         object_version: 0,
@@ -775,7 +772,7 @@ pub fn write_chunk_media_record(
         drive_id: record.drive_id,
         chunk_id,
         record,
-        // Phase 0: live writes carry zero identity until KST threads real values (Phase 1).
+        // Writers without object context (fill/record helpers) carry no identity.
         stripe: 0,
         object_id: 0,
         object_version: 0,
@@ -1032,8 +1029,8 @@ fn write_chunk_media_payload_with_file(
         drive_id: record.drive_id,
         chunk_id,
         record,
-        // Phase 2a: carry the object identity supplied by the caller (KST threads it
-        // from the KP2 write request; other writers pass default/zeros).
+        // Carry the object identity supplied by the caller (KST threads it from the
+        // KP2 write request; other writers pass default/zeros).
         stripe: identity.stripe,
         object_id: identity.object_id,
         object_version: identity.object_version,
@@ -1562,8 +1559,8 @@ fn encode_slot_header(buffer: &mut [u8], header: ChunkMediaSlotHeader) -> io::Re
     buffer[60..64].copy_from_slice(&header.record.stored_length.to_le_bytes());
     buffer[64..68].copy_from_slice(&header.record.generation.to_le_bytes());
     buffer[68..72].copy_from_slice(&header.record.checksum.to_le_bytes());
-    // Self-describing fragment identity (Phase 0); fits the reserved regions
-    // [14..16] and [72..80], inside the CRC span below.
+    // Self-describing fragment identity; fits the reserved regions [14..16] and
+    // [72..80], inside the CRC span below.
     buffer[14..16].copy_from_slice(&header.stripe.to_le_bytes());
     buffer[72..76].copy_from_slice(&header.object_id.to_le_bytes());
     buffer[76..78].copy_from_slice(&header.object_version.to_le_bytes());
@@ -2169,7 +2166,7 @@ mod tests {
         let rebuilt = rebuild_from_chunk_media(&config.span).unwrap();
         assert_eq!(rebuilt.entries.get(&chunk_live), Some(&second));
         assert!(!rebuilt.entries.contains_key(&chunk_deleted));
-        // Phase 0: the writer carries zero identity, but rebuild must SURFACE the
+        // The writer carries zero identity here, but rebuild must SURFACE the
         // self-describing identity for live entries and omit tombstoned ones.
         assert_eq!(
             rebuilt.identities.get(&chunk_live),
