@@ -172,6 +172,10 @@ message ObjectHead {
   string object_entry_id = 1;
   string current_version_id = 2;
   uint64 revision = 3;
+  // Monotonic per-object version counter, distinct from `revision` (an internal
+  // sweep timestamp). Bumped on every committed version; the source of truth for
+  // the next version a write should use. Old heads decode it as 0.
+  uint32 version = 4;
 }
 
 message EcProfile {

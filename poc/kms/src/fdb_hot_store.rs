@@ -186,8 +186,8 @@ mod imp {
                             .map(|bytes| decode_object_head(bytes.as_ref()))
                             .transpose()
                             .map_err(status_to_fdb)?
-                            .map(|head| head.revision.saturating_add(1))
-                            .unwrap_or(1) as u32;
+                            .map(|head| head.version.saturating_add(1))
+                            .unwrap_or(1);
                         // Globally-monotonic object_id via read-modify-write; FDB
                         // serializability keeps it monotonic under conflict retry.
                         let next_id = trx
@@ -836,6 +836,7 @@ mod imp {
                             .map(|bytes| decode_object_head(bytes.as_ref()))
                             .transpose()
                             .map_err(status_to_fdb)?;
+                        let prior_version = previous_head.as_ref().map(|h| h.version).unwrap_or(0);
                         if let Some(previous_head) = previous_head {
                             if let Some(previous_manifest_bytes) = load_blob(
                                 &trx,
@@ -860,6 +861,7 @@ mod imp {
                             object_entry_id: manifest.object_entry_id.clone(),
                             current_version_id: manifest.version_id.clone(),
                             revision: finalization_sweep_after_ms,
+                            version: prior_version + 1,
                         };
                         let object_name = manifest
                             .key
