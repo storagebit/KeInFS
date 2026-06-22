@@ -5,7 +5,7 @@
 mod imp {
     use crate::fdb_schema::{
         bucket_context_key, decode_segments, ec_profile_key, namespace_entry_key,
-        namespace_path_key, object_head_key, object_version_chunk_key,
+        namespace_path_key, object_head_key, object_id_counter_key, object_version_chunk_key,
         object_version_chunk_prefix, object_version_key, write_intent_chunk_key,
         write_intent_chunk_prefix, write_intent_key, write_intent_range,
     };
@@ -163,6 +163,52 @@ mod imp {
             self.load_bucket_context(&bucket_id)
                 .await?
                 .ok_or_else(|| Status::not_found(format!("unknown bucket {}", bucket_id)))
+        }
+
+        async fn mint_object_id(
+            &self,
+            bucket_id: &str,
+            key: &str,
+        ) -> Result<(u32, u32), Status> {
+            let normalized_key = normalize_object_key(key)?;
+            let counter_key = object_id_counter_key();
+            let head_key = object_head_key(bucket_id, &normalized_key);
+            self.db
+                .run(move |trx, _| {
+                    let counter_key = counter_key.clone();
+                    let head_key = head_key.clone();
+                    async move {
+                        // version = prior head revision + 1 (1 if the object is new).
+                        let version = trx
+                            .get(&head_key, false)
+                            .await
+                            .map_err(FdbBindingError::from)?
+                            .map(|bytes| decode_object_head(bytes.as_ref()))
+                            .transpose()
+                            .map_err(status_to_fdb)?
+                            .map(|head| head.revision.saturating_add(1))
+                            .unwrap_or(1) as u32;
+                        // Globally-monotonic object_id via read-modify-write; FDB
+                        // serializability keeps it monotonic under conflict retry.
+                        let next_id = trx
+                            .get(&counter_key, false)
+                            .await
+                            .map_err(FdbBindingError::from)?
+                            .map(|bytes| {
+                                let mut raw = [0u8; 4];
+                                let src = bytes.as_ref();
+                                let n = src.len().min(4);
+                                raw[..n].copy_from_slice(&src[..n]);
+                                u32::from_le_bytes(raw)
+                            })
+                            .unwrap_or(0)
+                            .saturating_add(1);
+                        trx.set(&counter_key, &next_id.to_le_bytes());
+                        Ok((next_id, version))
+                    }
+                })
+                .await
+                .map_err(map_fdb_binding_error)
         }
 
         async fn prepare_and_create_write_intent(
@@ -1392,6 +1438,16 @@ mod imp {
             &self,
             _bucket_id: String,
         ) -> Result<BucketWriteContext, Status> {
+            Err(Status::unimplemented(
+                "FoundationDB metadata backend is supported only on Linux",
+            ))
+        }
+
+        async fn mint_object_id(
+            &self,
+            _bucket_id: &str,
+            _key: &str,
+        ) -> Result<(u32, u32), Status> {
             Err(Status::unimplemented(
                 "FoundationDB metadata backend is supported only on Linux",
             ))

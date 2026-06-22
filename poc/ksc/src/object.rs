@@ -8,7 +8,8 @@ use futures_util::StreamExt;
 use kee::{EcProfile as KeeProfile, FailureDomain as KeeFailureDomain, KeeEngine, PreparedEcPlan};
 use keinctl::proto::kms_client::KmsClient;
 use keinctl::proto::{
-    AbortObjectWriteRequest, CommitObjectWriteRequest, CommitObjectWriteWindowRequest,
+    AbortObjectWriteRequest, BeginObjectRequest, CommitObjectWriteRequest,
+    CommitObjectWriteWindowRequest,
     DeleteObjectRequest, DeletedObjectVersion, EcProfile, FailureDomain, FragmentPlan, FragmentRef,
     InitiateObjectWriteRequest, MetadataInvalidationEvent, ObjectVersionManifest,
     RepairObjectWriteRequest, ReserveObjectWriteWindowRequest, ResolveObjectReadRequest,
@@ -301,6 +302,8 @@ struct BatchedTargetWritePlan {
     fragment_index: u32,
     granule_index: u64,
     generation: u32,
+    object_id: u32,
+    version: u32,
     chunk_id: ChunkId,
     payload: Vec<u8>,
 }
@@ -940,6 +943,20 @@ impl ObjectClient {
         .await?
         .into_inner();
         phases.kms_initiate = initiated_started.elapsed();
+        // Mint the object_id + numeric version up front so each fragment write stamps a
+        // self-describing identity into its on-media slot header.
+        let begun = control_rpc(
+            "KMS BeginObject",
+            kms.begin_object(BeginObjectRequest {
+                namespace_id: String::new(),
+                bucket_id: bucket_id.to_string(),
+                key: key.to_string(),
+            }),
+        )
+        .await?
+        .into_inner();
+        let object_id = begun.object_id;
+        let object_version = begun.version;
         let mut intent = initiated.intent.ok_or_else(|| {
             ObjectError::Metadata("KMS InitiateObjectWrite did not return intent".to_string())
         })?;
@@ -1044,6 +1061,8 @@ impl ObjectClient {
                     let write_future = write_prepared_stripe_batch_with_sessions(
                         session_snapshot,
                         &intent_id,
+                        object_id,
+                        object_version,
                         prepared_batch,
                         Arc::clone(&self.write_inflight_limiter),
                     );
@@ -2500,10 +2519,13 @@ where
 async fn write_prepared_stripe_batch_with_sessions(
     target_sessions: Arc<HashMap<String, TargetSession>>,
     intent_id: &str,
+    object_id: u32,
+    object_version: u32,
     prepared_batch: Vec<PreparedStripeWrite>,
     write_inflight_limiter: Arc<AdaptiveWriteLimiter>,
 ) -> Result<PreparedStripeBatchWriteResult, ObjectError> {
-    let endpoint_batches = build_endpoint_write_batches(intent_id, &prepared_batch)?;
+    let endpoint_batches =
+        build_endpoint_write_batches(intent_id, object_id, object_version, &prepared_batch)?;
     let mut writes = JoinSet::new();
     for batch in endpoint_batches {
         let endpoint = batch
@@ -2578,11 +2600,10 @@ async fn write_prepared_stripe_batch_with_sessions(
                             chunk_id: item.chunk_id,
                             slot_index: item.granule_index,
                             generation: item.generation,
-                            // Phase 2a: carry the fragment's object position. object_id/version
-                            // are 0 until KMS BeginObject mints them (Phase 2b).
+                            // Carry the fragment's object identity + EC position into the entry.
                             identity: WriteIdentity {
-                                object_id: 0,
-                                object_version: 0,
+                                object_id: item.object_id,
+                                object_version: item.version as u16,
                                 stripe: item.stripe_index as u16,
                                 frag: item.fragment_index as u16,
                             },
@@ -2803,6 +2824,8 @@ struct BatchedTargetReadResult {
 
 fn build_endpoint_write_batches(
     intent_id: &str,
+    object_id: u32,
+    object_version: u32,
     prepared_batch: &[PreparedStripeWrite],
 ) -> Result<Vec<Vec<BatchedTargetWritePlan>>, ObjectError> {
     let mut by_endpoint = HashMap::<String, Vec<BatchedTargetWritePlan>>::new();
@@ -2829,6 +2852,8 @@ fn build_endpoint_write_batches(
                     fragment_index: plan.fragment_index,
                     granule_index: plan.granule_index,
                     generation: plan.generation,
+                    object_id,
+                    version: object_version,
                     chunk_id,
                     payload,
                 });
@@ -3978,7 +4003,7 @@ mod tests {
             fragments: (0..17).map(|_| vec![7_u8; 1024 * 1024]).collect(),
         }];
 
-        let batches = build_endpoint_write_batches("intent-1", &prepared_batch).unwrap();
+        let batches = build_endpoint_write_batches("intent-1", 0, 0, &prepared_batch).unwrap();
 
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), 16);
@@ -3999,7 +4024,7 @@ mod tests {
             fragments: vec![vec![1_u8; 1024], vec![2_u8; 1024]],
         }];
 
-        let mut batches = build_endpoint_write_batches("intent-2", &prepared_batch).unwrap();
+        let mut batches = build_endpoint_write_batches("intent-2", 0, 0, &prepared_batch).unwrap();
         batches.sort_by(|left, right| left[0].endpoint.cmp(&right[0].endpoint));
 
         assert_eq!(batches.len(), 2);
@@ -4162,7 +4187,7 @@ mod tests {
             .flat_map(|stripe| stripe.fragments.iter().map(|fragment| fragment.len()))
             .collect();
 
-        let batches = build_endpoint_write_batches("intent-x", &prepared_batch).unwrap();
+        let batches = build_endpoint_write_batches("intent-x", 0, 0, &prepared_batch).unwrap();
 
         let after: Vec<usize> = prepared_batch
             .iter()

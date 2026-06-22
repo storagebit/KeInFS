@@ -966,19 +966,34 @@ impl Kms for KmsService {
 
     async fn begin_object(
         &self,
-        _request: Request<BeginObjectRequest>,
+        request: Request<BeginObjectRequest>,
     ) -> Result<Response<BeginObjectReply>, Status> {
-        // TLA/SC+ Phase 2b: mint a monotonic object_id + numeric version (FDB atomic-add).
-        // Not yet implemented; Phase 2a wire/media plumbing carries identity with object_id=0.
-        Err(Status::unimplemented("KMS BeginObject lands in Phase 2b"))
+        let request = request.into_inner();
+        // Mint the monotonic object_id + numeric version up front.
+        let (object_id, version) = self
+            .hot_store
+            .mint_object_id(&request.bucket_id, &request.key)
+            .await?;
+        // EC profile is the bucket's immutable binding.
+        let ec_profile = self
+            .hot_store
+            .get_bucket_write_context(request.bucket_id.clone())
+            .await?
+            .ec_profile;
+        Ok(Response::new(BeginObjectReply {
+            object_id,
+            version,
+            ec_profile: Some(ec_profile),
+            topology_epoch: 0,
+        }))
     }
 
     async fn commit_object(
         &self,
         _request: Request<CommitObjectRequest>,
     ) -> Result<Response<CommitObjectReply>, Status> {
-        // TLA/SC+ Phase 2b: single-shot commit (manifest + per-target reverse log + CAS head flip).
-        Err(Status::unimplemented("KMS CommitObject lands in Phase 2b"))
+        // Single-shot commit (manifest + per-target reverse log + CAS head flip) — not yet implemented.
+        Err(Status::unimplemented("KMS CommitObject is not yet implemented"))
     }
 
     async fn commit_object_write(

@@ -18,6 +18,10 @@ pub(crate) trait HotMetadataStore: Send + Sync {
         bucket_id: String,
     ) -> Result<BucketWriteContext, Status>;
 
+    /// Mints a globally-monotonic object_id and the numeric version for a write (the
+    /// BeginObject RPC). version = prior head revision + 1 (1 if new).
+    async fn mint_object_id(&self, bucket_id: &str, key: &str) -> Result<(u32, u32), Status>;
+
     async fn prepare_and_create_write_intent(
         &self,
         intent: WriteIntent,

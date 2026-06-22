@@ -20,9 +20,15 @@ const PREFIX_PLACEMENT_TASK: u8 = 11;
 const PREFIX_TARGET_CURRENT_FRAGMENT: u8 = 12;
 const PREFIX_MAINTENANCE_MARKER: u8 = 13;
 const PREFIX_NAMESPACE_PATH: u8 = 14;
+const PREFIX_OBJECT_ID_COUNTER: u8 = 15;
 
 pub(crate) fn bucket_context_key(bucket_id: &str) -> Vec<u8> {
     encode_key(PREFIX_BUCKET_CONTEXT, &[bucket_id])
+}
+
+/// Singleton key for the globally-monotonic object_id counter.
+pub(crate) fn object_id_counter_key() -> Vec<u8> {
+    encode_key(PREFIX_OBJECT_ID_COUNTER, &["object-id"])
 }
 
 pub(crate) fn write_intent_key(intent_id: &str) -> Vec<u8> {
