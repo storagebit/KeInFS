@@ -59,7 +59,7 @@ impl Inode {
 /// Per-open-handle staged contents, backed by a TEMPORARY FILE rather than an
 /// in-RAM `Vec<u8>` (streaming-writeback v1).
 ///
-/// The original Phase-1 design held the whole object in a `Vec<u8>` behind the
+/// The original design held the whole object in a `Vec<u8>` behind the
 /// per-handle lock and committed it whole — a multi-GB write therefore needed
 /// multi-GB of client RAM. This backs the writable handle with an
 /// `O_CREAT|O_EXCL` temp file in the OS temp dir instead, so client RAM is
@@ -266,7 +266,7 @@ impl Drop for HandleBuffer {
 /// The backing model of an open handle.
 pub(crate) enum HandleData {
     /// Read-only handle: reads are served by stripe-granular ranged backend
-    /// reads (Phase 2) — no whole-object load at open, no local staging.
+    /// reads — no whole-object load at open, no local staging.
     Ranged,
     /// Writable / truncate handle: contents staged in a temp file (RAM-bounded)
     /// and streamed to the object store in stripe-sized chunks on flush

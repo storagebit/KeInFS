@@ -40,10 +40,10 @@ mod imp {
         mutation_guards: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
         owner_id: Arc<String>,
         allocation_shard_id: Arc<Option<String>>,
-        // Phase-2 (DESIGN_KAS_WRITE_SCALE.md §3 change #2/#4). When set, this
-        // instance holds the per-shard mutation lease for the whole leadership
+        // Leader-resident-lease mode (see DESIGN_KAS_WRITE_SCALE.md). When set,
+        // this instance holds the per-shard mutation lease for the whole leadership
         // term instead of acquiring/releasing it per op, drops the per-op stamp
-        // read, and relies on the epoch fence (#3) for split-brain safety. The
+        // read, and relies on the epoch fence for split-brain safety. The
         // flag gates ONLY that behavior change; the epoch fence write/assert is
         // always on (it is strictly stronger than the per-op stamp reload).
         leader_resident_lease: bool,
@@ -55,7 +55,7 @@ mod imp {
         // lost renewal / observed epoch bump, which makes the instance stop
         // serving mutations until it re-acquires.
         leadership: Arc<tokio::sync::Mutex<Option<LeadershipTerm>>>,
-        // Phase-3 (change #7) deferred durable bin-member deletes. The lock-light
+        // Deferred durable bin-member deletes. The lock-light
         // claim pops the in-memory bin (authoritative) and defers the durable
         // `reservation_bin_member_key` cleanup here instead of committing it per
         // claim. These entries are write-only acceleration never read back into
@@ -111,8 +111,8 @@ mod imp {
     struct CoordinationLeaseRecord {
         owner_id: String,
         expires_at_unix_ms: u64,
-        /// Monotonic per-lease fencing token (DESIGN_KAS_WRITE_SCALE.md §3/§4
-        /// change #3, the epoch fence). Bumped ONLY on a *new* grant (an
+        /// Monotonic per-lease fencing token (the epoch fence; see
+        /// DESIGN_KAS_WRITE_SCALE.md). Bumped ONLY on a *new* grant (an
         /// absent/expired lease, or one taken from another owner) — never on a
         /// self-renewal. A new leader that wins a stale lease increments it, so a
         /// superseded old leader still carries the prior (now lower) epoch.
@@ -260,7 +260,7 @@ mod imp {
     }
 
     /// Whether a `persist_state` commit is fenced by the per-shard allocator
-    /// mutation epoch (DESIGN_KAS_WRITE_SCALE.md §3/§4 change #3).
+    /// mutation epoch (see DESIGN_KAS_WRITE_SCALE.md).
     ///
     /// `Leased` is used by every split-brain-sensitive allocator-state mutation
     /// (reserve / claim / finalize / release / expire / refill) — those run under
@@ -933,7 +933,7 @@ mod imp {
                 })
         }
 
-        /// Phase-3 lock-light claim persist (change #7): write ONLY the claimed
+        /// Lock-light claim persist: write ONLY the claimed
         /// reservations' (TTL-bumped) records, fenced by the held epoch, WITHOUT
         /// bumping the allocator-state stamp. Reaping correctness needs the TTL
         /// bump durable; the stamp is intentionally not touched (the sole fenced
@@ -973,7 +973,7 @@ mod imp {
         }
 
         /// Flush deferred durable bin-member deletes accumulated by lock-light
-        /// claims (change #7). Best-effort: these entries are write-only and never
+        /// claims. Best-effort: these entries are write-only and never
         /// read back, so on failure they are simply left for a later flush / a
         /// `reset`'s prefix clear. Fenced like any other leased write.
         async fn flush_deferred_bin_member_deletes(&self) -> Result<(), Status> {
@@ -1053,9 +1053,9 @@ mod imp {
             self.ensure_target_state_current_inner(false).await
         }
 
-        /// `skip_stamp_read` implements change #4: while the leader holds the
+        /// `skip_stamp_read`: while the leader holds the
         /// per-shard lease, the per-op `load_allocator_state_stamp` GET is
-        /// dropped. It is safe ONLY because the epoch fence (#3) now detects an
+        /// dropped. It is safe ONLY because the epoch fence now detects an
         /// out-of-band writer at commit time instead. A reload is still forced on
         /// (re)acquisition / epoch change, which `acquire_leader_resident_lease`
         /// signals by clearing `target_state_loaded`, so the `needs_refresh`
@@ -1090,7 +1090,7 @@ mod imp {
         }
 
         /// See `ensure_target_state_current_inner`: `skip_stamp_read` drops the
-        /// per-op stamp GET under a held leader-resident lease (change #4).
+        /// per-op stamp GET under a held leader-resident lease.
         async fn ensure_full_state_current_inner(
             &self,
             skip_stamp_read: bool,
@@ -1198,7 +1198,7 @@ mod imp {
         /// Acquire (or self-renew) a coordination lease and return the epoch the
         /// caller now holds, or `None` if the lease is held by a live other owner.
         ///
-        /// The epoch is the fencing token for change #3. In one serializable FDB
+        /// The epoch is the fencing token. In one serializable FDB
         /// transaction we read the current record and decide availability exactly
         /// as before (`owner_id == us || expired`). The epoch is then:
         ///   * carried unchanged on a **self-renew** (same owner, still live) — a
@@ -2279,7 +2279,7 @@ mod imp {
                     )
                 };
                 if self.leader_resident_lease {
-                    // Phase 3 / change #7 — lock-light claim. The in-memory pop
+                    // Lock-light claim. The in-memory pop
                     // (under `state.lock()` + the in-process mutation guard) is the
                     // authoritative hand-out: a popped reservation_id is gone from
                     // the in-memory queue so it cannot be re-claimed in-process, and
@@ -2344,7 +2344,7 @@ mod imp {
                 });
             }
             // Opportunistically drain the lock-light claim's deferred durable
-            // bin-member deletes (change #7) off the refill cadence — never on the
+            // bin-member deletes off the refill cadence — never on the
             // foreground claim path. Best-effort; failures are swallowed (these
             // entries are write-only and discarded on any refresh).
             if self.leader_resident_lease {
@@ -3109,7 +3109,7 @@ mod imp {
             .as_millis() as u64
     }
 
-    /// Pure epoch-fence grant decision (DESIGN_KAS_WRITE_SCALE.md §3/§4 change #3),
+    /// Pure epoch-fence grant decision (see DESIGN_KAS_WRITE_SCALE.md),
     /// factored out of the FDB transaction so the bump rule is unit-testable.
     ///
     /// `existing` is `(owner_id, expires_at_unix_ms, epoch)` of the current lease

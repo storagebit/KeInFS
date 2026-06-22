@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Copyright (C) 2026 Andreas Krause / storagebit
 
-//! FUSE-over-io_uring backend (Phase 5) — Linux, kernel >= 6.14.
+//! FUSE-over-io_uring backend — Linux, kernel >= 6.14.
 //!
 //! This is the Tier-1 max-throughput transport: kernel-managed io_uring command
 //! rings (`FUSE_IO_URING_CMD_REGISTER` + `COMMIT_AND_FETCH`) with zero-copy and
@@ -50,7 +50,7 @@ const FOPEN_KEEP_CACHE: u32 = 1 << 1;
 
 /// Whether to use the FUSE-over-io_uring backend on this host.
 ///
-/// This is the **opt-in gate for the Phase-5 benchmark**: it returns `true` only
+/// This is the **opt-in gate for the io_uring backend**: it returns `true` only
 /// when `KFC_IO_URING` is set to `1`/`true` AND the running kernel looks
 /// >= 6.14 (the first release with `FUSE_OVER_IO_URING`). Otherwise it returns
 /// `false` so [`crate::select_backend`] keeps the always-correct fuser backend
@@ -343,7 +343,7 @@ impl Filesystem for UringAdapter {
         // granted_max_write/readahead are reported as what we asked for; the
         // session caps max_write at its own ceiling (16 MiB) and the kernel may
         // lower readahead, but neither value is returned to us to read back.
-        // TODO(phase5-lab): if fractal-fuse later surfaces the negotiated
+        // TODO: if fractal-fuse later surfaces the negotiated
         // fuse_init_out, replace these desired-config values with the granted
         // truth (as the fuser backend does).
         self.core.set_capabilities(Capabilities {
@@ -634,7 +634,7 @@ impl Filesystem for UringAdapter {
     ) -> FsResult<usize> {
         let core = Arc::clone(&self.core);
         // Cap the request at the caller's buffer length; the core returns a
-        // freshly-allocated Vec we then copy into `buf` (Phase 3 zero-copies it).
+        // freshly-allocated Vec we then copy into `buf` (this can be zero-copied later).
         let size = buf.len() as u32;
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tokio.spawn(async move {
@@ -676,7 +676,7 @@ impl Filesystem for UringAdapter {
     ) -> FsResult<usize> {
         let core = Arc::clone(&self.core);
         // Copy the borrowed kernel buffer before moving into the task. With a
-        // 1 MiB max_write this is one copy per MiB; Phase 3 zero-copies it.
+        // 1 MiB max_write this is one copy per MiB; this can be zero-copied later.
         let data = data.to_vec();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tokio.spawn(async move {

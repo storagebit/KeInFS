@@ -55,7 +55,7 @@ pub struct DirEntry {
 /// The outcome of an `open`/`create`: a handle id plus per-open kernel cache
 /// hints. `keep_cache` asks the kernel to retain the page cache across opens
 /// (cheap re-reads); `direct_io` bypasses it (used only when an opt-out is
-/// required). Phase 1 wires these; Phase 2 makes `keep_cache` the default.
+/// required). `keep_cache` is the default once NATS coherence is active.
 #[derive(Clone, Copy, Debug)]
 pub struct OpenedFile {
     pub fh: u64,

@@ -221,7 +221,7 @@ enum PackEntryStage<'a> {
 }
 
 /// Rolls back every still-reserved staged write (used when a whole-request
-/// error aborts phase A before the shared barrier).
+/// error aborts staging before the shared barrier).
 fn rollback_staged(staged: &[PackEntryStage<'_>]) {
     for stage in staged {
         if let PackEntryStage::Written {
@@ -641,7 +641,7 @@ impl TargetRouter {
         Ok(record)
     }
 
-    /// Phase A of a packed write: reserve a lane and write each entry's payload
+    /// Staging step of a packed write: reserve a lane and write each entry's payload
     /// without a per-entry barrier. On a whole-request error (poisoned slot,
     /// KIX lookup failure, layout error) every reservation already taken is
     /// rolled back so no slot is left marked busy.
@@ -771,7 +771,7 @@ impl TargetRouter {
             decode_started.elapsed(),
         );
 
-        // Phase A: reserve a lane and write every entry's payload WITHOUT a
+        // Stage every entry: reserve a lane and write each payload WITHOUT a
         // per-entry durability barrier. Nothing is published into KIX yet, so a
         // crash here leaves no readable record for any written entry. A
         // whole-request error rolls back every reservation already taken so no
@@ -786,8 +786,8 @@ impl TargetRouter {
             &mut write_lookup,
         )?;
 
-        // Phase B: a SINGLE durability barrier covers every staged write in the
-        // pack instead of one fdatasync per entry.
+        // Durability barrier: a SINGLE fdatasync covers every staged write in the
+        // pack instead of one barrier per entry.
         let any_written = staged
             .iter()
             .any(|stage| matches!(stage, PackEntryStage::Written { .. }));
@@ -800,7 +800,7 @@ impl TargetRouter {
         let media_fsync = fsync_started.elapsed();
         let barrier_error = barrier.err();
 
-        // Phase C: only now publish each durable entry into KIX. If the shared
+        // Publish: only now publish each durable entry into KIX. If the shared
         // barrier failed, no entry is published (publish-before-sync is never
         // allowed); every staged write is rolled back and reported as 500.
         let mut entries = Vec::with_capacity(staged.len());

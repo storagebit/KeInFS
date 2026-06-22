@@ -3798,7 +3798,7 @@ fn accumulate_target_request_phases(into: &mut ObjectPhaseTimes, request: &Reque
 mod tests {
     use super::*;
 
-    // ---- ranged-read stripe arithmetic (Phase 2 / get_object_range) ----
+    // ---- ranged-read stripe arithmetic (get_object_range) ----
 
     #[test]
     fn range_to_stripe_indices_spans_boundaries() {
@@ -4348,7 +4348,7 @@ mod tests {
         assert_eq!(encoded.prepared_batch[0].fragments, expected);
     }
 
-    // ---- KP2 429 backpressure: backoff + adaptive-limit math (Phase 3) ----
+    // ---- KP2 429 backpressure: backoff + adaptive-limit math ----
 
     fn rate_limited_failure(retry_after_ms: Option<u64>) -> FragmentWriteFailure {
         FragmentWriteFailure::new(

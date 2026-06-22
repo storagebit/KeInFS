@@ -102,7 +102,7 @@ fn build_config(opts: &MountOpts) -> Config {
 
 /// CoherenceSink over a fuser [`Notifier`]: pushes invalidations into the kernel
 /// page cache / dentry cache so `FOPEN_KEEP_CACHE` data is dropped on
-/// out-of-band mutation (Phase 2 flips opens to KEEP_CACHE to use this).
+/// out-of-band mutation (opens use KEEP_CACHE to take advantage of this).
 struct FuserSink {
     notifier: Notifier,
 }
@@ -230,7 +230,7 @@ impl Filesystem for FuserAdapter {
         let _ = config.set_congestion_threshold(want.congestion_threshold);
 
         // Only request capabilities we both want AND the kernel supports.
-        // readdirplus + splice are deferred (no trait impl yet) to Phase 2/5.
+        // readdirplus + splice are not yet wired (no trait impl yet).
         let avail = config.capabilities();
         let mut flags = InitFlags::FUSE_BIG_WRITES & avail;
         if want.want_async_read {
@@ -503,7 +503,7 @@ impl Filesystem for FuserAdapter {
     ) {
         let core = Arc::clone(&self.core);
         // Copy the borrowed kernel buffer before moving into the task. With
-        // 1 MiB max_write this is one copy per MiB; Phase 3 zero-copies it.
+        // 1 MiB max_write this is one copy per MiB; this can be zero-copied later.
         let data = data.to_vec();
         self.rt.spawn(async move {
             match core.write(ino.0, fh.0, offset, &data).await {

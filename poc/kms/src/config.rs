@@ -36,7 +36,7 @@ pub(crate) struct Config {
     pub(crate) reservation_cache_stale_refill: Duration,
     pub(crate) reservation_cache_small_object_max_stripes: usize,
     pub(crate) reservation_cache_single_window_seed_batch: usize,
-    // Phase 1 #5: TTL for the allocation-shard route cache. While fresh,
+    // TTL for the allocation-shard route cache. While fresh,
     // foreground reserves resolve shard count from RAM instead of issuing ~6
     // `list_service_instances` RPCs to KAS per reserve.
     pub(crate) allocation_route_cache_ttl: Duration,

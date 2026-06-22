@@ -4,11 +4,11 @@
 //! KSC object engine — the native KP2 data path.
 //!
 //! All object bytes travel KSC<->KST over KP2 on raw HTTP/2 (FIRST_PRINCIPLES
-//! §2/§5); this engine never relays through a coordinator. Phase 1 keeps the
+//! §2/§5); this engine never relays through a coordinator. Today it keeps the
 //! original round-robin pool of `Arc<tokio::Mutex<ObjectClient>>` and the
 //! whole-object `get`/`put` semantics. Making a single `ObjectClient` shareable
-//! on the hot path (so per-call locking disappears) is task #7 / prereq P1;
-//! stripe-granular `get_object_range` is task #8 / prereq P0.
+//! on the hot path (so per-call locking disappears) and stripe-granular
+//! `get_object_range` are still to come.
 
 use crate::error::{classify, FsErrno};
 use crate::metadata::DynError;
@@ -107,7 +107,7 @@ impl ObjectEngine {
 
     /// Stripe-granular ranged read — fetches only the stripes the byte range
     /// `[offset, offset+len)` touches (KSC `get_object_range`), instead of the
-    /// whole object. This is the Phase 2 read path.
+    /// whole object.
     ///
     /// Returns `(payload, stripe_width)`; the caller's stripe cache aligns and
     /// keys on `stripe_width = data_fragments * fragment_bytes`.

@@ -28,7 +28,7 @@ pub(crate) struct Config {
     pub(crate) reservation_bin_top_up_chunk: usize,
     pub(crate) reservation_bin_bypass_batch_size: usize,
     pub(crate) reset_allocator_state_and_exit: bool,
-    /// Phase-2 write-scale opt-in (DESIGN_KAS_WRITE_SCALE.md §3 change #2/#4).
+    /// Leader-resident-lease write-scale opt-in (see DESIGN_KAS_WRITE_SCALE.md).
     ///
     /// When `false` (the default) the allocator keeps the historical
     /// acquire-lease / refresh / mutate / release-lease dance on every mutating
@@ -94,7 +94,7 @@ impl Config {
             reset_allocator_state_and_exit: false,
             // Default FALSE: keep the current per-op acquire/release lease path.
             // The leader-resident lease + dropped per-op stamp read is opt-in
-            // (DESIGN_KAS_WRITE_SCALE.md §3 change #2/#4, §5 Phase 2).
+            // (see DESIGN_KAS_WRITE_SCALE.md).
             allocator_leader_resident_lease: false,
         })
     }
@@ -444,7 +444,7 @@ mod tests {
             "/etc/foundationdb/fdb.cluster"
         );
         assert_eq!(defaults.listen_addr.to_string(), "127.0.0.1:50061");
-        // The leader-resident lease (Phase-2 write-scale opt-in) is OFF by
+        // The leader-resident lease (write-scale opt-in) is OFF by
         // default so the default build keeps the proven per-op lease path.
         assert!(!defaults.allocator_leader_resident_lease);
     }

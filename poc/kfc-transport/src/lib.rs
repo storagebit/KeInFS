@@ -8,10 +8,10 @@
 //! [`FuseBackend`] trait. The portable [`kfc_core::FsCore`] is unaware of which
 //! backend is live.
 //!
-//! Phase 1 ships the always-correct `fuser` backend (pure-Rust `/dev/fuse` on
-//! Linux; FUSE-T/macFUSE via `macos-no-mount` on macOS). Phase 5 adds a
-//! FUSE-over-io_uring backend behind the `io-uring` feature, chosen only when
-//! the kernel advertises `FUSE_OVER_IO_URING`.
+//! The always-correct `fuser` backend (pure-Rust `/dev/fuse` on
+//! Linux; FUSE-T/macFUSE via `macos-no-mount` on macOS) is the default. A
+//! FUSE-over-io_uring backend lives behind the `io-uring` feature, chosen only
+//! when the kernel advertises `FUSE_OVER_IO_URING`.
 
 use kfc_core::{FsConfig, FsCore};
 use std::io;
@@ -113,8 +113,8 @@ fn build_runtime() -> io::Result<tokio::runtime::Runtime> {
 
 /// Select the fastest viable backend for this host at runtime.
 ///
-/// Phase 1: always the `fuser` backend. On Linux that is `/dev/fuse`; the
-/// io_uring backend (Phase 5) is chosen only when compiled in AND the kernel
+/// Defaults to the `fuser` backend. On Linux that is `/dev/fuse`; the
+/// io_uring backend is chosen only when compiled in AND the kernel
 /// advertises the capability. On macOS we probe for FUSE-T and fall back to
 /// macFUSE — both drive the same fuser `macos-no-mount` path, so the choice is
 /// currently informational (the divergence is the external mounter).

@@ -1161,7 +1161,7 @@ mod tests {
 
     #[test]
     fn header_plus_payload_segments_match_whole_pack_encoding() {
-        // Fix #7(b): clients stream the header/descriptor prefix followed by each
+        // Clients stream the header/descriptor prefix followed by each
         // payload as separate frames instead of concatenating the whole pack. The
         // reassembled wire bytes must be byte-identical to encode_write_request, and
         // still decode back to the original pack.

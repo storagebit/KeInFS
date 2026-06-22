@@ -243,8 +243,8 @@ pub(crate) struct KmsStats {
     reservation_cache_misses: AtomicU64,
     reservation_cache_refills: AtomicU64,
     reservation_cache_depth: AtomicU64,
-    // Phase 0 write-scale instrumentation. These surface the reserve-path
-    // decomposition the lab needs to measure each later phase (route-discovery
+    // Write-scale instrumentation. These surface the reserve-path
+    // decomposition the lab needs to measure (route-discovery
     // amplification, cache effectiveness, synchronous KAS bypasses).
     route_discovery_lookups: AtomicU64,
     route_discovery_rpcs: AtomicU64,
@@ -415,36 +415,36 @@ impl KmsStats {
             .store(depth as u64, Ordering::Relaxed);
     }
 
-    /// Phase 0: record one allocation-shard route resolution and the number of
+    /// Record one allocation-shard route resolution and the number of
     /// `list_service_instances` RPCs it actually issued to KAS. With the
     /// uncached resolver this is ~6 RPCs/reserve; with the TTL route cache
-    /// (Phase 1 #5) it should fall toward ~0 RPCs per lookup.
+    /// it should fall toward ~0 RPCs per lookup.
     pub(crate) fn record_route_discovery(&self, rpc_count: usize) {
         self.route_discovery_lookups.fetch_add(1, Ordering::Relaxed);
         self.route_discovery_rpcs
             .fetch_add(rpc_count as u64, Ordering::Relaxed);
     }
 
-    /// Phase 0/1 #5: route TTL-cache hit (served from RAM, no KAS RPC).
+    /// Route TTL-cache hit (served from RAM, no KAS RPC).
     pub(crate) fn record_route_cache_hit(&self) {
         self.route_cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Phase 0/1 #5: route TTL-cache miss (forced a fresh discovery).
+    /// Route TTL-cache miss (forced a fresh discovery).
     pub(crate) fn record_route_cache_miss(&self) {
         self.route_cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Phase 0: a foreground reserve that fell through to a synchronous KAS
+    /// A foreground reserve that fell through to a synchronous KAS
     /// `reserve_stripe_batch` instead of draining the pool. On a multi-shard
-    /// cluster this is the dominant write-scale bottleneck; Phase 1 #1 should
-    /// drive it toward zero.
+    /// cluster this is the dominant write-scale bottleneck; the pre-staged
+    /// RAM pool should drive it toward zero.
     pub(crate) fn record_reservation_cache_shard_bypass(&self) {
         self.reservation_cache_shard_bypasses
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Phase 0: a foreground reserve served from the pool branch (cache path),
+    /// A foreground reserve served from the pool branch (cache path),
     /// regardless of whether each stripe hit or had to refill on demand.
     pub(crate) fn record_reservation_cache_serve(&self) {
         self.reservation_cache_serves

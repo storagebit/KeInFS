@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.allocator_leader_resident_lease,
         Some(stats.clone()),
     )?;
-    // Phase-2 opt-in: start the leader-resident lease renewer (no-op unless the
+    // Start the leader-resident lease renewer (no-op unless the
     // flag is set). Must run inside the tokio runtime, which `#[tokio::main]`
     // provides here. The reset-and-exit path below uses the default config, so
     // the flag is off there and nothing spawns.

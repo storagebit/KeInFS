@@ -7,8 +7,8 @@
 //! portable core, but pushing an invalidation *into the kernel page cache* is a
 //! transport capability. The transport implements [`CoherenceSink`] over its
 //! backend's notifier (e.g. fuser's `Notifier::inval_inode`/`inval_entry`) and
-//! hands it to the core. Phase 1 ships the in-process side and a no-op sink;
-//! Phase 2 (task #9) wires the real kernel notifier so `FOPEN_KEEP_CACHE` data
+//! hands it to the core. Today the in-process side and a no-op sink ship; once
+//! the real kernel notifier is wired, `FOPEN_KEEP_CACHE` data
 //! is invalidated on out-of-band mutation instead of forcing `DIRECT_IO`.
 
 use keinctl::proto::MetadataInvalidationEvent;

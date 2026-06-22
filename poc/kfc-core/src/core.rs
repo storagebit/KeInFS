@@ -28,8 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-/// Attribute/entry TTL handed to the kernel. Kept at 1s for Phase-1 parity with
-/// the original client; Phase 2 (task #9) raises this to ~30s when NATS
+/// Attribute/entry TTL handed to the kernel. Kept at 1s for parity with
+/// the original client; this rises to ~30s once NATS
 /// coherence is active and the kernel notifier is wired.
 const ATTR_TTL: Duration = Duration::from_secs(1);
 /// In-process metadata freshness window (size + child-list).
@@ -583,9 +583,8 @@ impl FsCore {
         Ok(self.node_attr(&node))
     }
 
-    /// setattr. Phase 1 keeps the original posture: chmod/chown is rejected
+    /// setattr keeps the original posture: chmod/chown is rejected
     /// (EPERM) under DefaultPermissions; only truncate (size) is honored.
-    /// Re-examined in task #15 (POSIX gaps).
     pub async fn setattr(
         &self,
         ino: u64,
@@ -782,7 +781,7 @@ impl FsCore {
                 .read_range(offset as usize, size as usize)
                 .map_err(|_| FsErrno::Io),
             // Read-only handle: stripe-granular ranged read — no whole-object
-            // fetch. The Phase 2 win: a 4 KiB pread of a 10 GiB object reads
+            // fetch. A 4 KiB pread of a 10 GiB object reads
             // only the touched stripe(s).
             None => self.read_ranged_cached(&handle.key, offset, size).await,
         }
@@ -1261,7 +1260,7 @@ impl FsCore {
         }
     }
 
-    /// Per-open kernel cache hints. Phase 2: keep the kernel page cache as the
+    /// Per-open kernel cache hints: keep the kernel page cache as the
     /// primary read cache (`FOPEN_KEEP_CACHE`) and rely on the NATS-driven
     /// `notify_inval_inode` sink for coherence — no more forced `DIRECT_IO`,
     /// which previously bypassed the page cache whenever NATS was enabled.

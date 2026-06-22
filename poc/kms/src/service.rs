@@ -2636,9 +2636,9 @@ impl KmsService {
         }
         let remaining_after_window = total_stripes.saturating_sub(window_end);
         let configured_kas_endpoint_count = self.kas_channels.endpoint_count().max(1);
-        // Phase 1 #5: shard-count comes from the TTL route cache, not a fresh
-        // per-reserve discovery. The cache records its own hit/miss + RPC count
-        // (Phase 0). We still record the wall-time spent here so the lab can see
+        // Shard-count comes from the TTL route cache, not a fresh
+        // per-reserve discovery. The cache records its own hit/miss + RPC count.
+        // We still record the wall-time spent here so the lab can see
         // route resolution drop toward ~0 once the cache warms.
         let route_phase_started = Instant::now();
         let discovered_allocation_shard_count = self
@@ -2662,9 +2662,9 @@ impl KmsService {
             self.reservation_cache.small_object_max_stripes(),
             allocation_shard_count,
         );
-        // Phase 0: distinguish the pool (cache) branch from the synchronous KAS
-        // bypass. On multi-shard with Phase 1 #1 the bypass counter should fall
-        // toward zero; previously it was hit on every multi-shard reserve.
+        // Distinguish the pool (cache) branch from the synchronous KAS
+        // bypass. On multi-shard with the pre-staged RAM pool the bypass counter
+        // should fall toward zero; previously it was hit on every multi-shard reserve.
         if use_shared_reservation_cache {
             self.stats.record_reservation_cache_serve();
         } else if allocation_shard_count > 1 {
@@ -2695,7 +2695,7 @@ impl KmsService {
                 self.reservation_mutation_batch_size,
             )
             .await?;
-            // Phase 0: latency of the synchronous foreground KAS reserve, so the
+            // Latency of the synchronous foreground KAS reserve, so the
             // lab can attribute the bypass cost separately from the pool path.
             self.stats.record_phase(
                 kind,
@@ -2939,7 +2939,7 @@ impl KmsService {
         let kas_rpc_timeout = self.kas_rpc_timeout;
         let reservation_mutation_batch_size = self.reservation_mutation_batch_size;
         tokio::spawn(async move {
-            // Phase 1 #1/#6: the BACKGROUND refill assembles full stripes via
+            // The BACKGROUND refill assembles full stripes via
             // the sharded reserve path (and so benefits from the concurrent
             // per-shard fan-out). This is what keeps the foreground reserve off
             // a synchronous KAS call on multi-shard.
@@ -3464,7 +3464,7 @@ struct AllocationShardRoute {
     channel: Channel,
 }
 
-/// Phase 1 #5 — TTL cache for allocation-shard route discovery.
+/// TTL cache for allocation-shard route discovery.
 ///
 /// Before this, `discover_allocation_shard_routes` ran *uncached* on every
 /// reserve (`reserve_object_write_window` at ~2605) and *again* inside
@@ -3587,7 +3587,7 @@ async fn reserve_stripe_batch(
         return Ok(Vec::new());
     }
 
-    // Phase 1 #5: route discovery is served from the TTL cache. This is the
+    // Route discovery is served from the TTL cache. This is the
     // background-refill / single-shard-fallback path; the foreground reserve
     // resolves shard count via the same cache before deciding to use the pool.
     let routes = route_cache
@@ -3630,7 +3630,7 @@ async fn discover_allocation_shard_routes(
     let mut last_err = None;
     let mut fresh_routes = HashMap::new();
     let mut stale_routes = HashMap::new();
-    // Phase 0: count the list_service_instances RPCs this single resolution
+    // Count the list_service_instances RPCs this single resolution
     // issued so the lab can measure route-discovery amplification per reserve.
     let mut rpc_count = 0usize;
     for endpoint in kas_channels.ordered_endpoints() {
@@ -4055,7 +4055,7 @@ async fn reserve_stripe_batch_sharded(
     let shard_plans = shard_fragment_distributions(fragment_count, &routes)?;
     let mut last_error = None;
     for shard_plan in shard_plans {
-        // Phase 1 #6: fan out the per-shard reserves concurrently instead of
+        // Fan out the per-shard reserves concurrently instead of
         // awaiting each before the next. Each shard leader holds its own lease,
         // so the 3 reserves overlap rather than serialize (~3x latency cut on a
         // 3-shard cluster). Partial-failure compensation below is preserved:
@@ -4954,7 +4954,7 @@ impl ReservationCache {
         let now_ms = now_unix_ms();
         let min_usable_until = now_ms.saturating_add(self.config.min_usable_ttl.as_millis() as u64);
         let mut inner = self.inner.lock().unwrap();
-        // Phase 1 #1 memory bound: `high_watermark` is the GLOBAL pool budget,
+        // Memory bound: `high_watermark` is the GLOBAL pool budget,
         // partitioned across distinct `(bucket, ec_profile, failure_domain)`
         // keys rather than applied per-key. Multi-shard makes the cache eligible
         // for many keys, so a per-key cap would let total RAM grow as
@@ -5379,7 +5379,7 @@ fn shared_reservation_cache_enabled(
     small_object_max_stripes: usize,
     allocation_shard_count: usize,
 ) -> bool {
-    // Phase 1 #1: the foreground reserve drains a pre-staged RAM pool on
+    // The foreground reserve drains a pre-staged RAM pool on
     // multi-shard clusters too. Previously this required
     // `allocation_shard_count <= 1`, which made the cache dead code on the
     // 3-shard prod/lab topology and forced every foreground reserve into a
@@ -5477,7 +5477,7 @@ mod tests {
 
     #[test]
     fn shared_reservation_cache_is_enabled_for_small_objects_on_any_shard_count() {
-        // Phase 1 #1: the pool is now the foreground source on multi-shard too,
+        // The pool is the foreground source on multi-shard too,
         // so the shard count no longer gates eligibility. What still gates it is
         // "the whole object fits one small-object window" (no remaining stripes
         // after the window, and the window is within small_object_max_stripes).
@@ -5812,7 +5812,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn route_cache_serves_fresh_snapshot_within_ttl() {
-        // Phase 1 #5: a freshly-fetched route set is served from RAM (no RPC),
+        // A freshly-fetched route set is served from RAM (no RPC),
         // and the cached shard count is what the foreground reserve reads.
         let cache = AllocationRouteCache::new(Duration::from_secs(5), test_stats());
         seed_route_cache(&cache, 3, Instant::now());
@@ -5891,7 +5891,7 @@ mod tests {
 
     #[test]
     fn pool_memory_budget_is_global_not_per_key() {
-        // Phase 1 #1 memory bound: high_watermark is the GLOBAL pool budget,
+        // Memory bound: high_watermark is the GLOBAL pool budget,
         // partitioned across distinct keys. Storing into many keys must not let
         // total depth exceed the budget (which a per-key cap would allow:
         // num_keys * high_watermark).
@@ -5954,7 +5954,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn merge_uses_min_fragment_expiry_across_shards() {
-        // FIX #1 (DESIGN_KAS_WRITE_SCALE.md §3): a merged full-stripe reservation
+        // A merged full-stripe reservation
         // is only usable while EVERY per-shard fragment is still valid, so its
         // cached expiry must be the EARLIEST (MIN), never the MAX. shard-0
         // expires soon, shard-1 late -> merged expiry == shard-0's (the min).
