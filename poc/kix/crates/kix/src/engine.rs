@@ -22,15 +22,28 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use dashmap::DashMap;
 
 pub use config::{KixConfig, KixError, KixStatsConfig, WorkerMode};
 pub use stats::{DriveStatsSnapshot, KixStatsSnapshot, LatencyStatsSnapshot, ShardStatsSnapshot};
+
+/// Durable owner of a physical (drive, slot/granule). Guard D rejects a write that
+/// would overwrite a live committed chunk of a different identity. Generation-fenced;
+/// rebuilt at boot (KST seeds it from recovered entries). Stale entries are harmless
+/// because Guard D verifies the owner is still live in the forward map before rejecting.
+#[derive(Clone, Copy)]
+pub struct GranuleOwner {
+    pub chunk_id: ChunkId,
+    pub generation: u32,
+}
 
 #[derive(Clone)]
 pub struct KixClient {
     shard_states: Arc<Vec<Arc<ShardState>>>,
     shard_stats: Arc<Vec<Arc<ShardRuntimeStats>>>,
     drive_arenas: Arc<DriveArenaSet>,
+    // granule->chunk inverse, one map per drive_id (TLA/SC+ Phase 0, Guard D backstop).
+    granule_inverse: Arc<HashMap<u16, DashMap<u64, GranuleOwner>>>,
 }
 
 #[derive(Clone)]
@@ -68,7 +81,12 @@ impl KixClient {
         Ok(hit)
     }
 
-    pub fn upsert(&self, chunk_id: ChunkId, record: LocationRecord) -> Result<(), KixError> {
+    pub fn upsert(
+        &self,
+        chunk_id: ChunkId,
+        slot_index: u64,
+        record: LocationRecord,
+    ) -> Result<(), KixError> {
         let shard = self.shard_index_for(&chunk_id)?;
         let stats = &self.shard_stats[shard];
         let t0 = Instant::now();
@@ -81,6 +99,8 @@ impl KixClient {
             )
             .map(|_| {
                 let live_entries = self.shard_states[shard].upsert(chunk_id, record);
+                // Maintain the durable granule->chunk inverse for Guard D.
+                self.update_inverse(record.drive_id, slot_index, chunk_id, record.generation);
                 stats
                     .live_entries
                     .store(live_entries as u64, Ordering::Relaxed);
@@ -93,6 +113,46 @@ impl KixClient {
         }
         stats.upsert_latency.observe(t0.elapsed());
         result
+    }
+
+    /// Generation-fenced update of the (drive, slot) -> owner inverse. Shared by the
+    /// write path (`upsert`) and KST boot reseeding (`seed_inverse`).
+    fn update_inverse(&self, drive_id: u16, slot_index: u64, chunk_id: ChunkId, generation: u32) {
+        let Some(inverse) = self.granule_inverse.get(&drive_id) else {
+            return;
+        };
+        use dashmap::mapref::entry::Entry;
+        match inverse.entry(slot_index) {
+            Entry::Occupied(mut existing) => {
+                if existing.get().generation <= generation {
+                    existing.insert(GranuleOwner {
+                        chunk_id,
+                        generation,
+                    });
+                }
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(GranuleOwner {
+                    chunk_id,
+                    generation,
+                });
+            }
+        }
+    }
+
+    /// Returns the current owner of a physical (drive, slot/granule), if any. Guard D
+    /// verifies the returned chunk is still live in the forward map before treating it
+    /// as a conflict, so a stale entry (owner since deleted) is harmless.
+    pub fn lookup_granule_chunk(&self, drive_id: u16, slot_index: u64) -> Option<(ChunkId, u32)> {
+        let owner = *self.granule_inverse.get(&drive_id)?.get(&slot_index)?;
+        Some((owner.chunk_id, owner.generation))
+    }
+
+    /// Seeds the inverse at KST boot from a recovered (drive, slot, chunk) mapping
+    /// (KST computes the slot from the recovered record + media layout). Idempotent,
+    /// generation-fenced.
+    pub fn seed_inverse(&self, drive_id: u16, slot_index: u64, chunk_id: ChunkId, generation: u32) {
+        self.update_inverse(drive_id, slot_index, chunk_id, generation);
     }
 
     pub fn delete(&self, chunk_id: ChunkId) -> Result<(), KixError> {
@@ -346,11 +406,20 @@ impl KixEngine {
             None => None,
         };
 
+        let granule_inverse = Arc::new(
+            config
+                .drive_configs
+                .iter()
+                .map(|cfg| (cfg.id, DashMap::new()))
+                .collect::<HashMap<u16, DashMap<u64, GranuleOwner>>>(),
+        );
+
         Ok(Self {
             client: KixClient {
                 shard_states: Arc::clone(&shard_states),
                 shard_stats,
                 drive_arenas: Arc::clone(&drive_arenas),
+                granule_inverse,
             },
             stats,
             stats_publisher,

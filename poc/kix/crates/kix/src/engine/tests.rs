@@ -75,8 +75,8 @@ fn engine_checkpoint_roundtrip() {
     let rec_a = LocationRecord::extent(0, 4096, 65536, 65536, 1, 100);
     let rec_b = LocationRecord::packed(1, 8192, 16384, 16384, 9, 200);
 
-    client.upsert(a, rec_a).unwrap();
-    client.upsert(b, rec_b).unwrap();
+    client.upsert(a, 0, rec_a).unwrap();
+    client.upsert(b, 1, rec_b).unwrap();
     engine.checkpoint_all().unwrap();
     drop(engine);
 
@@ -84,6 +84,39 @@ fn engine_checkpoint_roundtrip() {
     let client = reopened.client();
     assert_eq!(client.get(a).unwrap(), Some(rec_a));
     assert_eq!(client.get(b).unwrap(), Some(rec_b));
+}
+
+#[test]
+fn granule_inverse_tracks_owner_with_generation_fence() {
+    let dir = TestDir::new("granule-inverse");
+    let config = test_config(dir.path(), 2, 1);
+    let engine = KixEngine::open(config).unwrap();
+    let client = engine.client();
+    let a = ChunkId::from_seed(10);
+    let b = ChunkId::from_seed(11);
+    let c = ChunkId::from_seed(12);
+    // gen 1 at (drive 0, slot 5)
+    client
+        .upsert(a, 5, LocationRecord::extent(0, 4096, 65536, 65536, 1, 1))
+        .unwrap();
+    assert_eq!(client.lookup_granule_chunk(0, 5), Some((a, 1)));
+    // a higher generation takes the slot
+    client
+        .upsert(b, 5, LocationRecord::extent(0, 4096, 65536, 65536, 3, 2))
+        .unwrap();
+    assert_eq!(client.lookup_granule_chunk(0, 5), Some((b, 3)));
+    // a lower generation does NOT displace the owner (fence)
+    client
+        .upsert(c, 5, LocationRecord::extent(0, 4096, 65536, 65536, 2, 3))
+        .unwrap();
+    assert_eq!(client.lookup_granule_chunk(0, 5), Some((b, 3)));
+    // unknown slot has no owner
+    assert_eq!(client.lookup_granule_chunk(0, 999), None);
+    // boot reseed is idempotent + generation-fenced
+    client.seed_inverse(0, 7, a, 5);
+    assert_eq!(client.lookup_granule_chunk(0, 7), Some((a, 5)));
+    client.seed_inverse(0, 7, b, 4);
+    assert_eq!(client.lookup_granule_chunk(0, 7), Some((a, 5)));
 }
 
 #[test]
@@ -109,7 +142,7 @@ fn delete_survives_restart() {
     let chunk = ChunkId::from_seed(44);
     let record = LocationRecord::packed(0, 16_384, 16_384, 16_384, 1, 99);
 
-    client.upsert(chunk, record).unwrap();
+    client.upsert(chunk, 0, record).unwrap();
     client.delete(chunk).unwrap();
     drop(engine);
 
@@ -128,8 +161,8 @@ fn older_generation_cannot_overwrite_newer_live_record() {
     let newer = LocationRecord::packed(0, 16_384, 16_384, 16_384, 8, 222);
     let older = LocationRecord::packed(0, 32_768, 16_384, 16_384, 7, 111);
 
-    client.upsert(chunk, newer).unwrap();
-    client.upsert(chunk, older).unwrap();
+    client.upsert(chunk, 0, newer).unwrap();
+    client.upsert(chunk, 0, older).unwrap();
     assert_eq!(client.get(chunk).unwrap(), Some(newer));
     drop(engine);
 
@@ -184,7 +217,7 @@ fn stats_tree_contains_queue_and_latency_details() {
     let chunk = ChunkId::from_seed(7);
     let record = LocationRecord::packed(0, 8_192, 16_384, 16_384, 1, 77);
 
-    client.upsert(chunk, record).unwrap();
+    client.upsert(chunk, 0, record).unwrap();
     assert_eq!(client.get(chunk).unwrap(), Some(record));
     engine.checkpoint_all().unwrap();
 

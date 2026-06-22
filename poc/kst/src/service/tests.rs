@@ -143,7 +143,8 @@ fn build_slot_publications_seeds_current_owner() {
     let chunk_id = ChunkId::from_seed(7);
     let record = kix::chunk_media_record_for_slot(&layout, 0, 9, 3).unwrap();
 
-    let publications = build_slot_publications(&layout, 64, vec![(chunk_id, record)]).unwrap();
+    let publications =
+        build_slot_publications(&layout, 64, vec![(chunk_id, record)], |_, _, _, _| {}).unwrap();
     let owner = publications[9].current().unwrap();
 
     assert_eq!(owner.chunk_id, chunk_id);
@@ -167,7 +168,7 @@ fn build_slot_publications_rejects_conflicting_live_slot_owners() {
         kix::chunk_media_record_for_slot(&layout, 0, 11, 2).unwrap(),
     );
 
-    let err = build_slot_publications(&layout, 64, vec![first, second]).unwrap_err();
+    let err = build_slot_publications(&layout, 64, vec![first, second], |_, _, _, _| {}).unwrap_err();
 
     assert!(err.to_string().contains("conflicting live slot owners"));
 }

@@ -218,10 +218,12 @@ async fn serve(config: ServeConfig) -> Result<(), Box<dyn Error>> {
         },
     )?;
 
+    let seed_client = engine.client();
     let slot_publications = build_slot_publications(
         media.layout(),
         media.layout().key_slots,
         engine.snapshot_entries(),
+        |drive, slot, chunk, gen| seed_client.seed_inverse(drive, slot, chunk, gen),
     )?;
 
     let router = Arc::new(TargetRouter {

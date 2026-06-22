@@ -501,6 +501,27 @@ impl TargetRouter {
             }
         }
 
+        // Durable Guard D backstop: consult the KIX granule->chunk inverse directly,
+        // so a conflicting overwrite is caught even when the in-memory slot owner above
+        // is empty (e.g. before the slot map is fully repopulated). A stale inverse entry
+        // is harmless because we only reject if the owner is still live in the forward map.
+        let drive_id = self.media.config().drive_id;
+        if let Some((owner_chunk, _gen)) = self.client.lookup_granule_chunk(drive_id, slot_index) {
+            if owner_chunk != chunk_id && self.client.get(owner_chunk).ok().flatten().is_some() {
+                slot_publication.rollback();
+                self.stats.record_committed_slot_write_rejection();
+                return Err(ServiceError::new(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "KST refused to write chunk {:?} to slot {} (drive {}): the granule already \
+                         holds live committed chunk {:?} (durable Guard D).",
+                        chunk_id, slot_index, drive_id, owner_chunk
+                    ),
+                    false,
+                ));
+            }
+        }
+
         // From here on the reservation must be resolved (commit or rollback)
         // before returning so the slot does not stay busy.
         match self.publish_reserved(chunk_id, slot_index, generation, &body, reservation) {
@@ -586,7 +607,7 @@ impl TargetRouter {
         );
         let record = media_result.record;
         let publish_started = Instant::now();
-        self.client.upsert(chunk_id, record).map_err(|err| {
+        self.client.upsert(chunk_id, slot_index, record).map_err(|err| {
             ServiceError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!(
@@ -825,8 +846,33 @@ impl TargetRouter {
                             continue;
                         }
                     }
+                    // Durable Guard D backstop (packed): consult the KIX inverse directly.
+                    let drive_id = self.media.config().drive_id;
+                    if let Some((owner_chunk, _g)) =
+                        self.client.lookup_granule_chunk(drive_id, slot_index)
+                    {
+                        if owner_chunk != chunk_id
+                            && self.client.get(owner_chunk).ok().flatten().is_some()
+                        {
+                            slot_publication.rollback();
+                            self.stats.record_committed_slot_write_rejection();
+                            entries.push(PackedWriteReplyEntry {
+                                chunk_id: kp2::ChunkId(chunk_id.0),
+                                slot_index,
+                                requested_generation: generation,
+                                status_code: 409,
+                                location: None,
+                                error: Some(format!(
+                                    "KST refused to write chunk {:?} to slot {} (drive {}): granule \
+                                     already holds live committed chunk {:?} (durable Guard D)",
+                                    chunk_id, slot_index, drive_id, owner_chunk
+                                )),
+                            });
+                            continue;
+                        }
+                    }
                     let publish_started = Instant::now();
-                    match self.client.upsert(chunk_id, record) {
+                    match self.client.upsert(chunk_id, slot_index, record) {
                         Ok(()) => {
                             let mut publish_cost = publish_started.elapsed();
                             if let Some(owner) = reservation.current {
@@ -1444,6 +1490,7 @@ pub(crate) fn build_slot_publications<I>(
     layout: &ChunkMediaLayoutSpec,
     key_slots: u64,
     entries: I,
+    mut seed_inverse: impl FnMut(u16, u64, ChunkId, u32),
 ) -> io::Result<Vec<SlotPublication>>
 where
     I: IntoIterator<Item = (ChunkId, LocationRecord)>,
@@ -1460,6 +1507,8 @@ where
                 ),
             )
         })?;
+        // Seed the durable granule->chunk inverse (Guard D backstop) from recovered state.
+        seed_inverse(record.drive_id, slot_index, chunk_id, record.generation);
         let Some(slot_state) = publications.get_mut(slot_index as usize) else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

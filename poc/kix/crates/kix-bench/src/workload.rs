@@ -403,7 +403,7 @@ pub(crate) fn execute_request_batch(
     for (index, request) in requests.iter().copied().enumerate() {
         if let BenchRequest::Write { chunk_id, record } = request {
             let t0 = Instant::now();
-            client.upsert(chunk_id, record).map_err(|err| {
+            client.upsert(chunk_id, index as u64, record).map_err(|err| {
                 format!(
                     "could not upsert chunk {:?} on drive {}: {}",
                     chunk_id, record.drive_id, err
