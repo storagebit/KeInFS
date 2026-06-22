@@ -439,15 +439,10 @@ impl TargetRouter {
         chunk_id: ChunkId,
         slot_index: u64,
         generation: u32,
+        identity: ChunkSelfDescribingIdentity,
         body: Vec<u8>,
     ) -> Result<ServiceResponse, ServiceError> {
-        self.write_chunk_with_payload(
-            chunk_id,
-            slot_index,
-            generation,
-            ChunkSelfDescribingIdentity::default(),
-            body,
-        )
+        self.write_chunk_with_payload(chunk_id, slot_index, generation, identity, body)
     }
 
     pub(crate) fn handle_direct_chunk_read(

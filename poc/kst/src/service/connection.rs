@@ -167,11 +167,17 @@ async fn handle_request(
             let chunk_id = parse_chunk_id_from_path(uri.path())?;
             let slot_index = parse_query_granule_index(uri.query())?;
             let generation = parse_query_u32(uri.query(), "generation")?;
+            let identity = ChunkSelfDescribingIdentity {
+                object_id: parse_query_u32_opt(uri.query(), "object_id"),
+                object_version: parse_query_u32_opt(uri.query(), "object_version") as u16,
+                stripe: parse_query_u32_opt(uri.query(), "stripe") as u16,
+                frag: parse_query_u32_opt(uri.query(), "frag") as u16,
+            };
             let expected_bytes = parse_content_length(&headers)?;
-            Ok::<_, ServiceError>((chunk_id, slot_index, generation, expected_bytes))
+            Ok::<_, ServiceError>((chunk_id, slot_index, generation, identity, expected_bytes))
         })();
         match streamed_request {
-            Ok((chunk_id, slot_index, generation, expected_bytes)) => {
+            Ok((chunk_id, slot_index, generation, identity, expected_bytes)) => {
                 state.router.stats.record_phase(
                     rpc,
                     RequestPhase::RequestDecode,
@@ -197,6 +203,7 @@ async fn handle_request(
                                     chunk_id,
                                     slot_index,
                                     generation,
+                                    identity,
                                     body,
                                 },
                             ) {

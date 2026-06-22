@@ -4,7 +4,7 @@
 use crate::service::{ServiceError, ServiceResponse, TargetRouter};
 use crate::stats::{RequestPhase, RpcKind};
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
-use kix::{ChunkId, WorkerMode};
+use kix::{ChunkId, ChunkSelfDescribingIdentity, WorkerMode};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -75,6 +75,7 @@ pub(crate) enum DirectExecutionRequest {
         chunk_id: ChunkId,
         slot_index: u64,
         generation: u32,
+        identity: ChunkSelfDescribingIdentity,
         body: Vec<u8>,
     },
 }
@@ -141,11 +142,12 @@ fn direct_execution_worker_loop(
                 chunk_id,
                 slot_index,
                 generation,
+                identity,
                 body,
             } => {
                 let started = Instant::now();
-                let result =
-                    router.handle_direct_chunk_write(chunk_id, slot_index, generation, body);
+                let result = router
+                    .handle_direct_chunk_write(chunk_id, slot_index, generation, identity, body);
                 router
                     .stats
                     .record_phase(task.rpc, RequestPhase::RouteExecute, started.elapsed());
