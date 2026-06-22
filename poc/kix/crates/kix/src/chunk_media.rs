@@ -307,9 +307,22 @@ pub struct ChunkMediaRebuildSummary {
     pub layout_mismatches: u64,
 }
 
+/// Self-describing fragment identity recovered from the on-media slot header
+/// (TLA/SC+ Phase 0). Zeros on the live write path until KST threads real values in
+/// Phase 1; surfaced here so media-rebuild and GC can reason about a fragment's
+/// owning object without a central index.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ChunkSelfDescribingIdentity {
+    pub stripe: u16,
+    pub object_id: u32,
+    pub object_version: u16,
+    pub frag: u16,
+}
+
 pub struct ChunkMediaRebuildResult {
     pub superblock: ChunkMediaSuperblock,
     pub entries: HashMap<ChunkId, LocationRecord>,
+    pub identities: HashMap<ChunkId, ChunkSelfDescribingIdentity>,
     pub summary: ChunkMediaRebuildSummary,
 }
 
@@ -345,14 +358,11 @@ struct ChunkMediaSlotHeader {
     // Self-describing fragment identity (TLA/SC+ Phase 0). Carried in the on-media
     // header so a fragment identifies its owning object for media-rebuild discovery
     // and GC. Live writes carry zeros until KST threads real values in Phase 1;
-    // consumed by rebuild in a later Phase 0 step. All within the CRC span [..80].
-    #[allow(dead_code)]
+    // surfaced by rebuild_from_chunk_media as ChunkSelfDescribingIdentity. All
+    // within the CRC span [..80].
     stripe: u16,
-    #[allow(dead_code)]
     object_id: u32,
-    #[allow(dead_code)]
     object_version: u16,
-    #[allow(dead_code)]
     frag: u16,
 }
 
@@ -881,15 +891,26 @@ pub fn rebuild_from_chunk_media(
         }
     }
 
+    let mut identities: HashMap<ChunkId, ChunkSelfDescribingIdentity> = HashMap::new();
     for (chunk_id, header) in latest_headers {
         if header.state == ChunkMediaEntryState::Live {
             entries.insert(chunk_id, header.record);
+            identities.insert(
+                chunk_id,
+                ChunkSelfDescribingIdentity {
+                    stripe: header.stripe,
+                    object_id: header.object_id,
+                    object_version: header.object_version,
+                    frag: header.frag,
+                },
+            );
         }
     }
 
     Ok(ChunkMediaRebuildResult {
         superblock,
         entries,
+        identities,
         summary,
     })
 }
@@ -2141,6 +2162,13 @@ mod tests {
         let rebuilt = rebuild_from_chunk_media(&config.span).unwrap();
         assert_eq!(rebuilt.entries.get(&chunk_live), Some(&second));
         assert!(!rebuilt.entries.contains_key(&chunk_deleted));
+        // Phase 0: the writer carries zero identity, but rebuild must SURFACE the
+        // self-describing identity for live entries and omit tombstoned ones.
+        assert_eq!(
+            rebuilt.identities.get(&chunk_live),
+            Some(&ChunkSelfDescribingIdentity::default())
+        );
+        assert!(!rebuilt.identities.contains_key(&chunk_deleted));
 
         fs::remove_file(path).unwrap();
     }
