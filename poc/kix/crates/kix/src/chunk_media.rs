@@ -18,7 +18,7 @@ pub const CHUNK_MEDIA_PUBLICATION_LANES: u64 = 2;
 
 const CHUNK_MEDIA_SUPERBLOCK_MAGIC: [u8; 8] = *b"KIXMSB01";
 const CHUNK_MEDIA_SLOT_MAGIC: [u8; 8] = *b"KIXMSL01";
-const CHUNK_MEDIA_VERSION: u16 = 1;
+const CHUNK_MEDIA_VERSION: u16 = 2;
 const BLKGETSIZE64_IOCTL: libc::c_ulong = 0x8008_1272;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,6 +342,18 @@ struct ChunkMediaSlotHeader {
     drive_id: u16,
     chunk_id: ChunkId,
     record: LocationRecord,
+    // Self-describing fragment identity (TLA/SC+ Phase 0). Carried in the on-media
+    // header so a fragment identifies its owning object for media-rebuild discovery
+    // and GC. Live writes carry zeros until KST threads real values in Phase 1;
+    // consumed by rebuild in a later Phase 0 step. All within the CRC span [..80].
+    #[allow(dead_code)]
+    stripe: u16,
+    #[allow(dead_code)]
+    object_id: u32,
+    #[allow(dead_code)]
+    object_version: u16,
+    #[allow(dead_code)]
+    frag: u16,
 }
 
 #[derive(Clone, Copy)]
@@ -403,6 +415,11 @@ pub fn fill_chunk_media_slot_bytes(
         drive_id: record.drive_id,
         chunk_id,
         record,
+        // Phase 0: live writes carry zero identity until KST threads real values (Phase 1).
+        stripe: 0,
+        object_id: 0,
+        object_version: 0,
+        frag: 0,
     };
     encode_slot_header(buffer, header)?;
     let payload = &mut buffer[CHUNK_MEDIA_SLOT_HEADER_BYTES as usize..total_len];
@@ -744,6 +761,11 @@ pub fn write_chunk_media_record(
         drive_id: record.drive_id,
         chunk_id,
         record,
+        // Phase 0: live writes carry zero identity until KST threads real values (Phase 1).
+        stripe: 0,
+        object_id: 0,
+        object_version: 0,
+        frag: 0,
     };
     encode_slot_header(block.as_mut_slice(), header)?;
     let payload = &mut block.as_mut_slice()[CHUNK_MEDIA_SLOT_HEADER_BYTES as usize
@@ -983,6 +1005,11 @@ fn write_chunk_media_payload_with_file(
         drive_id: record.drive_id,
         chunk_id,
         record,
+        // Phase 0: live writes carry zero identity until KST threads real values (Phase 1).
+        stripe: 0,
+        object_id: 0,
+        object_version: 0,
+        frag: 0,
     };
     encode_slot_header(block.as_mut_slice(), header)?;
     let payload_dst = &mut block.as_mut_slice()[CHUNK_MEDIA_SLOT_HEADER_BYTES as usize
@@ -1024,6 +1051,10 @@ fn write_chunk_media_tombstone_with_file(
         drive_id: record.drive_id,
         chunk_id,
         record: tombstone_record,
+        stripe: 0,
+        object_id: 0,
+        object_version: 0,
+        frag: 0,
     };
     encode_slot_header(block.as_mut_slice(), header)?;
     direct_write_exact(
@@ -1503,6 +1534,12 @@ fn encode_slot_header(buffer: &mut [u8], header: ChunkMediaSlotHeader) -> io::Re
     buffer[60..64].copy_from_slice(&header.record.stored_length.to_le_bytes());
     buffer[64..68].copy_from_slice(&header.record.generation.to_le_bytes());
     buffer[68..72].copy_from_slice(&header.record.checksum.to_le_bytes());
+    // Self-describing fragment identity (Phase 0); fits the reserved regions
+    // [14..16] and [72..80], inside the CRC span below.
+    buffer[14..16].copy_from_slice(&header.stripe.to_le_bytes());
+    buffer[72..76].copy_from_slice(&header.object_id.to_le_bytes());
+    buffer[76..78].copy_from_slice(&header.object_version.to_le_bytes());
+    buffer[78..80].copy_from_slice(&header.frag.to_le_bytes());
     let crc = crc32_ieee(&buffer[..80]);
     buffer[80..84].copy_from_slice(&crc.to_le_bytes());
     Ok(())
@@ -1533,10 +1570,18 @@ fn decode_slot_header(buffer: &[u8]) -> Option<ChunkMediaSlotHeader> {
     let stored_length = u32::from_le_bytes(buffer[60..64].try_into().ok()?);
     let generation = u32::from_le_bytes(buffer[64..68].try_into().ok()?);
     let checksum = u32::from_le_bytes(buffer[68..72].try_into().ok()?);
+    let stripe = u16::from_le_bytes(buffer[14..16].try_into().ok()?);
+    let object_id = u32::from_le_bytes(buffer[72..76].try_into().ok()?);
+    let object_version = u16::from_le_bytes(buffer[76..78].try_into().ok()?);
+    let frag = u16::from_le_bytes(buffer[78..80].try_into().ok()?);
     Some(ChunkMediaSlotHeader {
         state,
         drive_id,
         chunk_id,
+        stripe,
+        object_id,
+        object_version,
+        frag,
         record: LocationRecord {
             drive_id,
             location_kind,
@@ -1773,6 +1818,59 @@ mod tests {
     use std::fs::{self, OpenOptions};
     use std::io::Read;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn sample_v2_header(stripe: u16, object_id: u32, object_version: u16, frag: u16) -> ChunkMediaSlotHeader {
+        ChunkMediaSlotHeader {
+            state: ChunkMediaEntryState::Live,
+            drive_id: 7,
+            chunk_id: ChunkId([0x5A; 32]),
+            record: LocationRecord::extent(7, 8192, 1024, 1_048_576, 3, 0xABCD),
+            stripe,
+            object_id,
+            object_version,
+            frag,
+        }
+    }
+
+    #[test]
+    fn slot_header_v2_round_trips_self_describing_identity() {
+        let header = sample_v2_header(3, 0x1234_5678, 2, 7);
+        let mut buf = vec![0u8; CHUNK_MEDIA_SLOT_HEADER_BYTES as usize];
+        encode_slot_header(&mut buf, header).unwrap();
+        let decoded = decode_slot_header(&buf).expect("v2 header must decode");
+        assert_eq!(decoded.stripe, 3);
+        assert_eq!(decoded.object_id, 0x1234_5678);
+        assert_eq!(decoded.object_version, 2);
+        assert_eq!(decoded.frag, 7);
+        assert_eq!(decoded.chunk_id, header.chunk_id);
+        assert_eq!(decoded.record.generation, 3);
+    }
+
+    #[test]
+    fn slot_header_v2_crc_covers_self_describing_fields() {
+        let header = sample_v2_header(1, 0x1111_2222, 1, 4);
+        let mut buf = vec![0u8; CHUNK_MEDIA_SLOT_HEADER_BYTES as usize];
+        encode_slot_header(&mut buf, header).unwrap();
+        // Flip a byte inside the object_id field [72..76]; the CRC over [..80] must catch it.
+        buf[72] ^= 0xFF;
+        assert!(
+            decode_slot_header(&buf).is_none(),
+            "CRC must cover the self-describing identity fields"
+        );
+    }
+
+    #[test]
+    fn slot_header_v1_media_is_rejected_by_the_version_gate() {
+        let header = sample_v2_header(0, 0, 0, 0);
+        let mut buf = vec![0u8; CHUNK_MEDIA_SLOT_HEADER_BYTES as usize];
+        encode_slot_header(&mut buf, header).unwrap();
+        // Downgrade the on-media version field to v1; decode must reject before reading payload.
+        buf[8..10].copy_from_slice(&1u16.to_le_bytes());
+        assert!(
+            decode_slot_header(&buf).is_none(),
+            "old v1 media must be rejected at the version gate"
+        );
+    }
 
     #[test]
     fn planned_span_includes_superblock_and_slot_headers() {
