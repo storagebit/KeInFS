@@ -291,3 +291,39 @@ KRS-driven drain (§14 Q4, flagged as the weakest axis); (4) BeeGFS gap → not 
 
 *Full cited research + this tournament's six designs and critiques are archived in the session
 transcript; key sources: GPFS FAST '02, Ceph architecture/CRUSH docs, DAOS storage/transaction docs.*
+
+---
+
+## Appendix B — refinements (2026-06-21)
+
+### B.1 Phase 0 scoping corrections (Phase 0 is smaller than first scoped)
+- **Guard D already survives restart.** `build_slot_publications` rebuilds slot ownership from
+  KIX-recovered `(chunk_id, location)` entries at boot (which KIX recovers by replaying arena
+  deltas). So Phase 0's deliverable is the *direct* KIX `(drive,granule)→chunk` **inverse index**
+  + the self-describing slot header — NOT a restart-durability fix (there is no restart hole).
+- **The KP2 write reply already carries the allocation result.** `PackedWriteReplyEntry.location`
+  (serialized in the ACK entry by `encode_write_reply`) already returns `drive_id`(=target),
+  `slot_index`(=granule), `generation`, and `checksum`(=fragment CRC). So "extend KP2 to carry the
+  allocation result so the client assembles the manifest" is **already satisfied** — the client can
+  build the manifest from existing write replies. (`target_id` is `u16` today; widening to `u32`
+  for >65 k targets is a later, separate concern.)
+
+### B.2 Capacity: drop the 2× publication-lane allocation (future phase; keep 8+2 EC now)
+Today `CHUNK_MEDIA_PUBLICATION_LANES = 2` — every logical granule is formatted with two physical
+lanes (`physical_slot = slot_index*2 + lane`), so a 1 MiB fragment consumes ~2 MiB of media
+(confirmed by the lab's ~1.96 MB/granule sizing). With rs-8-2 (1.25×) that is only **~40% raw→usable
+efficiency** (2× lane × 1.25× EC). The two-lane scheme exists for atomic *in-place rewrite* +
+torn-write protection during concurrent read.
+
+In the redesign both are redundant: durability is EC's job (8+2 survives 2 losses), and write
+atomicity moves to the immutable-manifest commit — writes go to a **fresh granule**, a generation
+bump (rebuild) writes a **new** granule + manifest CAS, so a live fragment is never overwritten in
+place while being read. With that fresh-granule / no-in-place-rewrite invariant (already enforced by
+Guard D + the inverse index), the second lane buys nothing.
+
+**Decision (2026-06-21):** keep rs-8-2 EC + 2 lanes for now (Phase 0 stays additive). **Add a later
+phase: single-lane media** (`CHUNK_MEDIA_PUBLICATION_LANES 2→1`) — reclaims ~50% (efficiency
+~40%→~80% with 8+2), **gated on the fresh-granule write invariant from Phases 1–3**. "Fortress"
+durability = an explicit replication policy (mirrored placement / a replicated EC profile), NOT a
+silent 2× media tax on all data. (Media-format + write-path behavioral change → its own
+format-version bump + reformat; fine under POC §17.)
