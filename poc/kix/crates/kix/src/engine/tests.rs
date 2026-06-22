@@ -119,6 +119,65 @@ fn granule_inverse_tracks_owner_with_generation_fence() {
     assert_eq!(client.lookup_granule_chunk(0, 7), Some((a, 5)));
 }
 
+// Mirrors the exact decision the KST write path (Guard D) runs before publishing:
+// look up the granule's owner, and treat it as a conflict only if it is a DIFFERENT
+// chunk that is still live in the forward map.
+fn guard_d_conflict(client: &KixClient, drive: u16, slot: u64, incoming: ChunkId) -> Option<ChunkId> {
+    match client.lookup_granule_chunk(drive, slot) {
+        Some((owner, _)) if owner != incoming && client.get(owner).unwrap().is_some() => Some(owner),
+        _ => None,
+    }
+}
+
+#[test]
+fn guard_d_rejects_live_conflict_and_ignores_stale_owner() {
+    let dir = TestDir::new("guard-d-decision");
+    let config = test_config(dir.path(), 2, 1);
+    let engine = KixEngine::open(config).unwrap();
+    let client = engine.client();
+    let a = ChunkId::from_seed(100);
+    let b = ChunkId::from_seed(200);
+    let rec_a = LocationRecord::extent(0, 4096, 65536, 65536, 1, 7);
+    client.upsert(a, 5, rec_a).unwrap();
+
+    // A different chunk targeting A's live granule is a conflict -> Guard D rejects.
+    assert_eq!(guard_d_conflict(&client, 0, 5, b), Some(a));
+    // Re-writing the SAME chunk identity is allowed (generation bump on its own slot).
+    assert_eq!(guard_d_conflict(&client, 0, 5, a), None);
+
+    // Delete A: the inverse entry is now STALE (delete does not clear it)...
+    client.delete(a).unwrap();
+    assert_eq!(client.lookup_granule_chunk(0, 5), Some((a, 1)));
+    // ...but the liveness check makes Guard D ignore it, so a fresh write of B is allowed.
+    assert_eq!(guard_d_conflict(&client, 0, 5, b), None);
+}
+
+#[test]
+fn guard_d_conflict_survives_restart_via_seed() {
+    let dir = TestDir::new("guard-d-restart");
+    let config = test_config(dir.path(), 2, 1);
+    let a = ChunkId::from_seed(101);
+    let b = ChunkId::from_seed(201);
+    let rec_a = LocationRecord::extent(0, 4096, 65536, 65536, 3, 9);
+    {
+        let engine = KixEngine::open(config.clone()).unwrap();
+        engine.client().upsert(a, 5, rec_a).unwrap();
+        engine.checkpoint_all().unwrap();
+    }
+    // Restart: the forward map recovers A from the arena, but the in-memory inverse
+    // starts empty -> Guard D would MISS the conflict until KST reseeds at boot.
+    let engine = KixEngine::open(config).unwrap();
+    let client = engine.client();
+    assert_eq!(client.get(a).unwrap(), Some(rec_a));
+    assert_eq!(client.lookup_granule_chunk(0, 5), None);
+    assert_eq!(guard_d_conflict(&client, 0, 5, b), None); // not yet armed
+
+    // KST recomputes the slot from the recovered record and reseeds (build_slot_publications).
+    client.seed_inverse(0, 5, a, rec_a.generation);
+    // Now Guard D rejects the conflicting overwrite again -> it survives restart.
+    assert_eq!(guard_d_conflict(&client, 0, 5, b), Some(a));
+}
+
 #[test]
 fn corrupted_drive_marks_rebuild_required() {
     let dir = TestDir::new("corrupted-drive");
