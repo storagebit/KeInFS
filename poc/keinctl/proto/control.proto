@@ -522,6 +522,37 @@ message CommitObjectWriteReply {
   ObjectVersionManifest manifest = 1;
 }
 
+// TLA/SC+ Phase 2: single-shot object lifecycle. BeginObject mints the monotonic
+// object_id + numeric version up front (no central write-intent row); CommitObject is
+// one transaction that writes the manifest, appends the per-target reverse log, and
+// CAS-flips the head. KMS handlers land in Phase 2b (FDB host). object_id is u32 for
+// now to match the on-media slot header; widen later for >4B-object scale.
+message BeginObjectRequest {
+  string namespace_id = 1;
+  string bucket_id = 2;
+  string key = 3;
+}
+
+message BeginObjectReply {
+  uint32 object_id = 1;
+  uint32 version = 2;
+  EcProfile ec_profile = 3;
+  uint64 topology_epoch = 4;
+}
+
+message CommitObjectRequest {
+  uint32 object_id = 1;
+  string namespace_id = 2;
+  string bucket_id = 3;
+  string key = 4;
+  uint32 version = 5;
+  ObjectVersionManifest manifest = 6;
+}
+
+message CommitObjectReply {
+  ObjectHead head = 1;
+}
+
 message AbortObjectWriteRequest {
   string intent_id = 1;
 }
@@ -988,6 +1019,8 @@ service Kms {
   rpc ReserveObjectWriteWindow(ReserveObjectWriteWindowRequest) returns (ReserveObjectWriteWindowReply);
   rpc CommitObjectWriteWindow(CommitObjectWriteWindowRequest) returns (CommitObjectWriteWindowReply);
   rpc CommitObjectWrite(CommitObjectWriteRequest) returns (CommitObjectWriteReply);
+  rpc BeginObject(BeginObjectRequest) returns (BeginObjectReply);
+  rpc CommitObject(CommitObjectRequest) returns (CommitObjectReply);
   rpc AbortObjectWrite(AbortObjectWriteRequest) returns (AbortObjectWriteReply);
   rpc RepairObjectWrite(RepairObjectWriteRequest) returns (RepairObjectWriteReply);
   rpc ListWriteIntents(ListWriteIntentsRequest) returns (ListWriteIntentsReply);

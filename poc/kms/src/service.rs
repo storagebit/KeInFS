@@ -18,7 +18,8 @@ use http::{Method, Request as HttpRequest, StatusCode, Uri};
 use keinctl::proto::kas_client::KasClient;
 use keinctl::proto::kms_server::Kms;
 use keinctl::proto::{
-    AbortObjectWriteReply, AbortObjectWriteRequest, CommitObjectWriteReply,
+    AbortObjectWriteReply, AbortObjectWriteRequest, BeginObjectReply, BeginObjectRequest,
+    CommitObjectReply, CommitObjectRequest, CommitObjectWriteReply,
     CommitObjectWriteRequest, CommitObjectWriteWindowReply, CommitObjectWriteWindowRequest,
     CommitPlacementTaskReply, CommitPlacementTaskRequest, CommitRebuildReply, CommitRebuildRequest,
     CreateBucketReply, CreateBucketRequest, CreateEcProfileReply, CreateEcProfileRequest,
@@ -961,6 +962,23 @@ impl Kms for KmsService {
                 kms_err(&self.stats, kind, &started, err)
             }
         }
+    }
+
+    async fn begin_object(
+        &self,
+        _request: Request<BeginObjectRequest>,
+    ) -> Result<Response<BeginObjectReply>, Status> {
+        // TLA/SC+ Phase 2b: mint a monotonic object_id + numeric version (FDB atomic-add).
+        // Not yet implemented; Phase 2a wire/media plumbing carries identity with object_id=0.
+        Err(Status::unimplemented("KMS BeginObject lands in Phase 2b"))
+    }
+
+    async fn commit_object(
+        &self,
+        _request: Request<CommitObjectRequest>,
+    ) -> Result<Response<CommitObjectReply>, Status> {
+        // TLA/SC+ Phase 2b: single-shot commit (manifest + per-target reverse log + CAS head flip).
+        Err(Status::unimplemented("KMS CommitObject lands in Phase 2b"))
     }
 
     async fn commit_object_write(
