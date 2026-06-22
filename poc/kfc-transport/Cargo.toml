@@ -35,7 +35,7 @@ fractal-fuse = { version = "0.4", optional = true }
 
 [features]
 default = []
-# Phase 5: FUSE-over-io_uring backend (Linux kernel >= 6.14). Off by default;
+# FUSE-over-io_uring backend (Linux kernel >= 6.14). Off by default;
 # selected at runtime only when the kernel advertises FUSE_OVER_IO_URING. Pulls
 # in the (optional, Linux-only) `fractal-fuse` dependency.
 io-uring = ["dep:fractal-fuse"]
