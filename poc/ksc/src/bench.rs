@@ -547,7 +547,7 @@ async fn issue_write_pack(
         let payload = synthetic_payload(key.chunk_id, key.slot_index, generation, payload_len);
         let payload_bytes = payload.len();
         let phases = session
-            .write_chunk(key.chunk_id, key.slot_index, generation, payload)
+            .write_chunk(key.chunk_id, key.slot_index, generation, WriteIdentity::default(), payload)
             .await?;
         return Ok(Some((1, payload_bytes, phases)));
     }
@@ -706,7 +706,7 @@ async fn prefill_keyspace(
                     synthetic_payload(key.chunk_id, key.slot_index, generation, payload_len);
                 let payload_bytes = payload.len();
                 let phases = session
-                    .write_chunk(key.chunk_id, key.slot_index, generation, payload)
+                    .write_chunk(key.chunk_id, key.slot_index, generation, WriteIdentity::default(), payload)
                     .await?;
                 stats.record_write(1, payload_bytes, started.elapsed(), &phases);
             }

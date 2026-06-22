@@ -420,12 +420,18 @@ impl TargetRouter {
         let decode_started = Instant::now();
         let slot_index = parse_query_granule_index(query)?;
         let generation = parse_query_u32(query, "generation")?;
+        let identity = ChunkSelfDescribingIdentity {
+            object_id: parse_query_u32_opt(query, "object_id"),
+            object_version: parse_query_u32_opt(query, "object_version") as u16,
+            stripe: parse_query_u32_opt(query, "stripe") as u16,
+            frag: parse_query_u32_opt(query, "frag") as u16,
+        };
         self.stats.record_phase(
             RpcKind::Write,
             RequestPhase::RequestDecode,
             decode_started.elapsed(),
         );
-        self.write_chunk_with_payload(chunk_id, slot_index, generation, body)
+        self.write_chunk_with_payload(chunk_id, slot_index, generation, identity, body)
     }
 
     pub(crate) fn handle_direct_chunk_write(
@@ -435,7 +441,13 @@ impl TargetRouter {
         generation: u32,
         body: Vec<u8>,
     ) -> Result<ServiceResponse, ServiceError> {
-        self.write_chunk_with_payload(chunk_id, slot_index, generation, body)
+        self.write_chunk_with_payload(
+            chunk_id,
+            slot_index,
+            generation,
+            ChunkSelfDescribingIdentity::default(),
+            body,
+        )
     }
 
     pub(crate) fn handle_direct_chunk_read(
@@ -450,6 +462,7 @@ impl TargetRouter {
         chunk_id: ChunkId,
         slot_index: u64,
         generation: u32,
+        identity: ChunkSelfDescribingIdentity,
         body: Vec<u8>,
     ) -> Result<ServiceResponse, ServiceError> {
         let slot_publication = self.slot_publication(slot_index)?;
@@ -524,7 +537,7 @@ impl TargetRouter {
 
         // From here on the reservation must be resolved (commit or rollback)
         // before returning so the slot does not stay busy.
-        match self.publish_reserved(chunk_id, slot_index, generation, &body, reservation) {
+        match self.publish_reserved(chunk_id, slot_index, generation, identity, &body, reservation) {
             Ok(record) => {
                 slot_publication.commit(PublishedSlotOwner { chunk_id, record })?;
                 let map_started = Instant::now();
@@ -559,6 +572,7 @@ impl TargetRouter {
         chunk_id: ChunkId,
         slot_index: u64,
         generation: u32,
+        identity: ChunkSelfDescribingIdentity,
         body: &[u8],
         reservation: SlotPublicationReservation,
     ) -> Result<LocationRecord, ServiceError> {
@@ -569,8 +583,7 @@ impl TargetRouter {
                 reservation.lane,
                 chunk_id,
                 generation,
-                // Direct (non-object) single-chunk path carries no object identity yet.
-                ChunkSelfDescribingIdentity::default(),
+                identity,
                 body,
             )
             .map_err(|err| {
@@ -1815,6 +1828,14 @@ fn parse_query_u32(query: Option<&str>, key: &str) -> Result<u32, ServiceError> 
                 true,
             )
         })
+}
+
+/// Parses an optional u32 query parameter, defaulting to 0 when absent or unparseable.
+fn parse_query_u32_opt(query: Option<&str>, key: &str) -> u32 {
+    parse_query_value(query, key)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 fn parse_query_value<'a>(query: Option<&'a str>, key: &str) -> Result<&'a str, ServiceError> {

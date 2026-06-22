@@ -1097,6 +1097,8 @@ impl ObjectClient {
                             let retry_result = self
                                 .retry_fragment_failures_same_target(
                                     &intent.intent_id,
+                                    object_id,
+                                    object_version,
                                     &stripe_result.prepared.plans,
                                     &stripe_result.prepared.fragments,
                                     std::mem::take(&mut write_failures),
@@ -1178,6 +1180,8 @@ impl ObjectClient {
                             let (retry_write_failures, retry_rpc_phases) = self
                                 .write_fragment_plans(
                                     &repaired.intent_id,
+                                    object_id,
+                                    object_version,
                                     &retry_plans,
                                     &stripe_result.prepared.fragments,
                                 )
@@ -1190,6 +1194,8 @@ impl ObjectClient {
                                 let retry_result = self
                                     .retry_fragment_failures_same_target(
                                         &repaired.intent_id,
+                                        object_id,
+                                        object_version,
                                         &retry_plans,
                                         &stripe_result.prepared.fragments,
                                         std::mem::take(&mut write_failures),
@@ -2165,6 +2171,8 @@ impl ObjectClient {
     async fn write_fragment_plans(
         &self,
         intent_id: &str,
+        object_id: u32,
+        object_version: u32,
         plans: &[FragmentPlan],
         fragments: &[Vec<u8>],
     ) -> Result<(Vec<FragmentWriteFailure>, RequestPhaseTimes), ObjectError> {
@@ -2175,6 +2183,8 @@ impl ObjectClient {
                 intent_id,
             )?),
             intent_id,
+            object_id,
+            object_version,
             plans,
             fragments,
             Arc::clone(&self.write_inflight_limiter),
@@ -2185,6 +2195,8 @@ impl ObjectClient {
     async fn retry_fragment_failures_same_target(
         &mut self,
         intent_id: &str,
+        object_id: u32,
+        object_version: u32,
         plans: &[FragmentPlan],
         fragments: &[Vec<u8>],
         failures: Vec<FragmentWriteFailure>,
@@ -2209,7 +2221,7 @@ impl ObjectClient {
 
             let write_started = Instant::now();
             let (retry_failures, retry_phases) = self
-                .write_fragment_plans(intent_id, &retry_plans, fragments)
+                .write_fragment_plans(intent_id, object_id, object_version, &retry_plans, fragments)
                 .await?;
             result.write_elapsed += write_started.elapsed();
             add_request_phase_times(&mut result.phases, &retry_phases);
@@ -2400,6 +2412,8 @@ fn snapshot_target_sessions(
 async fn write_fragment_plans_with_sessions(
     target_sessions: Arc<HashMap<String, TargetSession>>,
     intent_id: &str,
+    object_id: u32,
+    object_version: u32,
     plans: &[FragmentPlan],
     fragments: &[Vec<u8>],
     write_inflight_limiter: Arc<AdaptiveWriteLimiter>,
@@ -2441,7 +2455,18 @@ async fn write_fragment_plans_with_sessions(
             data_rpc(
                 "target write",
                 TARGET_IO_TIMEOUT,
-                session.write_chunk(chunk_id, granule_index, generation, fragment),
+                session.write_chunk(
+                    chunk_id,
+                    granule_index,
+                    generation,
+                    WriteIdentity {
+                        object_id,
+                        object_version: object_version as u16,
+                        stripe: stripe_index as u16,
+                        frag: fragment_index as u16,
+                    },
+                    fragment,
+                ),
             )
             .await
             .map_err(|err| {
@@ -2566,6 +2591,12 @@ async fn write_prepared_stripe_batch_with_sessions(
                         item.chunk_id,
                         item.granule_index,
                         item.generation,
+                        WriteIdentity {
+                            object_id: item.object_id,
+                            object_version: item.version as u16,
+                            stripe: item.stripe_index as u16,
+                            frag: item.fragment_index as u16,
+                        },
                         payload,
                     ),
                 )

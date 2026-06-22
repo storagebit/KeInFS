@@ -378,6 +378,23 @@ fn run_inspect(config: &ToolConfig, dump_entries: usize) -> Result<(), Box<dyn E
     println!("check_state={}", classify_recovery(&recovery).as_str());
     if dump_entries > 0 {
         dump_recovered_entries_with_prefix("", &recovery.entries, dump_entries);
+        if let Some(media_span) = media_span_config(config) {
+            match rebuild_from_chunk_media(&media_span) {
+                Ok(rebuilt) => {
+                    println!("media_live_identities={}", rebuilt.identities.len());
+                    for identity in rebuilt.identities.values().take(dump_entries) {
+                        println!(
+                            "media_identity object_id={} version={} stripe={} frag={}",
+                            identity.object_id,
+                            identity.object_version,
+                            identity.stripe,
+                            identity.frag
+                        );
+                    }
+                }
+                Err(err) => println!("media_rebuild_error={err}"),
+            }
+        }
     }
     Ok(())
 }

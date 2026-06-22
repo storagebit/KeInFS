@@ -9,7 +9,7 @@ use kp2::{
     apply_packed_headers, decode_read_response, decode_write_reply, encode_read_query,
     encode_write_request_header, validate_declared_counts, validate_packed_headers, ChunkId,
     PackedReadQuery, PackedReadResponse, PackedWriteEntry, PackedWriteReply, PackedWriteRequest,
-    CONTENT_TYPE as KP2_CONTENT_TYPE, HEADER_LIMIT_CLASS, HEADER_LIMIT_CURRENT_IN_FLIGHT,
+    WriteIdentity, CONTENT_TYPE as KP2_CONTENT_TYPE, HEADER_LIMIT_CLASS, HEADER_LIMIT_CURRENT_IN_FLIGHT,
     HEADER_LIMIT_MAX_IN_FLIGHT, HEADER_LIMIT_SCOPE, HEADER_RETRY_AFTER_MS, KIND_QUERY, KIND_READ,
     KIND_WRITE, MAX_PACK_PAYLOAD_BYTES,
 };
@@ -482,11 +482,17 @@ impl TargetSession {
         chunk_id: ChunkId,
         granule_index: u64,
         generation: u32,
+        identity: WriteIdentity,
         payload: Vec<u8>,
     ) -> Result<RequestPhaseTimes, ClientError> {
         let path = format!(
-            "/v1/chunk/{}?granule={granule_index}&generation={generation}",
-            hex::encode(chunk_id.0)
+            "/v1/chunk/{chunk}?granule={granule_index}&generation={generation}\
+             &object_id={object_id}&object_version={object_version}&stripe={stripe}&frag={frag}",
+            chunk = hex::encode(chunk_id.0),
+            object_id = identity.object_id,
+            object_version = identity.object_version,
+            stripe = identity.stripe,
+            frag = identity.frag,
         );
         let response = self
             .send_h2_request(
