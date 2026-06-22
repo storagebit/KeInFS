@@ -53,6 +53,74 @@ pub(crate) struct TargetRouter {
     pub(crate) media: ChunkMediaHandle,
     pub(crate) stats: Arc<TargetRuntimeStats>,
     pub(crate) slot_publications: Arc<Vec<SlotPublication>>,
+    // Wired into the write path when target-local allocation replaces client-supplied
+    // granules; constructed + unit-tested now as the foundation.
+    #[allow(dead_code)]
+    pub(crate) granule_allocator: GranuleAllocator,
+}
+
+/// Target-local free-granule allocator for this drive. Hands out a granule (slot) the
+/// target chooses itself, so a write need not carry a centrally-reserved granule. A slot
+/// is allocatable when it is neither durably occupied (per the KIX granule inverse) nor
+/// already handed out and not-yet-published (the `pending` set). The on-media publication
+/// lane is a separate physical detail handled at write time; this allocates the logical
+/// granule in `[0, key_slots)`.
+#[allow(dead_code)]
+pub(crate) struct GranuleAllocator {
+    key_slots: u64,
+    inner: std::sync::Mutex<GranuleAllocatorInner>,
+}
+
+struct GranuleAllocatorInner {
+    /// Round-robin cursor so successive allocations spread across the granule space
+    /// instead of repeatedly probing the same low slots.
+    cursor: u64,
+    /// Slots handed out but not yet durably published (so they are not in the KIX
+    /// inverse yet); reserved here to prevent two concurrent writes picking the same slot.
+    pending: std::collections::HashSet<u64>,
+}
+
+#[allow(dead_code)]
+impl GranuleAllocator {
+    pub(crate) fn new(key_slots: u64) -> Self {
+        Self {
+            key_slots,
+            inner: std::sync::Mutex::new(GranuleAllocatorInner {
+                cursor: 0,
+                pending: std::collections::HashSet::new(),
+            }),
+        }
+    }
+
+    /// Allocate a free granule, marking it pending. `is_occupied(slot)` reports whether a
+    /// slot already holds a durably-published chunk (the KIX inverse is the truth). Scans
+    /// at most one full pass from the cursor; returns None only when the drive is full.
+    pub(crate) fn allocate(&self, is_occupied: impl Fn(u64) -> bool) -> Option<u64> {
+        if self.key_slots == 0 {
+            return None;
+        }
+        let mut inner = self.inner.lock().expect("granule allocator mutex poisoned");
+        for _ in 0..self.key_slots {
+            let slot = inner.cursor;
+            inner.cursor = (inner.cursor + 1) % self.key_slots;
+            if !inner.pending.contains(&slot) && !is_occupied(slot) {
+                inner.pending.insert(slot);
+                return Some(slot);
+            }
+        }
+        None
+    }
+
+    /// Drop a slot's pending reservation — called after the write fails/rolls back, or
+    /// after it is durably published (the KIX inverse then protects it, so the pending
+    /// marker is no longer needed).
+    pub(crate) fn release(&self, slot: u64) {
+        self.inner
+            .lock()
+            .expect("granule allocator mutex poisoned")
+            .pending
+            .remove(&slot);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

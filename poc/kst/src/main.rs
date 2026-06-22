@@ -17,7 +17,9 @@ use kix::{
     ChunkMediaSpanConfig, ChunkMediaWriteConfig, DriveConfig, KixConfig, KixEngine, KixStatsConfig,
     CHUNK_MEDIA_PUBLICATION_LANES,
 };
-use service::{build_slot_publications, run_smoke, serve_connection, TargetRouter, TargetState};
+use service::{
+    build_slot_publications, run_smoke, serve_connection, GranuleAllocator, TargetRouter, TargetState,
+};
 use stats::{spawn_stats_publisher, TargetIdentity, TargetRuntimeStats, TargetStatsConfig};
 use std::error::Error;
 use std::io;
@@ -226,12 +228,14 @@ async fn serve(config: ServeConfig) -> Result<(), Box<dyn Error>> {
         |drive, slot, chunk, gen| seed_client.seed_inverse(drive, slot, chunk, gen),
     )?;
 
+    let granule_allocator = GranuleAllocator::new(media.layout().key_slots);
     let router = Arc::new(TargetRouter {
         _engine: Arc::clone(&engine),
         client: engine.client(),
         media,
         stats: Arc::clone(&runtime_stats),
         slot_publications: Arc::new(slot_publications),
+        granule_allocator,
     });
     let read_ingress = spawn_ingress_workers(
         Arc::clone(&router),

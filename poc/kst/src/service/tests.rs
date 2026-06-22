@@ -316,3 +316,51 @@ fn begin_delete_blocks_publication_and_clears_on_success() {
     publication.finish_delete(false);
     assert_eq!(publication.current(), Some(owner));
 }
+
+#[test]
+fn granule_allocator_hands_out_distinct_free_slots() {
+    let allocator = GranuleAllocator::new(8);
+    let none_occupied = |_slot: u64| false;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..8 {
+        let slot = allocator.allocate(none_occupied).expect("a free slot exists");
+        assert!(slot < 8, "slot is within the granule space");
+        assert!(seen.insert(slot), "each allocation is a distinct slot");
+    }
+    // The drive is now fully pending; the next allocation fails rather than reusing one.
+    assert_eq!(allocator.allocate(none_occupied), None, "full drive yields no slot");
+}
+
+#[test]
+fn granule_allocator_skips_occupied_slots() {
+    let allocator = GranuleAllocator::new(4);
+    // Slots 0 and 2 already hold durably-published chunks.
+    let occupied = |slot: u64| slot == 0 || slot == 2;
+    let mut got = vec![
+        allocator.allocate(occupied).unwrap(),
+        allocator.allocate(occupied).unwrap(),
+    ];
+    got.sort_unstable();
+    assert_eq!(got, vec![1, 3], "only the unoccupied slots are handed out");
+    assert_eq!(allocator.allocate(occupied), None, "no free slots remain");
+}
+
+#[test]
+fn granule_allocator_release_returns_a_slot_to_the_pool() {
+    let allocator = GranuleAllocator::new(2);
+    let free = |_slot: u64| false;
+    let a = allocator.allocate(free).unwrap();
+    let b = allocator.allocate(free).unwrap();
+    assert_eq!(allocator.allocate(free), None, "both slots pending");
+    // Releasing a (write failed/rolled back) makes it allocatable again.
+    allocator.release(a);
+    let c = allocator.allocate(free).unwrap();
+    assert_eq!(c, a, "the released slot is reused");
+    let _ = b;
+}
+
+#[test]
+fn granule_allocator_with_no_slots_allocates_nothing() {
+    let allocator = GranuleAllocator::new(0);
+    assert_eq!(allocator.allocate(|_| false), None);
+}
