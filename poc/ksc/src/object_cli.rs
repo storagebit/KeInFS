@@ -28,6 +28,8 @@ pub(crate) async fn run_put_object(
             kms_grpc_max_message_bytes: config.kms_grpc_max_message_bytes,
             metadata_notification_nats_url: config.metadata_notification_nats_url.clone(),
             metadata_notification_subject: config.metadata_notification_subject.clone(),
+            single_shot_commit: config.single_shot_commit,
+            decentralized: config.decentralized,
             ..ObjectClientOptions::default()
         },
     )
@@ -70,6 +72,7 @@ pub(crate) async fn run_get_object(
                 kms_grpc_max_message_bytes: config.kms_grpc_max_message_bytes,
                 metadata_notification_nats_url: config.metadata_notification_nats_url.clone(),
                 metadata_notification_subject: config.metadata_notification_subject.clone(),
+                decentralized: config.decentralized,
                 ..ObjectClientOptions::default()
             },
         )
@@ -98,6 +101,7 @@ pub(crate) async fn run_get_object(
             kms_grpc_max_message_bytes: config.kms_grpc_max_message_bytes,
             metadata_notification_nats_url: config.metadata_notification_nats_url.clone(),
             metadata_notification_subject: config.metadata_notification_subject.clone(),
+            decentralized: config.decentralized,
             ..ObjectClientOptions::default()
         },
     )

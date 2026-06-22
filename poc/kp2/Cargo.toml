@@ -6,3 +6,4 @@ license = "GPL-2.0-or-later"
 
 [dependencies]
 http = "1"
+sha2 = "0.10"

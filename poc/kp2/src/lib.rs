@@ -47,6 +47,59 @@ const ACK_ENTRY_BYTES: usize = 80;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ChunkId(pub [u8; 32]);
 
+/// Domain-separation prefix for the computed chunk-id derivation. Bump the trailing
+/// version if the derivation ever changes so ids from different schemes cannot collide.
+const CHUNK_ID_DOMAIN: &[u8] = b"keinfs/chunk-id/v1";
+
+impl ChunkId {
+    /// Derives the deterministic chunk id for a fragment from its object identity,
+    /// scoped to a cluster by `cluster_salt`.
+    ///
+    /// The id is COMPUTED, not stored: any party that knows the identity — the writer
+    /// placing the fragment or a reader resolving it — derives the same id with no
+    /// manifest and no lookup. SHA-256 yields a uniform 32-byte id, so the KIX shard
+    /// split (which keys on the leading bytes) stays balanced even across the fragments
+    /// of one object.
+    ///
+    /// `cluster_salt` is a per-cluster secret minted once and shared by every client
+    /// and target in the cluster. It scopes the id space so the ids are not derivable
+    /// from the (sequential) object identity alone, and so two clusters never collide.
+    /// It is length-prefixed into the hash, so any salt length is unambiguous; the
+    /// salt MUST be stable for the life of the cluster (changing it orphans every
+    /// previously written fragment).
+    pub fn for_fragment(
+        cluster_salt: &[u8],
+        object_id: u32,
+        object_version: u16,
+        stripe: u16,
+        frag: u16,
+    ) -> ChunkId {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(CHUNK_ID_DOMAIN);
+        hasher.update((cluster_salt.len() as u32).to_le_bytes());
+        hasher.update(cluster_salt);
+        hasher.update(object_id.to_le_bytes());
+        hasher.update(object_version.to_le_bytes());
+        hasher.update(stripe.to_le_bytes());
+        hasher.update(frag.to_le_bytes());
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&hasher.finalize());
+        ChunkId(id)
+    }
+
+    /// Convenience wrapper deriving the chunk id from a [`WriteIdentity`].
+    pub fn for_identity(cluster_salt: &[u8], identity: &WriteIdentity) -> ChunkId {
+        Self::for_fragment(
+            cluster_salt,
+            identity.object_id,
+            identity.object_version,
+            identity.stripe,
+            identity.frag,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocationKindCode {
     None = 0,
@@ -1111,6 +1164,68 @@ mod tests {
         let mut raw = [0_u8; 32];
         raw.fill(seed);
         ChunkId(raw)
+    }
+
+    const TEST_SALT: &[u8] = b"test-cluster-salt";
+
+    #[test]
+    fn computed_chunk_id_is_deterministic() {
+        let a = ChunkId::for_fragment(TEST_SALT, 0x1234_5678, 3, 7, 2);
+        let b = ChunkId::for_fragment(TEST_SALT, 0x1234_5678, 3, 7, 2);
+        assert_eq!(a, b, "same salt + identity must derive the same chunk id");
+        let via_identity = ChunkId::for_identity(
+            TEST_SALT,
+            &WriteIdentity {
+                object_id: 0x1234_5678,
+                object_version: 3,
+                stripe: 7,
+                frag: 2,
+            },
+        );
+        assert_eq!(a, via_identity, "for_identity must match for_fragment");
+    }
+
+    #[test]
+    fn computed_chunk_id_distinguishes_every_field() {
+        let base = ChunkId::for_fragment(TEST_SALT, 10, 1, 0, 0);
+        assert_ne!(base, ChunkId::for_fragment(TEST_SALT, 11, 1, 0, 0), "object_id matters");
+        assert_ne!(base, ChunkId::for_fragment(TEST_SALT, 10, 2, 0, 0), "version matters");
+        assert_ne!(base, ChunkId::for_fragment(TEST_SALT, 10, 1, 1, 0), "stripe matters");
+        assert_ne!(base, ChunkId::for_fragment(TEST_SALT, 10, 1, 0, 1), "frag matters");
+    }
+
+    #[test]
+    fn computed_chunk_id_is_cluster_scoped() {
+        // The same identity in two different clusters must derive different ids, and a
+        // salt-length boundary must not be ambiguous (length-prefixing guards this).
+        let a = ChunkId::for_fragment(b"cluster-a", 42, 1, 0, 0);
+        let b = ChunkId::for_fragment(b"cluster-b", 42, 1, 0, 0);
+        assert_ne!(a, b, "different cluster salt must derive a different chunk id");
+        let split_1 = ChunkId::for_fragment(b"ab", 42, 1, 0, 0);
+        let split_2 = ChunkId::for_fragment(b"a", 42, 1, 0, 0);
+        assert_ne!(split_1, split_2, "salt boundary must be unambiguous");
+    }
+
+    #[test]
+    fn computed_chunk_id_spreads_across_shards() {
+        // shard_for keys on the leading 8 bytes; the fragments of one object must not
+        // collapse onto a single KIX shard. Project a stripe/frag sweep through the
+        // same leading-8-byte hash the engine uses and require a healthy spread.
+        const SHARDS: usize = 16;
+        let mut buckets = [0u32; SHARDS];
+        for stripe in 0..16u16 {
+            for frag in 0..10u16 {
+                let id = ChunkId::for_fragment(TEST_SALT, 0xABCD_1234, 5, stripe, frag);
+                let mut head = [0u8; 8];
+                head.copy_from_slice(&id.0[..8]);
+                buckets[(u64::from_le_bytes(head) as usize) % SHARDS] += 1;
+            }
+        }
+        let occupied = buckets.iter().filter(|count| **count > 0).count();
+        assert!(
+            occupied >= SHARDS / 2,
+            "computed chunk ids should spread across shards, only {occupied}/{SHARDS} hit"
+        );
     }
 
     #[test]

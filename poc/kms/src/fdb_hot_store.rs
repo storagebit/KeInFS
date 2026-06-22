@@ -4,18 +4,19 @@
 #[cfg(target_os = "linux")]
 mod imp {
     use crate::fdb_schema::{
-        bucket_context_key, decode_segments, ec_profile_key, namespace_entry_key,
+        bucket_context_key, cluster_salt_key, decode_segments, ec_profile_key, namespace_entry_key,
         namespace_path_key, object_head_key, object_id_counter_key, object_version_chunk_key,
-        object_version_chunk_prefix, object_version_key, write_intent_chunk_key,
-        write_intent_chunk_prefix, write_intent_key, write_intent_range,
+        object_version_chunk_prefix, object_version_key, target_reverse_log_key,
+        write_intent_chunk_key, write_intent_chunk_prefix, write_intent_key, write_intent_range,
     };
     use crate::hot_store::HotMetadataStore;
     use crate::store::{
         apply_fragment_repair, auto_create_levels, build_finalize_plans,
         clear_target_current_fragment_index, decode_manifest_bytes, decode_write_intent_bytes,
-        encode_manifest, encode_write_intent, expected_fragment_count, fragment_plans_for_window,
-        join_path, mark_successful_fragments, normalize_object_key, normalize_write_intent,
-        random_chunk_id, write_target_current_fragment_index, AutoCreateLevel, BucketWriteContext,
+        encode_manifest, encode_reverse_log_value, encode_write_intent, expected_fragment_count,
+        fragment_plans_for_window, join_path, mark_successful_fragments, normalize_object_key,
+        normalize_write_intent, random_chunk_id, random_salt,
+        write_target_current_fragment_index, AutoCreateLevel, BucketWriteContext,
         CommittedObjectWrite, CommittedObjectWriteWindow, DeletedObject, DeletedObjectVersion,
         ReservedObjectWriteWindow, StoredBucketWriteContext, TimedStoreResult,
     };
@@ -43,6 +44,17 @@ mod imp {
 
     const CHUNKED_BLOB_META_MAGIC: &[u8; 8] = b"KFBLOB01";
     const MAX_FDB_BLOB_CHUNK_BYTES: usize = 80_000;
+    // Conservative ceiling on the total bytes a single-shot commit writes in one FDB
+    // transaction. FoundationDB's hard limit is 10 MB; staying under 9 MB leaves
+    // headroom for key encoding and the transaction's own bookkeeping. Objects whose
+    // commit would exceed this need the append-then-seal segmented manifest path.
+    const MAX_SINGLE_SHOT_TXN_BYTES: usize = 9 * 1024 * 1024;
+    // Estimated per-fragment cost of the writes the commit makes ON TOP OF the
+    // manifest blob: a reverse-log key+value, the secondary-index/occupancy keys, and
+    // the committed-occupancy value (each embedding the version_id/target_id strings).
+    // Deliberately generous so the fail-fast guard trips before the real transaction
+    // would breach the FDB limit.
+    const SINGLE_SHOT_PER_FRAGMENT_TXN_BYTES: usize = 512;
 
     impl Display for StatusCarrier {
         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -862,6 +874,11 @@ mod imp {
                             current_version_id: manifest.version_id.clone(),
                             revision: finalization_sweep_after_ms,
                             version: prior_version + 1,
+                            logical_length_bytes: manifest.logical_length_bytes,
+                            ec_profile_id: manifest.ec_profile_id.clone(),
+                            // The window/commit write path does not compute placement,
+                            // so it records no topology epoch.
+                            topology_epoch: 0,
                         };
                         let object_name = manifest
                             .key
@@ -935,6 +952,241 @@ mod imp {
                 value,
                 phase_timings: Vec::new(),
             })
+        }
+
+        async fn commit_object_single_shot(
+            &self,
+            expected_prior_version: u32,
+            manifest: ObjectVersionManifest,
+            parent_entry_id: String,
+            parent_path: String,
+            topology_epoch: u64,
+            omit_manifest: bool,
+        ) -> Result<ObjectHead, Status> {
+            let mut manifest = manifest;
+            manifest.key = normalize_object_key(&manifest.key)?;
+            let head_key = object_head_key(&manifest.bucket_id, &manifest.key);
+            self.db
+                .run(move |trx, _| {
+                    let mut manifest = manifest.clone();
+                    let head_key = head_key.clone();
+                    let parent_entry_id = parent_entry_id.clone();
+                    let parent_path = parent_path.clone();
+                    async move {
+                        // The single transaction reads + validates the head BEFORE
+                        // issuing any write, so a CAS loser or oversized manifest
+                        // leaves no partial state (HARD INVARIANT).
+                        let prior = trx
+                            .get(&head_key, false)
+                            .await
+                            .map_err(FdbBindingError::from)?
+                            .map(|bytes| decode_object_head(bytes.as_ref()))
+                            .transpose()
+                            .map_err(status_to_fdb)?;
+
+                        // Idempotent success: a retried commit whose own version
+                        // already won finds the live head pointing at its version_id.
+                        // Return it OK regardless of the CAS witness, which the client
+                        // may have refreshed between attempts.
+                        if let Some(existing) = &prior {
+                            if existing.current_version_id == manifest.version_id {
+                                return Ok(existing.clone());
+                            }
+                        }
+
+                        // Compare-and-swap on the live version.
+                        let witnessed = prior.as_ref().map(|head| head.version).unwrap_or(0);
+                        if witnessed != expected_prior_version {
+                            return Err(status_to_fdb(Status::failed_precondition(format!(
+                                "single-shot commit version mismatch for {}/{}: live head version {} != expected {}",
+                                manifest.bucket_id, manifest.key, witnessed, expected_prior_version
+                            ))));
+                        }
+
+                        // Create-only: overwriting requires a per-object write lease
+                        // and lease-fenced GC, which do not exist yet; without them an
+                        // overwrite would orphan the superseded version's granules, so
+                        // an existing head is refused rather than replaced.
+                        if prior.is_some() {
+                            return Err(status_to_fdb(Status::failed_precondition(format!(
+                                "single-shot commit is create-only and {}/{} already exists",
+                                manifest.bucket_id, manifest.key
+                            ))));
+                        }
+
+                        // From here the commit will write. Finalize the object entry
+                        // id (the write-intent path mints it and carries it on the
+                        // manifest; mint a fresh one only if absent), then encode the
+                        // manifest once and reject anything too large for one txn. The
+                        // budget bounds the WHOLE transaction (manifest blob + the
+                        // per-fragment reverse-log/index/occupancy writes), not just the
+                        // manifest, so the commit fails fast instead of mid-transaction.
+                        if manifest.object_entry_id.is_empty() {
+                            manifest.object_entry_id = Uuid::new_v4().to_string();
+                        }
+                        // The decentralized path persists NO manifest blob (the per-target
+                        // reverse log is the per-fragment record and reads recompute the
+                        // layout), so skip encoding it; otherwise encode once for the blob.
+                        let manifest_bytes = if omit_manifest {
+                            Vec::new()
+                        } else {
+                            encode_manifest(&manifest)
+                        };
+                        let fragment_count: usize =
+                            manifest.stripes.iter().map(|s| s.fragments.len()).sum();
+                        let estimated_txn_bytes = manifest_bytes.len().saturating_add(
+                            fragment_count.saturating_mul(SINGLE_SHOT_PER_FRAGMENT_TXN_BYTES),
+                        );
+                        if estimated_txn_bytes > MAX_SINGLE_SHOT_TXN_BYTES {
+                            return Err(status_to_fdb(Status::failed_precondition(format!(
+                                "single-shot commit for {}/{} would write ~{} bytes across {} fragments, over the {}-byte transaction budget",
+                                manifest.bucket_id,
+                                manifest.key,
+                                estimated_txn_bytes,
+                                fragment_count,
+                                MAX_SINGLE_SHOT_TXN_BYTES
+                            ))));
+                        }
+
+                        let object_name = manifest
+                            .key
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(manifest.key.as_str())
+                            .to_string();
+                        let object_entry = NamespaceDomainEntry {
+                            entry_id: manifest.object_entry_id.clone(),
+                            namespace_id: manifest.namespace_id.clone(),
+                            parent_entry_id: parent_entry_id.clone(),
+                            name: object_name.clone(),
+                            kind: NamespaceEntryKind::Object as i32,
+                            // Denormalize the size at commit so listings carry it
+                            // without a per-object resolve (mirrors commit_object_write).
+                            path: join_path(&parent_path, &object_name),
+                            size_bytes: manifest.logical_length_bytes,
+                        };
+                        let object_entry_json = serde_json::to_vec(&object_entry).map_err(|err| {
+                            status_to_fdb(Status::internal(format!(
+                                "failed to encode namespace entry JSON payload: {err}"
+                            )))
+                        })?;
+                        let head = ObjectHead {
+                            object_entry_id: manifest.object_entry_id.clone(),
+                            current_version_id: manifest.version_id.clone(),
+                            revision: 0,
+                            version: expected_prior_version + 1,
+                            logical_length_bytes: manifest.logical_length_bytes,
+                            ec_profile_id: manifest.ec_profile_id.clone(),
+                            // The placement topology the client computed against; 0 when
+                            // the committer does not compute placement.
+                            topology_epoch,
+                        };
+
+                        // --- Writes (all reads/validation above are complete) ---
+                        // The manifest blob is the thing the decentralized design drops:
+                        // persist it only when the committer wants a manifest-readable
+                        // object (the reverse log below is the per-fragment record either way).
+                        if !omit_manifest {
+                            store_blob(
+                                &trx,
+                                &object_version_key(&manifest.version_id),
+                                &object_version_chunk_prefix(&manifest.version_id),
+                                |chunk_index| {
+                                    object_version_chunk_key(&manifest.version_id, chunk_index)
+                                },
+                                &manifest_bytes,
+                            );
+                        }
+                        // Per-target reverse log: the durable target->object map that
+                        // rebuild/GC range-scan by target_id. Keyed by version_id so it
+                        // is idempotent under FDB transaction retry.
+                        for stripe in &manifest.stripes {
+                            for fragment in &stripe.fragments {
+                                trx.set(
+                                    &target_reverse_log_key(
+                                        &fragment.target_id,
+                                        &manifest.version_id,
+                                        fragment.stripe_index,
+                                        fragment.fragment_index,
+                                    ),
+                                    &encode_reverse_log_value(
+                                        fragment.generation,
+                                        fragment.granule_index,
+                                    ),
+                                );
+                            }
+                        }
+                        // Retain the committed-occupancy markers + legacy secondary
+                        // index: while reservations remain on the write path, the
+                        // allocator/reaper relies on them to know a granule is taken.
+                        write_target_current_fragment_index(&trx, &manifest);
+                        // Namespace entry + path index, mirroring commit_object_write.
+                        trx.set(
+                            &namespace_entry_key(
+                                &manifest.namespace_id,
+                                &manifest.object_entry_id,
+                            ),
+                            &object_entry_json,
+                        );
+                        trx.set(
+                            &namespace_path_key(&manifest.namespace_id, &object_entry.path),
+                            manifest.object_entry_id.as_bytes(),
+                        );
+                        // CAS head-flip last: the object becomes resolvable only once
+                        // every fragment, the reverse log, and the entry are durable.
+                        trx.set(&head_key, &encode_object_head(&head));
+                        Ok(head)
+                    }
+                })
+                .await
+                .map_err(map_fdb_binding_error)
+        }
+
+        async fn get_or_init_cluster_salt(&self) -> Result<Vec<u8>, Status> {
+            let key = cluster_salt_key();
+            self.db
+                .run(move |trx, _| {
+                    let key = key.clone();
+                    async move {
+                        if let Some(existing) =
+                            trx.get(&key, false).await.map_err(FdbBindingError::from)?
+                        {
+                            return Ok(existing.as_ref().to_vec());
+                        }
+                        // First use mints the salt. FDB serializability makes the first
+                        // committer win; a concurrent loser conflicts on the read, retries,
+                        // finds the committed salt, and returns it — so the cluster keeps
+                        // exactly one salt for its lifetime.
+                        let salt = random_salt();
+                        trx.set(&key, &salt);
+                        Ok(salt)
+                    }
+                })
+                .await
+                .map_err(map_fdb_binding_error)
+        }
+
+        async fn get_object_head(
+            &self,
+            bucket_id: String,
+            key_path: String,
+        ) -> Result<Option<ObjectHead>, Status> {
+            let normalized_key = normalize_object_key(&key_path)?;
+            let head_key = object_head_key(&bucket_id, &normalized_key);
+            self.db
+                .run(move |trx, _| {
+                    let head_key = head_key.clone();
+                    async move {
+                        trx.get(&head_key, false)
+                            .await
+                            .map_err(FdbBindingError::from)?
+                            .map(|bytes| decode_object_head(bytes.as_ref()))
+                            .transpose()
+                            .map_err(status_to_fdb)
+                    }
+                })
+                .await
+                .map_err(map_fdb_binding_error)
         }
 
         async fn abort_object_write(
@@ -1409,8 +1661,8 @@ mod imp {
         ReservedObjectWriteWindow, TimedStoreResult,
     };
     use keinctl::proto::{
-        EcProfile, FragmentRef, ObjectVersionManifest, PlacementReservationRecord, WriteIntent,
-        WriteIntentState,
+        EcProfile, FragmentRef, ObjectHead, ObjectVersionManifest, PlacementReservationRecord,
+        WriteIntent, WriteIntentState,
     };
     use std::error::Error;
     use tonic::Status;
@@ -1509,6 +1761,36 @@ mod imp {
             _successful_fragments: Vec<FragmentRef>,
             _finalization_sweep_after_ms: u64,
         ) -> Result<TimedStoreResult<CommittedObjectWrite>, Status> {
+            Err(Status::unimplemented(
+                "FoundationDB metadata backend is supported only on Linux",
+            ))
+        }
+
+        async fn commit_object_single_shot(
+            &self,
+            _expected_prior_version: u32,
+            _manifest: ObjectVersionManifest,
+            _parent_entry_id: String,
+            _parent_path: String,
+            _topology_epoch: u64,
+            _omit_manifest: bool,
+        ) -> Result<ObjectHead, Status> {
+            Err(Status::unimplemented(
+                "FoundationDB metadata backend is supported only on Linux",
+            ))
+        }
+
+        async fn get_or_init_cluster_salt(&self) -> Result<Vec<u8>, Status> {
+            Err(Status::unimplemented(
+                "FoundationDB metadata backend is supported only on Linux",
+            ))
+        }
+
+        async fn get_object_head(
+            &self,
+            _bucket_id: String,
+            _key_path: String,
+        ) -> Result<Option<ObjectHead>, Status> {
             Err(Status::unimplemented(
                 "FoundationDB metadata backend is supported only on Linux",
             ))

@@ -176,6 +176,14 @@ message ObjectHead {
   // sweep timestamp). Bumped on every committed version; the source of truth for
   // the next version a write should use. Old heads decode it as 0.
   uint32 version = 4;
+  // Object-level state denormalized onto the head so a reader resolving an object
+  // needs only the head (plus the bucket's EC profile) to know its geometry, with
+  // no manifest fetch. logical_length_bytes + the EC profile give stripe count and
+  // tail sizing; topology_epoch records the placement topology the version was
+  // committed against (a staleness/rebalance hint). Old heads decode these as 0/empty.
+  uint64 logical_length_bytes = 5;
+  string ec_profile_id = 6;
+  uint64 topology_epoch = 7;
 }
 
 message EcProfile {
@@ -506,6 +514,18 @@ message ReserveObjectWriteWindowRequest {
   uint32 stripe_count = 3;
 }
 
+// Reserve a granule on each of the client-computed (CRUSH/HRW) targets for one stripe.
+// The client supplies the target set it derived from placement; KAS picks a free granule
+// on each. Used by the decentralized write path instead of the central window reserve.
+message ReserveComputedPlacementRequest {
+  string bucket_id = 1;
+  repeated string target_ids = 2;
+}
+
+message ReserveComputedPlacementReply {
+  PlacementReservationRecord reservation = 1;
+}
+
 message ReserveObjectWriteWindowReply {
   repeated FragmentPlan fragment_plans = 1;
 }
@@ -550,6 +570,25 @@ message CommitObjectRequest {
   string key = 4;
   uint32 version = 5;
   ObjectVersionManifest manifest = 6;
+  // Compare-and-swap witness: the version the committer believes is currently
+  // published for (bucket_id, key). 0 means "the object must not already exist".
+  // The commit succeeds only if the live head's version equals this; a retried
+  // commit whose own version already won is treated as success.
+  uint32 expected_prior_version = 7;
+  // Parent directory the committed object entry hangs under, resolved (and
+  // auto-created) up front by the write-intent path. Carried here so the commit
+  // transaction places the namespace entry without re-walking the path tree.
+  string parent_entry_id = 8;
+  string parent_path = 9;
+  // Placement topology epoch the client computed this object's placement against,
+  // recorded on the head as a staleness/rebalance hint. 0 when the committer does
+  // not compute placement.
+  uint64 topology_epoch = 10;
+  // When true the commit does NOT persist the object manifest blob: the per-target
+  // reverse log is the sole per-fragment record and reads reconstruct the layout by
+  // computation. Set by the decentralized write path; the manifest-backed path keeps
+  // it false so its objects remain manifest-readable.
+  bool omit_manifest = 11;
 }
 
 message CommitObjectReply {
@@ -614,6 +653,20 @@ message ResolveObjectReadRequest {
 
 message ResolveObjectReadReply {
   ObjectVersionManifest manifest = 1;
+  EcProfile ec_profile = 2;
+}
+
+// Head-only resolve for the decentralized read path: the client reconstructs the
+// fragment layout itself (computed placement + chunk ids) from the head's geometry
+// (logical_length_bytes + the bucket EC profile) and the cluster config, so it never
+// fetches a manifest.
+message ResolveObjectHeadRequest {
+  string bucket_id = 1;
+  string key = 2;
+}
+
+message ResolveObjectHeadReply {
+  ObjectHead head = 1;
   EcProfile ec_profile = 2;
 }
 
@@ -846,6 +899,22 @@ message ListTargetsRequest {}
 
 message ListTargetsReply {
   repeated TargetRecord targets = 1;
+  // Content-derived identifier of the placement-relevant topology (the usable target
+  // roster). Changes only when membership/health/lifecycle changes, identical across
+  // KAS instances for the same roster. 0 from servers that predate this field.
+  uint64 topology_epoch = 2;
+}
+
+// Cluster-wide constants a smart client fetches once to compute placement locally:
+// the per-cluster chunk-id/placement salt and the current topology snapshot + epoch.
+message GetClusterConfigRequest {}
+
+message GetClusterConfigReply {
+  // Per-cluster salt folded into computed chunk ids and placement weights. Minted once
+  // and stable for the life of the cluster.
+  bytes cluster_salt = 1;
+  uint64 topology_epoch = 2;
+  repeated TargetRecord targets = 3;
 }
 
 message SetTargetStateRequest {
@@ -1024,11 +1093,14 @@ service Kms {
   rpc CommitObjectWrite(CommitObjectWriteRequest) returns (CommitObjectWriteReply);
   rpc BeginObject(BeginObjectRequest) returns (BeginObjectReply);
   rpc CommitObject(CommitObjectRequest) returns (CommitObjectReply);
+  rpc GetClusterConfig(GetClusterConfigRequest) returns (GetClusterConfigReply);
+  rpc ReserveComputedPlacement(ReserveComputedPlacementRequest) returns (ReserveComputedPlacementReply);
   rpc AbortObjectWrite(AbortObjectWriteRequest) returns (AbortObjectWriteReply);
   rpc RepairObjectWrite(RepairObjectWriteRequest) returns (RepairObjectWriteReply);
   rpc ListWriteIntents(ListWriteIntentsRequest) returns (ListWriteIntentsReply);
   rpc GetWriteIntent(GetWriteIntentRequest) returns (GetWriteIntentReply);
   rpc ResolveObjectRead(ResolveObjectReadRequest) returns (ResolveObjectReadReply);
+  rpc ResolveObjectHead(ResolveObjectHeadRequest) returns (ResolveObjectHeadReply);
   rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectReply);
   rpc LeaseRebuildTasks(LeaseRebuildTasksRequest) returns (LeaseRebuildTasksReply);
   rpc CommitRebuild(CommitRebuildRequest) returns (CommitRebuildReply);

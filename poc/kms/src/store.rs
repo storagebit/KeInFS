@@ -2132,6 +2132,7 @@ fn decode_target_current_fragment_version_id(key: &[u8]) -> Result<String, Statu
     Ok(segments[1].clone())
 }
 
+#[cfg(target_os = "linux")]
 fn decode_reverse_log_version_id(key: &[u8]) -> Result<String, Status> {
     let (_, segments) = decode_segments(key)
         .map_err(|err| Status::internal(format!("failed to decode reverse-log key: {err}")))?;
@@ -2153,6 +2154,7 @@ pub(crate) fn encode_reverse_log_value(generation: u32, granule_index: u64) -> V
     out
 }
 
+#[cfg(target_os = "linux")]
 #[allow(dead_code)]
 fn decode_reverse_log_value(bytes: &[u8]) -> Result<(u32, u64), Status> {
     if bytes.len() != 12 {
@@ -2646,6 +2648,13 @@ pub(crate) fn apply_fragment_repair(
 }
 
 pub(crate) fn random_chunk_id() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes
+}
+
+/// A fresh 32-byte random cluster salt (minted once per cluster on first use).
+pub(crate) fn random_salt() -> Vec<u8> {
     let mut bytes = vec![0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     bytes

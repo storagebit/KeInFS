@@ -274,6 +274,7 @@ pub(crate) struct KmsStats {
     reserve_object_write_window: RpcRuntimeStats,
     commit_object_write_window: RpcRuntimeStats,
     commit_object_write: RpcRuntimeStats,
+    commit_object: RpcRuntimeStats,
     abort_object_write: RpcRuntimeStats,
     repair_object_write: RpcRuntimeStats,
     list_write_intents: RpcRuntimeStats,
@@ -342,6 +343,7 @@ impl KmsStats {
             reserve_object_write_window: RpcRuntimeStats::new(),
             commit_object_write_window: RpcRuntimeStats::new(),
             commit_object_write: RpcRuntimeStats::new(),
+            commit_object: RpcRuntimeStats::new(),
             abort_object_write: RpcRuntimeStats::new(),
             repair_object_write: RpcRuntimeStats::new(),
             list_write_intents: RpcRuntimeStats::new(),
@@ -596,6 +598,7 @@ impl KmsStats {
             RpcKind::ReserveObjectWriteWindow => &self.reserve_object_write_window,
             RpcKind::CommitObjectWriteWindow => &self.commit_object_write_window,
             RpcKind::CommitObjectWrite => &self.commit_object_write,
+            RpcKind::CommitObject => &self.commit_object,
             RpcKind::AbortObjectWrite => &self.abort_object_write,
             RpcKind::RepairObjectWrite => &self.repair_object_write,
             RpcKind::ListWriteIntents => &self.list_write_intents,
@@ -641,6 +644,7 @@ pub(crate) enum RpcKind {
     ReserveObjectWriteWindow,
     CommitObjectWriteWindow,
     CommitObjectWrite,
+    CommitObject,
     AbortObjectWrite,
     RepairObjectWrite,
     ListWriteIntents,
@@ -665,7 +669,7 @@ pub(crate) enum RpcKind {
 }
 
 impl RpcKind {
-    const ALL: [Self; 39] = [
+    const ALL: [Self; 40] = [
         Self::CreateNamespace,
         Self::ListNamespaces,
         Self::GetNamespace,
@@ -684,6 +688,7 @@ impl RpcKind {
         Self::ReserveObjectWriteWindow,
         Self::CommitObjectWriteWindow,
         Self::CommitObjectWrite,
+        Self::CommitObject,
         Self::AbortObjectWrite,
         Self::RepairObjectWrite,
         Self::ListWriteIntents,
@@ -727,6 +732,7 @@ impl RpcKind {
             Self::ReserveObjectWriteWindow => "reserve_object_write_window",
             Self::CommitObjectWriteWindow => "commit_object_write_window",
             Self::CommitObjectWrite => "commit_object_write",
+            Self::CommitObject => "commit_object",
             Self::AbortObjectWrite => "abort_object_write",
             Self::RepairObjectWrite => "repair_object_write",
             Self::ListWriteIntents => "list_write_intents",

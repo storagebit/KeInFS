@@ -28,7 +28,8 @@ use keinctl::proto::{
     DeleteObjectReply, DeleteObjectRequest, DeletedObjectVersion, DrainTargetReply,
     DrainTargetRequest, EcProfile, EnqueueTargetRebalanceReply, EnqueueTargetRebalanceRequest,
     FailPlacementTaskReply, FailPlacementTaskRequest, FinalizeReservationsBatchRequest,
-    GetBucketReply, GetBucketRequest, GetNamespaceReply, GetNamespaceRequest,
+    GetBucketReply, GetBucketRequest, GetClusterConfigReply, GetClusterConfigRequest,
+    GetNamespaceReply, GetNamespaceRequest,
     GetPlacementTaskReply, GetPlacementTaskRequest, GetTargetPlacementStatusReply,
     GetTargetPlacementStatusRequest, GetWriteIntentReply, GetWriteIntentRequest,
     InitiateObjectWriteReply, InitiateObjectWriteRequest, LeasePlacementTasksReply,
@@ -42,8 +43,10 @@ use keinctl::proto::{
     PreviewTargetRebalanceRequest, ReclaimTargetGranulesRequest, RecoverTargetReply,
     RecoverTargetRequest, ReleaseReservationsBatchRequest, RepairObjectWriteReply,
     RepairObjectWriteRequest, ReportTargetFailureReply, ReportTargetFailureRequest,
-    ReservationMutation, ReserveObjectWriteWindowReply, ReserveObjectWriteWindowRequest,
-    ReserveReplacementPlacementRequest, ReserveStripeBatchRequest, ResolveObjectReadReply,
+    ReservationMutation, ReserveComputedPlacementReply, ReserveComputedPlacementRequest,
+    ReserveObjectWriteWindowReply, ReserveObjectWriteWindowRequest,
+    ReserveReplacementPlacementRequest, ReserveStripeBatchRequest, ResolveObjectHeadReply,
+    ResolveObjectHeadRequest, ResolveObjectReadReply,
     ResolveObjectReadRequest, ResolvePathReply, ResolvePathRequest, ResolveShardReply,
     ResolveShardRequest, RetireTargetReply, RetireTargetRequest, ServiceKind,
     SetTargetStateRequest, TargetGranule, TargetLifecycleState, WatchEntryReply, WatchEntryRequest,
@@ -988,12 +991,184 @@ impl Kms for KmsService {
         }))
     }
 
+    async fn get_cluster_config(
+        &self,
+        _request: Request<GetClusterConfigRequest>,
+    ) -> Result<Response<GetClusterConfigReply>, Status> {
+        // Cluster-wide constants a smart client fetches once to compute placement
+        // locally: the per-cluster salt (minted and owned by KMS) plus the current
+        // topology snapshot + epoch, proxied from KAS, the target-inventory authority.
+        let cluster_salt = self.hot_store.get_or_init_cluster_salt().await?;
+        let mut client = self.kas_channels.client();
+        let reply = timeout(self.kas_rpc_timeout, client.list_targets(ListTargetsRequest {}))
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded(format!(
+                    "KMS->KAS ListTargets timed out after {} ms",
+                    self.kas_rpc_timeout.as_millis()
+                ))
+            })??
+            .into_inner();
+        Ok(Response::new(GetClusterConfigReply {
+            cluster_salt,
+            topology_epoch: reply.topology_epoch,
+            targets: reply.targets,
+        }))
+    }
+
+    async fn reserve_computed_placement(
+        &self,
+        request: Request<ReserveComputedPlacementRequest>,
+    ) -> Result<Response<ReserveComputedPlacementReply>, Status> {
+        // The client computed this stripe's targets locally. Granule reservation is
+        // shard-local (one KAS leader owns one allocation shard), but computed placement
+        // spans the whole roster, so group the requested targets by their allocation
+        // shard and route a per-shard reservation to the KAS that owns it, then merge.
+        // Each per-shard reservation is TTL-reaped and committed-occupancy-protected.
+        let request = request.into_inner();
+        if request.target_ids.is_empty() {
+            return Err(Status::invalid_argument(
+                "ReserveComputedPlacement requires at least one target",
+            ));
+        }
+        let ec_profile = self
+            .hot_store
+            .get_bucket_write_context(request.bucket_id)
+            .await?
+            .ec_profile;
+
+        // target_id -> allocation_shard_id, from the live KAS roster.
+        let roster = {
+            let mut client = self.kas_channels.client();
+            timeout(self.kas_rpc_timeout, client.list_targets(ListTargetsRequest {}))
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded("KMS->KAS ListTargets timed out")
+                })??
+                .into_inner()
+                .targets
+        };
+        let shard_of: HashMap<String, String> = roster
+            .into_iter()
+            .map(|target| (target.target_id, target.allocation_shard_id))
+            .collect();
+        // allocation_shard_id -> KAS channel for that shard's leader.
+        let routes =
+            resolved_allocation_shard_routes(self.kas_channels.clone(), self.kas_rpc_timeout, None)
+                .await;
+        let shard_channel: HashMap<String, Channel> = routes
+            .into_iter()
+            .map(|route| (route.shard_id, route.channel))
+            .collect();
+
+        let mut by_shard: HashMap<String, Vec<String>> = HashMap::new();
+        for target_id in request.target_ids {
+            let shard = shard_of.get(&target_id).cloned().ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "target {target_id} is not in the KAS roster"
+                ))
+            })?;
+            by_shard.entry(shard).or_default().push(target_id);
+        }
+
+        let mut placements = Vec::new();
+        for (shard, targets) in by_shard {
+            let channel = shard_channel.get(&shard).cloned().ok_or_else(|| {
+                Status::failed_precondition(format!("no KAS route for allocation shard {shard}"))
+            })?;
+            let count = targets.len() as u32;
+            let mut client = KasClient::new(channel)
+                .max_decoding_message_size(KAS_GRPC_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(KAS_GRPC_MAX_MESSAGE_BYTES);
+            let reservation = timeout(
+                self.kas_rpc_timeout,
+                client.reserve_replacement_placement(ReserveReplacementPlacementRequest {
+                    reservation_id: format!("computed-{}", uuid::Uuid::new_v4()),
+                    replacement_count: count,
+                    failure_domain: ec_profile.failure_domain,
+                    excluded_target_ids: Vec::new(),
+                    reservation_ttl_ms: self.write_intent_ttl.as_millis() as u64,
+                    required_target_ids: targets,
+                }),
+            )
+            .await
+            .map_err(|_| {
+                Status::deadline_exceeded("KMS->KAS ReserveReplacementPlacement timed out")
+            })??
+            .into_inner()
+            .reservation
+            .ok_or_else(|| {
+                Status::resource_exhausted(format!(
+                    "allocator could not reserve computed placement in shard {shard}"
+                ))
+            })?;
+            placements.extend(reservation.placements);
+        }
+
+        Ok(Response::new(ReserveComputedPlacementReply {
+            reservation: Some(PlacementReservationRecord {
+                placements,
+                ..Default::default()
+            }),
+        }))
+    }
+
     async fn commit_object(
         &self,
-        _request: Request<CommitObjectRequest>,
+        request: Request<CommitObjectRequest>,
     ) -> Result<Response<CommitObjectReply>, Status> {
-        // Single-shot commit (manifest + per-target reverse log + CAS head flip) — not yet implemented.
-        Err(Status::unimplemented("KMS CommitObject is not yet implemented"))
+        // Single-shot commit: one transaction writes the manifest, the per-target
+        // reverse log, and CAS-flips the head (no central write-intent commit step).
+        let kind = RpcKind::CommitObject;
+        let started = Instant::now();
+        self.stats.record_request(kind);
+        let request = request.into_inner();
+        let manifest = request
+            .manifest
+            .ok_or_else(|| Status::invalid_argument("KMS CommitObject requires a manifest"))?;
+        let phase_started = Instant::now();
+        match self
+            .hot_store
+            .commit_object_single_shot(
+                request.expected_prior_version,
+                manifest.clone(),
+                request.parent_entry_id,
+                request.parent_path,
+                request.topology_epoch,
+                request.omit_manifest,
+            )
+            .await
+        {
+            Ok(head) => {
+                // The store writes the head/entry under the normalized key, and the
+                // read cache + watchers key on the canonical path, so invalidate and
+                // notify under the normalized key rather than the raw request key.
+                let key = normalize_object_key(&manifest.key).unwrap_or_else(|_| manifest.key.clone());
+                invalidate_local_object_cache(&self.read_cache, &manifest.bucket_id, &key);
+                self.notifications.notify(object_invalidation_event(
+                    &manifest.namespace_id,
+                    &manifest.bucket_id,
+                    &key,
+                    MetadataEventKind::ObjectHeadUpdated,
+                    &manifest.version_id,
+                ));
+                self.stats.record_phase(
+                    kind,
+                    "store_commit_object_single_shot",
+                    phase_started.elapsed(),
+                );
+                self.stats.record_success(kind, started.elapsed());
+                Ok(Response::new(CommitObjectReply { head: Some(head) }))
+            }
+            Err(err) => {
+                self.stats.record_phase(
+                    kind,
+                    "store_commit_object_single_shot",
+                    phase_started.elapsed(),
+                );
+                kms_err(&self.stats, kind, &started, err)
+            }
+        }
     }
 
     async fn commit_object_write(
@@ -1294,6 +1469,35 @@ impl Kms for KmsService {
                 kms_err(&self.stats, kind, &started, err)
             }
         }
+    }
+
+    async fn resolve_object_head(
+        &self,
+        request: Request<ResolveObjectHeadRequest>,
+    ) -> Result<Response<ResolveObjectHeadReply>, Status> {
+        // Head-only resolve: returns the object geometry (length + EC profile + topology
+        // epoch) so the decentralized read path reconstructs the fragment layout by
+        // computation, with no manifest fetch.
+        let request = request.into_inner();
+        let head = self
+            .hot_store
+            .get_object_head(request.bucket_id.clone(), request.key.clone())
+            .await?
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "object {}/{} has no head",
+                    request.bucket_id, request.key
+                ))
+            })?;
+        let ec_profile = self
+            .hot_store
+            .get_bucket_write_context(request.bucket_id)
+            .await?
+            .ec_profile;
+        Ok(Response::new(ResolveObjectHeadReply {
+            head: Some(head),
+            ec_profile: Some(ec_profile),
+        }))
     }
 
     async fn resolve_object_read(

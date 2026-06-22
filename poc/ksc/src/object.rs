@@ -8,12 +8,13 @@ use futures_util::StreamExt;
 use kee::{EcProfile as KeeProfile, FailureDomain as KeeFailureDomain, KeeEngine, PreparedEcPlan};
 use keinctl::proto::kms_client::KmsClient;
 use keinctl::proto::{
-    AbortObjectWriteRequest, BeginObjectRequest, CommitObjectWriteRequest,
+    AbortObjectWriteRequest, BeginObjectRequest, CommitObjectRequest, CommitObjectWriteRequest,
     CommitObjectWriteWindowRequest,
     DeleteObjectRequest, DeletedObjectVersion, EcProfile, FailureDomain, FragmentPlan, FragmentRef,
-    InitiateObjectWriteRequest, MetadataInvalidationEvent, ObjectVersionManifest,
-    RepairObjectWriteRequest, ReserveObjectWriteWindowRequest, ResolveObjectReadRequest,
-    WriteIntent,
+    GetClusterConfigRequest, InitiateObjectWriteRequest, MetadataInvalidationEvent, ObjectHead,
+    ObjectVersionManifest, RepairObjectWriteRequest, ReserveComputedPlacementRequest,
+    ReserveObjectWriteWindowRequest, ResolveObjectHeadRequest, ResolveObjectReadRequest,
+    StripeManifest, TargetRecord, WriteIntent,
 };
 use kp2::{
     ChunkId, ChunkRange, PackedReadQuery, PackedWriteEntry, PackedWriteRequest, WriteIdentity,
@@ -38,6 +39,8 @@ const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const TARGET_IO_TIMEOUT: Duration = Duration::from_secs(10);
 const TARGET_SAME_PLAN_RETRY_ATTEMPTS: usize = 2;
 const TARGET_SAME_PLAN_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const COMMIT_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(50);
+const COMMIT_RETRY_BACKOFF_CEILING: Duration = Duration::from_millis(500);
 /// Ceiling on how long a KP2 429 `Retry-After` (or computed exponential backoff)
 /// may stall a same-target retry. A misbehaving or hostile target cannot park a
 /// write task for longer than this.
@@ -204,6 +207,16 @@ pub struct ObjectPhaseTimes {
     pub target_payload_validate: Duration,
 }
 
+/// Cluster-wide constants a client fetches once to compute placement locally: the
+/// per-cluster salt (folded into computed chunk ids and placement weights) plus the
+/// current target snapshot and its content-derived topology epoch.
+#[derive(Clone, Debug)]
+pub struct ClusterConfig {
+    pub cluster_salt: Vec<u8>,
+    pub topology_epoch: u64,
+    pub targets: Vec<TargetRecord>,
+}
+
 pub struct ObjectClient {
     kms: KmsEndpointBalancer,
     target_sessions: HashMap<String, TargetSession>,
@@ -219,6 +232,14 @@ pub struct ObjectClient {
     session_options: TargetSessionOptions,
     write_window_max_stripes: usize,
     write_window_inflight_stripes: usize,
+    /// When set, object writes commit through the single-shot `CommitObject` path
+    /// (one KMS transaction: manifest + per-target reverse log + CAS head flip)
+    /// instead of the window/commit write-intent path. Create-only for now.
+    single_shot_commit: bool,
+    /// When set, the client computes fragment placement (HRW) + chunk ids locally from
+    /// the cluster config and reserves granules on the computed targets, instead of the
+    /// central window reserve. Implies `single_shot_commit`. Create-only for now.
+    decentralized: bool,
     /// Adaptive concurrency gate for fragment writes (KP2 429 backpressure).
     /// Shared (`Arc`) so the per-fragment write tasks spawned inside
     /// `write_prepared_stripe_batch_with_sessions` hold permits across the await.
@@ -457,6 +478,11 @@ pub struct ObjectClientOptions {
     pub read_payload_cache_max_object_bytes: usize,
     pub metadata_notification_nats_url: Option<String>,
     pub metadata_notification_subject: String,
+    /// Opt into the single-shot `CommitObject` write path (default off).
+    pub single_shot_commit: bool,
+    /// Opt into computed (decentralized) placement + chunk ids (default off; implies
+    /// single-shot commit).
+    pub decentralized: bool,
 }
 
 impl Default for ObjectClientOptions {
@@ -473,6 +499,8 @@ impl Default for ObjectClientOptions {
             read_payload_cache_max_object_bytes: DEFAULT_READ_PAYLOAD_CACHE_MAX_OBJECT_BYTES,
             metadata_notification_nats_url: None,
             metadata_notification_subject: DEFAULT_METADATA_NOTIFICATION_SUBJECT.to_string(),
+            single_shot_commit: false,
+            decentralized: false,
         }
     }
 }
@@ -505,6 +533,8 @@ impl ObjectClientOptions {
             } else {
                 self.metadata_notification_subject.trim().to_string()
             },
+            single_shot_commit: self.single_shot_commit,
+            decentralized: self.decentralized,
         }
     }
 }
@@ -802,6 +832,8 @@ impl ObjectClient {
             session_options,
             write_window_max_stripes: options.write_window_max_stripes,
             write_window_inflight_stripes: options.write_window_inflight_stripes,
+            single_shot_commit: options.single_shot_commit,
+            decentralized: options.decentralized,
             write_inflight_limiter: Arc::new(AdaptiveWriteLimiter::new(
                 options.write_window_inflight_stripes,
             )),
@@ -821,6 +853,85 @@ impl ObjectClient {
         let mut client = Self::connect_with_options(kms_endpoints, options).await?;
         client.shared_shard_freelists = Some(shared_shard_freelists);
         Ok(client)
+    }
+
+    /// Resolves an object for reading, returning a manifest + EC profile. On the
+    /// decentralized path it fetches only the head and RECONSTRUCTS the fragment layout
+    /// by computation (placement + chunk ids); otherwise it fetches the stored manifest.
+    async fn resolve_for_read(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+    ) -> Result<(ObjectVersionManifest, EcProfile), ObjectError> {
+        if self.decentralized {
+            return self.resolve_decentralized_read(bucket_id, key).await;
+        }
+        let mut kms = self.kms.client();
+        let resolved = control_rpc(
+            "KMS ResolveObjectRead",
+            kms.resolve_object_read(ResolveObjectReadRequest {
+                bucket_id: bucket_id.to_string(),
+                key: key.to_string(),
+            }),
+        )
+        .await?
+        .into_inner();
+        let manifest = resolved.manifest.ok_or_else(|| {
+            ObjectError::Metadata("KMS ResolveObjectRead did not return manifest".to_string())
+        })?;
+        let ec_profile = resolved.ec_profile.ok_or_else(|| {
+            ObjectError::Metadata("KMS ResolveObjectRead did not return ec_profile".to_string())
+        })?;
+        Ok((manifest, ec_profile))
+    }
+
+    /// Decentralized resolve: fetch only the head (object geometry), then reconstruct the
+    /// fragment layout locally from computed placement + chunk ids — no manifest is read.
+    async fn resolve_decentralized_read(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+    ) -> Result<(ObjectVersionManifest, EcProfile), ObjectError> {
+        let resolved = {
+            let mut kms = self.kms.client();
+            control_rpc(
+                "KMS ResolveObjectHead",
+                kms.resolve_object_head(ResolveObjectHeadRequest {
+                    bucket_id: bucket_id.to_string(),
+                    key: key.to_string(),
+                }),
+            )
+            .await?
+            .into_inner()
+        };
+        let head = resolved.head.ok_or_else(|| {
+            ObjectError::Metadata("KMS ResolveObjectHead did not return a head".to_string())
+        })?;
+        let ec_profile = resolved.ec_profile.ok_or_else(|| {
+            ObjectError::Metadata("KMS ResolveObjectHead did not return ec_profile".to_string())
+        })?;
+        let cluster = self.fetch_cluster_config().await?;
+        let manifest =
+            reconstruct_manifest_from_head(bucket_id, key, &head, &ec_profile, &cluster)?;
+        Ok((manifest, ec_profile))
+    }
+
+    /// Fetches the cluster-wide placement constants (salt + topology snapshot + epoch).
+    /// A smart client fetches this once on connect and computes fragment placement and
+    /// chunk ids locally from it, with no per-object metadata round trip.
+    pub async fn fetch_cluster_config(&mut self) -> Result<ClusterConfig, ObjectError> {
+        let mut kms = self.kms.client();
+        let reply = control_rpc(
+            "KMS GetClusterConfig",
+            kms.get_cluster_config(GetClusterConfigRequest {}),
+        )
+        .await?
+        .into_inner();
+        Ok(ClusterConfig {
+            cluster_salt: reply.cluster_salt,
+            topology_epoch: reply.topology_epoch,
+            targets: reply.targets,
+        })
     }
 
     pub async fn put_object_single_stripe(
@@ -979,12 +1090,117 @@ impl ObjectClient {
             initial_window_stripe_count = fragment_window_stripe_count(&initial_window_plans);
         }
 
+        let decentralized = self.decentralized;
+        let single_shot = self.single_shot_commit || decentralized;
+        // The decentralized path computes placement + chunk ids locally from the cluster
+        // config (salt, topology epoch, target roster) instead of the central reserve.
+        let cluster_placement = if decentralized {
+            let cfg = self.fetch_cluster_config().await?;
+            let targets = cfg
+                .targets
+                .iter()
+                .map(keinctl::placement::PlacementTarget::from_record)
+                .collect::<Vec<_>>();
+            let failure_domain = FailureDomain::try_from(ec_profile.failure_domain)
+                .unwrap_or(FailureDomain::Unspecified);
+            Some((cfg.cluster_salt, cfg.topology_epoch, targets, failure_domain))
+        } else {
+            None
+        };
+
         let result = async {
+            // Single-shot path: accumulate the placement that actually won for every
+            // fragment (the reservation plan, overlaid with the repaired plan if a
+            // fragment was relocated). Keyed by (stripe, fragment); the final entry is
+            // the durable on-media location, since the target stores each fragment at
+            // exactly the requested granule/generation. Empty (and unused) on the
+            // window/commit write-intent path.
+            let mut single_shot_plans: HashMap<(u32, u32), FragmentPlan> = HashMap::new();
             let mut window_start = 0usize;
             while window_start < stripe_count {
                 let default_window_stripe_count = (stripe_count - window_start)
                     .min(self.write_window_max_stripes);
-                let (window_stripe_count, window_plans) = if window_start == 0
+                let (window_stripe_count, window_plans) = if let Some((
+                    salt,
+                    _epoch,
+                    placement_targets,
+                    failure_domain,
+                )) = cluster_placement.as_ref()
+                {
+                    // Compute each stripe's targets (HRW) + chunk ids locally, then reserve
+                    // a granule on exactly those targets. No central window reserve, and the
+                    // placement is reproducible by a reader from the same cluster config.
+                    let count = default_window_stripe_count;
+                    let fragments_per_stripe =
+                        (ec_profile.data_fragments + ec_profile.parity_fragments) as usize;
+                    let no_excluded = std::collections::HashSet::new();
+                    let mut plans = Vec::with_capacity(count.saturating_mul(fragments_per_stripe));
+                    for offset in 0..count {
+                        let stripe_index = (window_start + offset) as u32;
+                        let stripe_targets = keinctl::placement::place_stripe(
+                            salt,
+                            object_id,
+                            object_version as u16,
+                            stripe_index,
+                            fragments_per_stripe,
+                            *failure_domain,
+                            placement_targets,
+                            &no_excluded,
+                        )
+                        .map_err(|err| {
+                            ObjectError::Metadata(format!(
+                                "computed placement failed for {}/{} stripe {}: {}",
+                                bucket_id, key, stripe_index, err
+                            ))
+                        })?;
+                        let phase_started = Instant::now();
+                        let reservation = control_rpc(
+                            "KMS ReserveComputedPlacement",
+                            kms.reserve_computed_placement(ReserveComputedPlacementRequest {
+                                bucket_id: bucket_id.to_string(),
+                                target_ids: stripe_targets.clone(),
+                            }),
+                        )
+                        .await?
+                        .into_inner()
+                        .reservation
+                        .ok_or_else(|| {
+                            ObjectError::Metadata(
+                                "KMS ReserveComputedPlacement returned no reservation".to_string(),
+                            )
+                        })?;
+                        phases.kms_initiate += phase_started.elapsed();
+                        for (fragment_index, target_id) in stripe_targets.iter().enumerate() {
+                            let placement = reservation
+                                .placements
+                                .iter()
+                                .find(|placement| &placement.target_id == target_id)
+                                .ok_or_else(|| {
+                                    ObjectError::Metadata(format!(
+                                        "ReserveComputedPlacement reservation is missing target {target_id}"
+                                    ))
+                                })?;
+                            plans.push(FragmentPlan {
+                                fragment_index: fragment_index as u32,
+                                chunk_id: ChunkId::for_fragment(
+                                    salt,
+                                    object_id,
+                                    object_version as u16,
+                                    stripe_index as u16,
+                                    fragment_index as u16,
+                                )
+                                .0
+                                .to_vec(),
+                                target_id: target_id.clone(),
+                                endpoint: placement.endpoint.clone(),
+                                granule_index: placement.granule_index,
+                                generation: 0,
+                                stripe_index,
+                            });
+                        }
+                    }
+                    (count, plans)
+                } else if window_start == 0
                     && initial_window_stripe_count > 0
                     && !initial_window_plans.is_empty()
                 {
@@ -1007,6 +1223,12 @@ impl ObjectClient {
                     phases.kms_initiate += phase_started.elapsed();
                     (default_window_stripe_count, reserved.fragment_plans)
                 };
+                if single_shot {
+                    for plan in &window_plans {
+                        single_shot_plans
+                            .insert((plan.stripe_index, plan.fragment_index), plan.clone());
+                    }
+                }
                 // Producer/consumer pipeline: the CPU-bound EC encode of the next
                 // inflight batch (off the tokio runtime via spawn_blocking) overlaps
                 // the network fragment writes of the current batch, instead of the
@@ -1111,7 +1333,13 @@ impl ObjectClient {
                         }
 
                         if !write_failures.is_empty() {
-                            if write_failures.len() > ec_profile.parity_fragments as usize {
+                            // Cross-target repair (RepairObjectWrite) reassigns via the
+                            // central write-intent, which does not know the decentralized
+                            // computed placement, so the decentralized path aborts instead
+                            // of repairing (CRUSH-fallback repair is a later step).
+                            if decentralized
+                                || write_failures.len() > ec_profile.parity_fragments as usize
+                            {
                                 let _ = kms
                                     .abort_object_write(AbortObjectWriteRequest {
                                         intent_id: intent.intent_id.clone(),
@@ -1173,6 +1401,17 @@ impl ObjectClient {
                                         })
                                 })
                                 .collect::<Result<Vec<_>, _>>()?;
+                            if single_shot {
+                                // Repair relocates the failed fragments to fresh
+                                // placement; record it so the manifest names where the
+                                // bytes actually landed, not the abandoned original.
+                                for plan in &retry_plans {
+                                    single_shot_plans.insert(
+                                        (plan.stripe_index, plan.fragment_index),
+                                        plan.clone(),
+                                    );
+                                }
+                            }
                             let phase_started = Instant::now();
                             self.ensure_target_sessions(&retry_plans).await?;
                             phases.target_connect += phase_started.elapsed();
@@ -1234,39 +1473,117 @@ impl ObjectClient {
                     stripe_offset += stripe_batch_len;
                 }
 
-                let phase_started = Instant::now();
-                control_rpc(
-                    "KMS CommitObjectWriteWindow",
-                    kms.commit_object_write_window(CommitObjectWriteWindowRequest {
-                        intent_id: intent.intent_id.clone(),
-                        successful_fragments: window_plans
-                            .iter()
-                            .map(|plan| FragmentRef {
-                                stripe_index: plan.stripe_index,
-                                fragment_index: plan.fragment_index,
-                            })
-                            .collect(),
-                    }),
-                )
-                .await?;
-                phases.kms_commit += phase_started.elapsed();
+                if !single_shot {
+                    // The single-shot path commits the whole object once at the end
+                    // (no per-window write-intent progression), so skip this RPC.
+                    let phase_started = Instant::now();
+                    control_rpc(
+                        "KMS CommitObjectWriteWindow",
+                        kms.commit_object_write_window(CommitObjectWriteWindowRequest {
+                            intent_id: intent.intent_id.clone(),
+                            successful_fragments: window_plans
+                                .iter()
+                                .map(|plan| FragmentRef {
+                                    stripe_index: plan.stripe_index,
+                                    fragment_index: plan.fragment_index,
+                                })
+                                .collect(),
+                        }),
+                    )
+                    .await?;
+                    phases.kms_commit += phase_started.elapsed();
+                }
                 window_start += window_stripe_count;
             }
 
             let phase_started = Instant::now();
-            let committed = control_rpc(
-                "KMS CommitObjectWrite",
-                kms.commit_object_write(CommitObjectWriteRequest {
-                    intent_id: intent.intent_id.clone(),
-                    successful_fragments: Vec::new(),
-                }),
-            )
-            .await?
-            .into_inner();
+            let manifest = if single_shot {
+                // Assemble the manifest from the placement that won for every
+                // fragment, then commit it in a single KMS transaction.
+                let fragments_per_stripe =
+                    (ec_profile.data_fragments + ec_profile.parity_fragments) as usize;
+                let mut stripes: Vec<StripeManifest> = (0..stripe_count)
+                    .map(|_| StripeManifest {
+                        fragments: Vec::new(),
+                    })
+                    .collect();
+                for ((stripe_index, _fragment_index), plan) in single_shot_plans.drain() {
+                    let stripe = stripes.get_mut(stripe_index as usize).ok_or_else(|| {
+                        ObjectError::Metadata(format!(
+                            "single-shot commit references missing stripe {} for {}/{}",
+                            stripe_index, bucket_id, key
+                        ))
+                    })?;
+                    stripe.fragments.push(plan);
+                }
+                for (stripe_index, stripe) in stripes.iter_mut().enumerate() {
+                    stripe
+                        .fragments
+                        .sort_unstable_by_key(|plan| plan.fragment_index);
+                    if stripe.fragments.len() != fragments_per_stripe {
+                        return Err(ObjectError::Metadata(format!(
+                            "single-shot commit assembled {} of {} fragments for stripe {} of {}/{}",
+                            stripe.fragments.len(),
+                            fragments_per_stripe,
+                            stripe_index,
+                            bucket_id,
+                            key
+                        )));
+                    }
+                }
+                // Deterministic version id makes the commit idempotent under retry.
+                let manifest = ObjectVersionManifest {
+                    version_id: format!("{object_id}:{object_version}"),
+                    bucket_id: bucket_id.to_string(),
+                    key: key.to_string(),
+                    logical_length_bytes,
+                    ec_profile_id: profile_id.clone(),
+                    stripes,
+                    namespace_id: intent.namespace_id.clone(),
+                    object_entry_id: intent.object_entry_id.clone(),
+                    bucket_entry_id: intent.bucket_entry_id.clone(),
+                };
+                let expected_prior_version = object_version.saturating_sub(1);
+                // The fragment bytes are already durable; this only flips metadata,
+                // so the helper retries transport failures idempotently and never
+                // rewrites data.
+                let _head = commit_object_single_shot_rpc(
+                    &mut kms,
+                    object_id,
+                    object_version,
+                    expected_prior_version,
+                    &manifest,
+                    &intent.parent_entry_id,
+                    &intent.parent_path,
+                    // Decentralized writes record the placement epoch they computed
+                    // against; the centrally-reserved single-shot path records none.
+                    cluster_placement
+                        .as_ref()
+                        .map(|(_, epoch, _, _)| *epoch)
+                        .unwrap_or(0),
+                    // Decentralized objects persist no manifest blob (reads recompute the
+                    // layout); the manifest-backed single-shot path keeps the manifest.
+                    decentralized,
+                )
+                .await?;
+                manifest
+            } else {
+                let committed = control_rpc(
+                    "KMS CommitObjectWrite",
+                    kms.commit_object_write(CommitObjectWriteRequest {
+                        intent_id: intent.intent_id.clone(),
+                        successful_fragments: Vec::new(),
+                    }),
+                )
+                .await?
+                .into_inner();
+                committed.manifest.ok_or_else(|| {
+                    ObjectError::Metadata(
+                        "KMS CommitObjectWrite did not return manifest".to_string(),
+                    )
+                })?
+            };
             phases.kms_commit += phase_started.elapsed();
-            let manifest = committed.manifest.ok_or_else(|| {
-                ObjectError::Metadata("KMS CommitObjectWrite did not return manifest".to_string())
-            })?;
             self.cache_resolved_read(manifest.clone(), ec_profile.clone());
             Ok(ObjectPutResult {
                 intent,
@@ -1396,23 +1713,8 @@ impl ObjectClient {
             cached
         } else {
             let phase_started = Instant::now();
-            let mut kms = self.kms.client();
-            let resolved = control_rpc(
-                "KMS ResolveObjectRead",
-                kms.resolve_object_read(ResolveObjectReadRequest {
-                    bucket_id: bucket_id.to_string(),
-                    key: key.to_string(),
-                }),
-            )
-            .await?
-            .into_inner();
+            let (manifest, ec_profile) = self.resolve_for_read(bucket_id, key).await?;
             phases.kms_resolve = phase_started.elapsed();
-            let manifest = resolved.manifest.ok_or_else(|| {
-                ObjectError::Metadata("KMS ResolveObjectRead did not return manifest".to_string())
-            })?;
-            let ec_profile = resolved.ec_profile.ok_or_else(|| {
-                ObjectError::Metadata("KMS ResolveObjectRead did not return ec_profile".to_string())
-            })?;
             self.cache_resolved_read(manifest.clone(), ec_profile.clone());
             (manifest, ec_profile)
         };
@@ -1534,23 +1836,8 @@ impl ObjectClient {
             cached
         } else {
             let phase_started = Instant::now();
-            let mut kms = self.kms.client();
-            let resolved = control_rpc(
-                "KMS ResolveObjectRead",
-                kms.resolve_object_read(ResolveObjectReadRequest {
-                    bucket_id: bucket_id.to_string(),
-                    key: key.to_string(),
-                }),
-            )
-            .await?
-            .into_inner();
+            let (manifest, ec_profile) = self.resolve_for_read(bucket_id, key).await?;
             phases.kms_resolve = phase_started.elapsed();
-            let manifest = resolved.manifest.ok_or_else(|| {
-                ObjectError::Metadata("KMS ResolveObjectRead did not return manifest".to_string())
-            })?;
-            let ec_profile = resolved.ec_profile.ok_or_else(|| {
-                ObjectError::Metadata("KMS ResolveObjectRead did not return ec_profile".to_string())
-            })?;
             self.cache_resolved_read(manifest.clone(), ec_profile.clone());
             (manifest, ec_profile)
         };
@@ -3767,6 +4054,114 @@ fn global_target_sessions() -> Arc<tokio::sync::Mutex<HashMap<String, TargetSess
         .clone()
 }
 
+/// Parses a decentralized version id of the form `"{object_id}:{version}"` back into
+/// `(object_id, object_version)`. The version is narrowed to u16 to match the on-media
+/// identity and the placement/chunk-id derivation used at write time.
+fn parse_version_id(version_id: &str) -> Result<(u32, u16), ObjectError> {
+    let (object_id, version) = version_id.split_once(':').ok_or_else(|| {
+        ObjectError::Metadata(format!(
+            "version id {version_id} is not in object_id:version form (not a decentralized object?)"
+        ))
+    })?;
+    let object_id = object_id.parse::<u32>().map_err(|_| {
+        ObjectError::Metadata(format!("version id {version_id} has a non-numeric object id"))
+    })?;
+    let version = version.parse::<u32>().map_err(|_| {
+        ObjectError::Metadata(format!("version id {version_id} has a non-numeric version"))
+    })?;
+    Ok((object_id, version as u16))
+}
+
+/// Reconstructs the object manifest from the head + cluster config by COMPUTING the
+/// fragment layout (HRW placement + chunk ids) — the read-side mirror of the
+/// decentralized write. `granule_index` is left 0: reads resolve a fragment by its chunk
+/// id, so the granule (a write-time placement detail) is not needed to read it back.
+fn reconstruct_manifest_from_head(
+    bucket_id: &str,
+    key: &str,
+    head: &ObjectHead,
+    ec_profile: &EcProfile,
+    cluster: &ClusterConfig,
+) -> Result<ObjectVersionManifest, ObjectError> {
+    let (object_id, object_version) = parse_version_id(&head.current_version_id)?;
+    let salt = cluster.cluster_salt.as_slice();
+    let placement_targets = cluster
+        .targets
+        .iter()
+        .map(keinctl::placement::PlacementTarget::from_record)
+        .collect::<Vec<_>>();
+    let endpoint_by_target: HashMap<&str, &str> = cluster
+        .targets
+        .iter()
+        .map(|target| (target.target_id.as_str(), target.endpoint.as_str()))
+        .collect();
+    let failure_domain =
+        FailureDomain::try_from(ec_profile.failure_domain).unwrap_or(FailureDomain::Unspecified);
+    let fragments_per_stripe = (ec_profile.data_fragments + ec_profile.parity_fragments) as usize;
+    let stripe_logical = stripe_logical_bytes(ec_profile)?;
+    let stripe_count = if head.logical_length_bytes == 0 || stripe_logical == 0 {
+        0
+    } else {
+        (head.logical_length_bytes as usize).div_ceil(stripe_logical)
+    };
+    let no_excluded = std::collections::HashSet::new();
+    let mut stripes = Vec::with_capacity(stripe_count);
+    for stripe_index in 0..stripe_count as u32 {
+        let targets = keinctl::placement::place_stripe(
+            salt,
+            object_id,
+            object_version,
+            stripe_index,
+            fragments_per_stripe,
+            failure_domain,
+            &placement_targets,
+            &no_excluded,
+        )
+        .map_err(|err| {
+            ObjectError::Metadata(format!(
+                "computed placement failed for {bucket_id}/{key} stripe {stripe_index}: {err}"
+            ))
+        })?;
+        let mut fragments = Vec::with_capacity(fragments_per_stripe);
+        for (fragment_index, target_id) in targets.iter().enumerate() {
+            let endpoint = endpoint_by_target.get(target_id.as_str()).ok_or_else(|| {
+                ObjectError::Metadata(format!(
+                    "cluster config has no endpoint for computed target {target_id}"
+                ))
+            })?;
+            fragments.push(FragmentPlan {
+                fragment_index: fragment_index as u32,
+                chunk_id: ChunkId::for_fragment(
+                    salt,
+                    object_id,
+                    object_version,
+                    stripe_index as u16,
+                    fragment_index as u16,
+                )
+                .0
+                .to_vec(),
+                target_id: target_id.clone(),
+                endpoint: (*endpoint).to_string(),
+                granule_index: 0,
+                generation: 0,
+                stripe_index,
+            });
+        }
+        stripes.push(StripeManifest { fragments });
+    }
+    Ok(ObjectVersionManifest {
+        version_id: head.current_version_id.clone(),
+        bucket_id: bucket_id.to_string(),
+        key: key.to_string(),
+        logical_length_bytes: head.logical_length_bytes,
+        ec_profile_id: head.ec_profile_id.clone(),
+        stripes,
+        namespace_id: String::new(),
+        object_entry_id: head.object_entry_id.clone(),
+        bucket_entry_id: String::new(),
+    })
+}
+
 async fn control_rpc<T, F>(label: &str, future: F) -> Result<T, ObjectError>
 where
     F: Future<Output = Result<T, tonic::Status>>,
@@ -3781,6 +4176,77 @@ where
             ))
         })?
         .map_err(ObjectError::from)
+}
+
+/// Commits a freshly-written object through the single-shot `CommitObject` RPC.
+///
+/// The commit only writes metadata (the fragment bytes are already durable on the
+/// targets), and the server side is idempotent: a retry whose own version already
+/// won returns OK. So a transport failure is retried by re-issuing the identical
+/// request — it never double-commits or rewrites fragment data. A
+/// `FailedPrecondition` is terminal: the object already exists, or another writer
+/// won the create race; retrying cannot change that.
+async fn commit_object_single_shot_rpc(
+    kms: &mut KmsClient<Channel>,
+    object_id: u32,
+    object_version: u32,
+    expected_prior_version: u32,
+    manifest: &ObjectVersionManifest,
+    parent_entry_id: &str,
+    parent_path: &str,
+    topology_epoch: u64,
+    omit_manifest: bool,
+) -> Result<ObjectHead, ObjectError> {
+    const MAX_ATTEMPTS: usize = 3;
+    let mut last_err: Option<ObjectError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let request = CommitObjectRequest {
+            object_id,
+            namespace_id: manifest.namespace_id.clone(),
+            bucket_id: manifest.bucket_id.clone(),
+            key: manifest.key.clone(),
+            version: object_version,
+            manifest: Some(manifest.clone()),
+            expected_prior_version,
+            parent_entry_id: parent_entry_id.to_string(),
+            parent_path: parent_path.to_string(),
+            topology_epoch,
+            omit_manifest,
+        };
+        match timeout(CONTROL_RPC_TIMEOUT, kms.commit_object(request)).await {
+            Ok(Ok(response)) => {
+                return response.into_inner().head.ok_or_else(|| {
+                    ObjectError::Metadata(
+                        "KMS CommitObject did not return an object head".to_string(),
+                    )
+                });
+            }
+            Ok(Err(status)) => {
+                if status.code() == tonic::Code::FailedPrecondition {
+                    return Err(ObjectError::from(status));
+                }
+                last_err = Some(ObjectError::from(status));
+            }
+            Err(_) => {
+                last_err = Some(ObjectError::Transport(format!(
+                    "KMS CommitObject timed out after {} ms",
+                    CONTROL_RPC_TIMEOUT.as_millis()
+                )));
+            }
+        }
+        // Back off before re-issuing so a briefly unavailable/overloaded KMS is not
+        // hammered with back-to-back attempts. Capped exponential, matching the
+        // data-plane retry convention.
+        if attempt + 1 < MAX_ATTEMPTS {
+            let backoff = COMMIT_RETRY_BASE_BACKOFF
+                .saturating_mul(1u32 << attempt)
+                .min(COMMIT_RETRY_BACKOFF_CEILING);
+            sleep(backoff).await;
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        ObjectError::Transport("KMS CommitObject exhausted retries".to_string())
+    }))
 }
 
 async fn data_rpc<T, F>(
@@ -3901,6 +4367,8 @@ mod tests {
             session_options: TargetSessionOptions::default(),
             write_window_max_stripes: 1,
             write_window_inflight_stripes: 1,
+            single_shot_commit: false,
+            decentralized: false,
             write_inflight_limiter: Arc::new(AdaptiveWriteLimiter::new(1)),
         }
     }

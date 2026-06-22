@@ -22,6 +22,8 @@ const PREFIX_MAINTENANCE_MARKER: u8 = 13;
 const PREFIX_NAMESPACE_PATH: u8 = 14;
 const PREFIX_OBJECT_ID_COUNTER: u8 = 15;
 const PREFIX_TARGET_REVERSE_LOG: u8 = 16;
+// 17 is reserved for the per-object write lease.
+const PREFIX_CLUSTER_CONFIG: u8 = 18;
 
 pub(crate) fn bucket_context_key(bucket_id: &str) -> Vec<u8> {
     encode_key(PREFIX_BUCKET_CONTEXT, &[bucket_id])
@@ -30,6 +32,12 @@ pub(crate) fn bucket_context_key(bucket_id: &str) -> Vec<u8> {
 /// Singleton key for the globally-monotonic object_id counter.
 pub(crate) fn object_id_counter_key() -> Vec<u8> {
     encode_key(PREFIX_OBJECT_ID_COUNTER, &["object-id"])
+}
+
+/// Singleton key for the per-cluster salt folded into computed chunk ids and
+/// placement weights. Minted once and never rewritten.
+pub(crate) fn cluster_salt_key() -> Vec<u8> {
+    encode_key(PREFIX_CLUSTER_CONFIG, &["chunk-id-salt"])
 }
 
 pub(crate) fn write_intent_key(intent_id: &str) -> Vec<u8> {

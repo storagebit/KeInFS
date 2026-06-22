@@ -334,10 +334,20 @@ impl Kas for KasService {
         let phase_started = Instant::now();
         match self.store.list_targets().await {
             Ok(targets) => {
+                // Content-derived epoch of the placement-relevant roster, so a client
+                // computing placement can tell whether its snapshot is still current.
+                let placement_targets = targets
+                    .iter()
+                    .map(keinctl::placement::PlacementTarget::from_record)
+                    .collect::<Vec<_>>();
+                let topology_epoch = keinctl::placement::topology_epoch(&placement_targets);
                 self.stats
                     .record_phase(kind, "store_list_targets", phase_started.elapsed());
                 self.stats.record_success(kind, started.elapsed());
-                Ok(Response::new(ListTargetsReply { targets }))
+                Ok(Response::new(ListTargetsReply {
+                    targets,
+                    topology_epoch,
+                }))
             }
             Err(err) => {
                 self.stats

@@ -6,8 +6,8 @@ use crate::store::{
     ReservedObjectWriteWindow, TimedStoreResult,
 };
 use keinctl::proto::{
-    EcProfile, FragmentRef, ObjectVersionManifest, PlacementReservationRecord, WriteIntent,
-    WriteIntentState,
+    EcProfile, FragmentRef, ObjectHead, ObjectVersionManifest, PlacementReservationRecord,
+    WriteIntent, WriteIntentState,
 };
 use tonic::Status;
 
@@ -53,6 +53,40 @@ pub(crate) trait HotMetadataStore: Send + Sync {
         successful_fragments: Vec<FragmentRef>,
         finalization_sweep_after_ms: u64,
     ) -> Result<TimedStoreResult<CommittedObjectWrite>, Status>;
+
+    /// Commits a freshly-written object in a single transaction: stores the
+    /// manifest, appends the per-target reverse log, retains the committed-occupancy
+    /// markers + secondary index, writes the namespace entry, and CAS-flips the head
+    /// from `expected_prior_version` to `expected_prior_version + 1`. Create-only:
+    /// refuses to overwrite an existing object. Idempotent under retry — a commit
+    /// whose own version already won returns that head. The caller resolves and
+    /// auto-creates the parent directory up front and passes it via
+    /// `parent_entry_id`/`parent_path`.
+    async fn commit_object_single_shot(
+        &self,
+        expected_prior_version: u32,
+        manifest: ObjectVersionManifest,
+        parent_entry_id: String,
+        parent_path: String,
+        topology_epoch: u64,
+        omit_manifest: bool,
+    ) -> Result<ObjectHead, Status>;
+
+    /// Returns the per-cluster salt, minting a fresh random one on first call and
+    /// persisting it so every subsequent call — on any KMS instance — returns the same
+    /// bytes. The salt scopes computed chunk ids and placement weights to this cluster
+    /// and is stable for its lifetime.
+    async fn get_or_init_cluster_salt(&self) -> Result<Vec<u8>, Status>;
+
+    /// Returns the object head for `(bucket_id, key_path)`, or None if absent. The
+    /// decentralized read path uses this to get the object geometry (length + EC profile
+    /// id + topology epoch) and then reconstructs the fragment layout by computation,
+    /// instead of fetching a manifest.
+    async fn get_object_head(
+        &self,
+        bucket_id: String,
+        key_path: String,
+    ) -> Result<Option<ObjectHead>, Status>;
 
     async fn abort_object_write(
         &self,

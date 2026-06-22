@@ -74,6 +74,8 @@ pub(crate) struct ObjectPutConfig {
     pub(crate) kms_grpc_max_message_bytes: usize,
     pub(crate) metadata_notification_nats_url: Option<String>,
     pub(crate) metadata_notification_subject: String,
+    pub(crate) single_shot_commit: bool,
+    pub(crate) decentralized: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +91,9 @@ pub(crate) struct ObjectGetConfig {
     /// Byte-granular range read: fetch only `[range_offset, range_offset+range_length)`.
     pub(crate) range_offset: Option<u64>,
     pub(crate) range_length: Option<u64>,
+    /// Resolve via the decentralized read path (head + computed layout) instead of the
+    /// stored manifest. Required for objects written with `--decentralized`.
+    pub(crate) decentralized: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -564,6 +569,8 @@ fn parse_put_object_args(args: &[String]) -> Result<ObjectPutConfig, Box<dyn Err
     let mut kms_grpc_max_message_bytes = DEFAULT_KMS_GRPC_MAX_MESSAGE_BYTES;
     let mut metadata_notification_nats_url = None;
     let mut metadata_notification_subject = DEFAULT_METADATA_NOTIFICATION_SUBJECT.to_string();
+    let mut single_shot_commit = false;
+    let mut decentralized = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -636,6 +643,12 @@ fn parse_put_object_args(args: &[String]) -> Result<ObjectPutConfig, Box<dyn Err
                     .ok_or_else(|| missing_value("--metadata-notification-subject"))?
                     .clone();
             }
+            "--single-shot-commit" => {
+                single_shot_commit = true;
+            }
+            "--decentralized" => {
+                decentralized = true;
+            }
             "--help" | "-h" => return Err(arg_error(put_object_usage())),
             other => {
                 return Err(arg_error(format!(
@@ -671,6 +684,8 @@ fn parse_put_object_args(args: &[String]) -> Result<ObjectPutConfig, Box<dyn Err
         kms_grpc_max_message_bytes,
         metadata_notification_nats_url,
         metadata_notification_subject,
+        single_shot_commit,
+        decentralized,
     })
 }
 
@@ -682,6 +697,7 @@ fn parse_get_object_args(args: &[String]) -> Result<ObjectGetConfig, Box<dyn Err
     let mut read_completion_mode = CompletionMode::Interrupt;
     let mut range_offset: Option<u64> = None;
     let mut range_length: Option<u64> = None;
+    let mut decentralized = false;
     let mut kms_grpc_max_message_bytes = DEFAULT_KMS_GRPC_MAX_MESSAGE_BYTES;
     let mut metadata_notification_nats_url = None;
     let mut metadata_notification_subject = DEFAULT_METADATA_NOTIFICATION_SUBJECT.to_string();
@@ -759,6 +775,9 @@ fn parse_get_object_args(args: &[String]) -> Result<ObjectGetConfig, Box<dyn Err
                     .ok_or_else(|| missing_value("--metadata-notification-subject"))?
                     .clone();
             }
+            "--decentralized" => {
+                decentralized = true;
+            }
             "--help" | "-h" => return Err(arg_error(get_object_usage())),
             other => {
                 return Err(arg_error(format!(
@@ -788,6 +807,7 @@ fn parse_get_object_args(args: &[String]) -> Result<ObjectGetConfig, Box<dyn Err
         metadata_notification_subject,
         range_offset,
         range_length,
+        decentralized,
     })
 }
 
@@ -1374,6 +1394,25 @@ mod tests {
         assert_eq!(config.write_window_max_stripes, 8192);
         assert_eq!(config.write_window_inflight_stripes, 64);
         assert_eq!(config.kms_grpc_max_message_bytes, 268435456);
+        assert!(!config.single_shot_commit);
+    }
+
+    #[test]
+    fn put_object_single_shot_commit_flag_opts_in() {
+        let command = parse_ok(&[
+            "put-object",
+            "--bucket",
+            "lab-8p2",
+            "--key",
+            "smoke/new1",
+            "--input",
+            "/tmp/input.bin",
+            "--single-shot-commit",
+        ]);
+        let Command::PutObject(config) = command else {
+            panic!("expected put-object command");
+        };
+        assert!(config.single_shot_commit);
     }
 
     #[test]
@@ -1468,6 +1507,8 @@ fn put_object_usage() -> &'static str {
         "  --kms-grpc-max-message-bytes <n> control-plane gRPC message cap, default 134217728\n",
         "  --metadata-notification-nats-url <uri> subscribe to KMS invalidation events via NATS\n",
         "  --metadata-notification-subject <name> NATS subject for invalidations, default keinfs.kms.events\n",
+        "  --single-shot-commit  commit via the single-shot CommitObject path (create-only), default off\n",
+        "  --decentralized       compute placement + chunk ids client-side (implies single-shot), default off\n",
     )
 }
 
@@ -1482,6 +1523,7 @@ fn get_object_usage() -> &'static str {
         "  --kms-grpc-max-message-bytes <n> control-plane gRPC message cap, default 134217728\n",
         "  --metadata-notification-nats-url <uri> subscribe to KMS invalidation events via NATS\n",
         "  --metadata-notification-subject <name> NATS subject for invalidations, default keinfs.kms.events\n",
+        "  --decentralized       resolve via head + computed layout (for --decentralized objects), default off\n",
     )
 }
 

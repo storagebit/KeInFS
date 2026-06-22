@@ -6,6 +6,7 @@ pub mod proto {
 }
 
 pub mod committed_occupancy;
+pub mod placement;
 
 use proto::{EcProfile, FailureDomain};
 use std::fmt;
