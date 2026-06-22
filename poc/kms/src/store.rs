@@ -424,8 +424,7 @@ impl KmsStore {
                 async move {
                     let mut version_ids = Vec::new();
                     let mut seen: HashSet<String> = HashSet::new();
-                    // Legacy secondary index (written by the old commit path and,
-                    // until INC-6, retained by single-shot CommitObject too).
+                    // Legacy per-fragment secondary index.
                     let mut stream =
                         trx.get_ranges_keyvalues(RangeOption::from((cur_begin, cur_end)), false);
                     while let Some(next) = stream.next().await {
@@ -439,8 +438,8 @@ impl KmsStore {
                             }
                         }
                     }
-                    // Per-target reverse log: the sole reverse index for new objects
-                    // once INC-6 drops the legacy secondary index. Deduped against it.
+                    // Per-target reverse log, deduped against the secondary index
+                    // above (an object's fragments may appear in both).
                     let mut stream =
                         trx.get_ranges_keyvalues(RangeOption::from((rev_begin, rev_end)), false);
                     while let Some(next) = stream.next().await {
