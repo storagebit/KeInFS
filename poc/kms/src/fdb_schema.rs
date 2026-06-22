@@ -22,7 +22,7 @@ const PREFIX_MAINTENANCE_MARKER: u8 = 13;
 const PREFIX_NAMESPACE_PATH: u8 = 14;
 const PREFIX_OBJECT_ID_COUNTER: u8 = 15;
 const PREFIX_TARGET_REVERSE_LOG: u8 = 16;
-// 17 is reserved for the per-object write lease.
+const PREFIX_OBJECT_LEASE: u8 = 17;
 const PREFIX_CLUSTER_CONFIG: u8 = 18;
 
 pub(crate) fn bucket_context_key(bucket_id: &str) -> Vec<u8> {
@@ -32,6 +32,21 @@ pub(crate) fn bucket_context_key(bucket_id: &str) -> Vec<u8> {
 /// Singleton key for the globally-monotonic object_id counter.
 pub(crate) fn object_id_counter_key() -> Vec<u8> {
     encode_key(PREFIX_OBJECT_ID_COUNTER, &["object-id"])
+}
+
+/// Per-object write lease. Issued when a write begins (keyed by the minted object_id),
+/// cleared when the object commits, and reaped once expired. It bounds the window in
+/// which an in-flight write's granules are protected from reclamation.
+pub(crate) fn object_lease_key(object_id: u32) -> Vec<u8> {
+    encode_key(PREFIX_OBJECT_LEASE, &[&format!("{object_id:08x}")])
+}
+
+/// Prefix + range covering every write-lease row (used by the reaper to scan for
+/// expired leases).
+pub(crate) fn object_lease_range() -> (Vec<u8>, Vec<u8>) {
+    let prefix = encode_key(PREFIX_OBJECT_LEASE, &[]);
+    let end = prefix_end(&prefix);
+    (prefix, end)
 }
 
 /// Singleton key for the per-cluster salt folded into computed chunk ids and

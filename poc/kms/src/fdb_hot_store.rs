@@ -6,14 +6,16 @@ mod imp {
     use crate::fdb_schema::{
         bucket_context_key, cluster_salt_key, decode_segments, ec_profile_key, namespace_entry_key,
         namespace_path_key, object_head_key, object_id_counter_key, object_version_chunk_key,
-        object_version_chunk_prefix, object_version_key, target_reverse_log_key,
-        write_intent_chunk_key, write_intent_chunk_prefix, write_intent_key, write_intent_range,
+        object_lease_key, object_lease_range, object_version_chunk_prefix, object_version_key,
+        target_reverse_log_key, write_intent_chunk_key, write_intent_chunk_prefix, write_intent_key,
+        write_intent_range,
     };
     use crate::hot_store::HotMetadataStore;
     use crate::store::{
         apply_fragment_repair, auto_create_levels, build_finalize_plans,
         clear_target_current_fragment_index, decode_manifest_bytes, decode_write_intent_bytes,
-        encode_manifest, encode_reverse_log_value, encode_write_intent, expected_fragment_count,
+        decode_write_lease_expiry, encode_manifest, encode_reverse_log_value,
+        encode_write_intent, encode_write_lease_value, expected_fragment_count,
         fragment_plans_for_window, join_path, mark_successful_fragments, normalize_object_key,
         normalize_write_intent, random_chunk_id, random_salt,
         write_target_current_fragment_index, AutoCreateLevel, BucketWriteContext,
@@ -1189,6 +1191,73 @@ mod imp {
                 .map_err(map_fdb_binding_error)
         }
 
+        async fn issue_write_lease(
+            &self,
+            object_id: u32,
+            expires_at_unix_ms: u64,
+        ) -> Result<(), Status> {
+            let key = object_lease_key(object_id);
+            self.db
+                .run(move |trx, _| {
+                    let key = key.clone();
+                    async move {
+                        trx.set(&key, &encode_write_lease_value(expires_at_unix_ms));
+                        Ok(())
+                    }
+                })
+                .await
+                .map_err(map_fdb_binding_error)
+        }
+
+        async fn clear_write_lease(&self, object_id: u32) -> Result<(), Status> {
+            let key = object_lease_key(object_id);
+            self.db
+                .run(move |trx, _| {
+                    let key = key.clone();
+                    async move {
+                        trx.clear(&key);
+                        Ok(())
+                    }
+                })
+                .await
+                .map_err(map_fdb_binding_error)
+        }
+
+        async fn reap_expired_leases(
+            &self,
+            now_unix_ms: u64,
+            limit: usize,
+        ) -> Result<usize, Status> {
+            let (begin, end) = object_lease_range();
+            self.db
+                .run(move |trx, _| {
+                    let begin = begin.clone();
+                    let end = end.clone();
+                    async move {
+                        // Scan the lease keyspace, clearing rows whose expiry has passed.
+                        // Lease volume is bounded by in-flight writes, so a single
+                        // scan-and-clear transaction is sufficient.
+                        let mut stream = trx.get_ranges_keyvalues((begin, end).into(), false);
+                        let mut reaped = 0usize;
+                        while let Some(next) = stream.next().await {
+                            if reaped >= limit {
+                                break;
+                            }
+                            let kv = next?;
+                            let expiry =
+                                decode_write_lease_expiry(kv.value()).map_err(status_to_fdb)?;
+                            if expiry <= now_unix_ms {
+                                trx.clear(kv.key());
+                                reaped += 1;
+                            }
+                        }
+                        Ok(reaped)
+                    }
+                })
+                .await
+                .map_err(map_fdb_binding_error)
+        }
+
         async fn abort_object_write(
             &self,
             intent_id: String,
@@ -1791,6 +1860,32 @@ mod imp {
             _bucket_id: String,
             _key_path: String,
         ) -> Result<Option<ObjectHead>, Status> {
+            Err(Status::unimplemented(
+                "FoundationDB metadata backend is supported only on Linux",
+            ))
+        }
+
+        async fn issue_write_lease(
+            &self,
+            _object_id: u32,
+            _expires_at_unix_ms: u64,
+        ) -> Result<(), Status> {
+            Err(Status::unimplemented(
+                "FoundationDB metadata backend is supported only on Linux",
+            ))
+        }
+
+        async fn clear_write_lease(&self, _object_id: u32) -> Result<(), Status> {
+            Err(Status::unimplemented(
+                "FoundationDB metadata backend is supported only on Linux",
+            ))
+        }
+
+        async fn reap_expired_leases(
+            &self,
+            _now_unix_ms: u64,
+            _limit: usize,
+        ) -> Result<usize, Status> {
             Err(Status::unimplemented(
                 "FoundationDB metadata backend is supported only on Linux",
             ))

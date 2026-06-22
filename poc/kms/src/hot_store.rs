@@ -78,6 +78,24 @@ pub(crate) trait HotMetadataStore: Send + Sync {
     /// and is stable for its lifetime.
     async fn get_or_init_cluster_salt(&self) -> Result<Vec<u8>, Status>;
 
+    /// Issues (or refreshes) the per-object write lease for `object_id`, expiring at
+    /// `expires_at_unix_ms`. The lease marks a write as in-flight so its granules are
+    /// protected from reclamation until it commits or the lease lapses.
+    async fn issue_write_lease(
+        &self,
+        object_id: u32,
+        expires_at_unix_ms: u64,
+    ) -> Result<(), Status>;
+
+    /// Clears the per-object write lease for `object_id` (called once the object has
+    /// committed; the head now protects its granules). Idempotent.
+    async fn clear_write_lease(&self, object_id: u32) -> Result<(), Status>;
+
+    /// Reaps up to `limit` write leases that expired at or before `now_unix_ms`,
+    /// returning the number cleared. An expired lease marks an abandoned write.
+    async fn reap_expired_leases(&self, now_unix_ms: u64, limit: usize)
+        -> Result<usize, Status>;
+
     /// Returns the object head for `(bucket_id, key_path)`, or None if absent. The
     /// decentralized read path uses this to get the object geometry (length + EC profile
     /// id + topology epoch) and then reconstructs the fragment layout by computation,

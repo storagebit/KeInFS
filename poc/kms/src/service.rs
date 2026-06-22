@@ -983,6 +983,12 @@ impl Kms for KmsService {
             .get_bucket_write_context(request.bucket_id.clone())
             .await?
             .ec_profile;
+        // Issue the per-object write lease covering this write attempt. It bounds how
+        // long the write's granules stay protected before an abandoned write is reaped;
+        // CommitObject clears it. Cleared/reaped on commit or expiry.
+        let lease_expiry =
+            now_unix_ms().saturating_add(self.write_intent_ttl.as_millis() as u64);
+        self.hot_store.issue_write_lease(object_id, lease_expiry).await?;
         Ok(Response::new(BeginObjectReply {
             object_id,
             version,
@@ -1123,6 +1129,7 @@ impl Kms for KmsService {
         let started = Instant::now();
         self.stats.record_request(kind);
         let request = request.into_inner();
+        let object_id = request.object_id;
         let manifest = request
             .manifest
             .ok_or_else(|| Status::invalid_argument("KMS CommitObject requires a manifest"))?;
@@ -1140,6 +1147,10 @@ impl Kms for KmsService {
             .await
         {
             Ok(head) => {
+                // The object is committed; the head now protects its granules, so clear
+                // the write lease. Best-effort — the lease reaper backstops a missed clear,
+                // and the lease-fenced GC checks the head before freeing anything.
+                let _ = self.hot_store.clear_write_lease(object_id).await;
                 // The store writes the head/entry under the normalized key, and the
                 // read cache + watchers key on the canonical path, so invalidate and
                 // notify under the normalized key rather than the raw request key.

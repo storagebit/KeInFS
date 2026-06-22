@@ -165,6 +165,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.reservation_mutation_batch_size,
         config.kas_rpc_timeout.saturating_mul(3),
     )));
+    let lease_reaper = Some(tokio::spawn(object_lease_reaper_loop(
+        std::sync::Arc::clone(&service.hot_store),
+        stats.clone(),
+        config.expiry_reap_interval,
+    )));
     let reservation_dispatcher = Some(tokio::spawn(reservation_mutation_dispatch_loop(
         std::sync::Arc::clone(&service.hot_store),
         KasEndpointBalancer::new(kas_channels.clone()),
@@ -201,6 +206,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(finalizer) = finalizer {
         finalizer.abort();
+    }
+    if let Some(lease_reaper) = lease_reaper {
+        lease_reaper.abort();
     }
     if let Some(reservation_dispatcher) = reservation_dispatcher {
         reservation_dispatcher.abort();
@@ -261,6 +269,28 @@ async fn service_registration_loop(
             .await
         {
             stats.set_last_error(format!("KMS service registration failed: {err}"));
+        }
+    }
+}
+
+async fn object_lease_reaper_loop(
+    hot_store: std::sync::Arc<dyn HotMetadataStore>,
+    stats: std::sync::Arc<KmsStats>,
+    interval: std::time::Duration,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    let mut consecutive_errors = 0usize;
+    loop {
+        ticker.tick().await;
+        match hot_store.reap_expired_leases(now_unix_ms(), 256).await {
+            Ok(_) => consecutive_errors = 0,
+            Err(err) => {
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                stats.set_last_error(format!("KMS write-lease reaper failed: {err}"));
+                tokio::time::sleep(reaper_error_backoff(interval, consecutive_errors)).await;
+            }
         }
     }
 }

@@ -2660,6 +2660,24 @@ pub(crate) fn random_salt() -> Vec<u8> {
     bytes
 }
 
+/// Write-lease value: the lease expiry as a unix-ms timestamp (u64 BE).
+pub(crate) fn encode_write_lease_value(expires_at_unix_ms: u64) -> Vec<u8> {
+    expires_at_unix_ms.to_be_bytes().to_vec()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn decode_write_lease_expiry(bytes: &[u8]) -> Result<u64, Status> {
+    if bytes.len() < 8 {
+        return Err(Status::internal(format!(
+            "write-lease value is {} bytes, expected at least 8",
+            bytes.len()
+        )));
+    }
+    Ok(u64::from_be_bytes(
+        bytes[0..8].try_into().expect("8-byte expiry"),
+    ))
+}
+
 fn validate_entry_name(name: &str) -> Result<(), Status> {
     if name.is_empty() {
         return Err(Status::invalid_argument("entry name must not be empty"));
