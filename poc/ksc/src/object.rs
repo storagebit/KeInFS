@@ -15,7 +15,7 @@ use keinctl::proto::{
     WriteIntent,
 };
 use kp2::{
-    ChunkId, ChunkRange, PackedReadQuery, PackedWriteEntry, PackedWriteRequest,
+    ChunkId, ChunkRange, PackedReadQuery, PackedWriteEntry, PackedWriteRequest, WriteIdentity,
     MAX_PACK_PAYLOAD_BYTES,
 };
 use prost::Message;
@@ -2578,6 +2578,14 @@ async fn write_prepared_stripe_batch_with_sessions(
                             chunk_id: item.chunk_id,
                             slot_index: item.granule_index,
                             generation: item.generation,
+                            // Phase 2a: carry the fragment's object position. object_id/version
+                            // are 0 until KMS BeginObject mints them (Phase 2b).
+                            identity: WriteIdentity {
+                                object_id: 0,
+                                object_version: 0,
+                                stripe: item.stripe_index as u16,
+                                frag: item.fragment_index as u16,
+                            },
                             payload: std::mem::take(&mut item.payload),
                         })
                         .collect(),

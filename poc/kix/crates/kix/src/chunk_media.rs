@@ -181,6 +181,7 @@ impl ChunkMediaHandle {
             PublicationLaneSelector::AgainstCurrent(None),
             chunk_id,
             generation,
+            ChunkSelfDescribingIdentity::default(),
             payload,
             WriteDurability::Barrier,
         )
@@ -202,6 +203,7 @@ impl ChunkMediaHandle {
             PublicationLaneSelector::AgainstCurrent(current_record),
             chunk_id,
             generation,
+            ChunkSelfDescribingIdentity::default(),
             payload,
             WriteDurability::Barrier,
         )
@@ -221,6 +223,7 @@ impl ChunkMediaHandle {
         publication_lane: u64,
         chunk_id: ChunkId,
         generation: u32,
+        identity: ChunkSelfDescribingIdentity,
         payload: &[u8],
     ) -> io::Result<ChunkMediaWriteResult> {
         write_chunk_media_payload_with_file(
@@ -231,6 +234,7 @@ impl ChunkMediaHandle {
             PublicationLaneSelector::Explicit(publication_lane),
             chunk_id,
             generation,
+            identity,
             payload,
             WriteDurability::Deferred,
         )
@@ -808,6 +812,7 @@ pub fn write_chunk_media_payload(
         PublicationLaneSelector::AgainstCurrent(None),
         chunk_id,
         generation,
+        ChunkSelfDescribingIdentity::default(),
         payload,
         WriteDurability::Barrier,
     )
@@ -970,6 +975,7 @@ fn write_chunk_media_payload_with_file(
     lane: PublicationLaneSelector,
     chunk_id: ChunkId,
     generation: u32,
+    identity: ChunkSelfDescribingIdentity,
     payload: &[u8],
     durability: WriteDurability,
 ) -> io::Result<ChunkMediaWriteResult> {
@@ -1026,11 +1032,12 @@ fn write_chunk_media_payload_with_file(
         drive_id: record.drive_id,
         chunk_id,
         record,
-        // Phase 0: live writes carry zero identity until KST threads real values (Phase 1).
-        stripe: 0,
-        object_id: 0,
-        object_version: 0,
-        frag: 0,
+        // Phase 2a: carry the object identity supplied by the caller (KST threads it
+        // from the KP2 write request; other writers pass default/zeros).
+        stripe: identity.stripe,
+        object_id: identity.object_id,
+        object_version: identity.object_version,
+        frag: identity.frag,
     };
     encode_slot_header(block.as_mut_slice(), header)?;
     let payload_dst = &mut block.as_mut_slice()[CHUNK_MEDIA_SLOT_HEADER_BYTES as usize

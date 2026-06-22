@@ -37,7 +37,7 @@ const MAGIC_QUERY: &[u8; 4] = b"KP2Q";
 const MAGIC_READ: &[u8; 4] = b"KP2R";
 const MAGIC_ACK: &[u8; 4] = b"KP2A";
 const COMMON_HEADER_BYTES: usize = 24;
-const WRITE_ENTRY_BYTES: usize = 52;
+const WRITE_ENTRY_BYTES: usize = 58;
 const QUERY_ENTRY_BYTES: usize = 32;
 /// Ranged query entry: chunk_id[32] + offset:u64 + length:u32 + reserved:u32.
 const QUERY_ENTRY_RANGED_BYTES: usize = 48;
@@ -88,11 +88,24 @@ impl LocationKindCode {
     }
 }
 
+/// Self-describing object identity for a fragment write (TLA/SC+ Phase 2). Carried on
+/// the KP2 write request so the storage target stamps it into the on-media slot header.
+/// object_id/object_version are server-minted (KP2M.BeginObject); until that lands they
+/// are 0. stripe/frag are the fragment's position in the object's EC layout.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WriteIdentity {
+    pub object_id: u32,
+    pub object_version: u16,
+    pub stripe: u16,
+    pub frag: u16,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackedWriteEntry {
     pub chunk_id: ChunkId,
     pub slot_index: u64,
     pub generation: u32,
+    pub identity: WriteIdentity,
     pub payload: Vec<u8>,
 }
 
@@ -379,7 +392,10 @@ pub fn encode_write_request_header(entries: &[PackedWriteEntry]) -> io::Result<V
         put_u64(&mut out, entry.slot_index);
         put_u32(&mut out, entry.generation);
         put_u32(&mut out, entry.payload.len() as u32);
-        put_u32(&mut out, 0);
+        put_u32(&mut out, entry.identity.object_id);
+        put_u16(&mut out, entry.identity.object_version);
+        put_u16(&mut out, entry.identity.stripe);
+        put_u16(&mut out, entry.identity.frag);
     }
     Ok(out)
 }
@@ -424,12 +440,12 @@ pub fn decode_write_request(body: &[u8]) -> io::Result<PackedWriteRequest> {
         let slot_index = read_u64(body, base + 32)?;
         let generation = read_u32(body, base + 40)?;
         let payload_bytes = read_u32(body, base + 44)? as usize;
-        let reserved = read_u32(body, base + 48)?;
-        if reserved != 0 {
-            return Err(invalid_data(
-                "KP2 write descriptor reserved field must be zero",
-            ));
-        }
+        let identity = WriteIdentity {
+            object_id: read_u32(body, base + 48)?,
+            object_version: read_u16(body, base + 52)?,
+            stripe: read_u16(body, base + 54)?,
+            frag: read_u16(body, base + 56)?,
+        };
         let payload_end = payload_cursor
             .checked_add(payload_bytes)
             .ok_or_else(|| invalid_data("KP2 write payload cursor overflow"))?;
@@ -440,6 +456,7 @@ pub fn decode_write_request(body: &[u8]) -> io::Result<PackedWriteRequest> {
             chunk_id,
             slot_index,
             generation,
+            identity,
             payload: body[payload_cursor..payload_end].to_vec(),
         });
         payload_cursor = payload_end;
@@ -1097,6 +1114,27 @@ mod tests {
     }
 
     #[test]
+    fn write_entry_carries_self_describing_identity() {
+        let pack = PackedWriteRequest {
+            entries: vec![PackedWriteEntry {
+                chunk_id: chunk(5),
+                slot_index: 42,
+                generation: 9,
+                identity: WriteIdentity {
+                    object_id: 0x1234_5678,
+                    object_version: 3,
+                    stripe: 7,
+                    frag: 2,
+                },
+                payload: vec![9, 9, 9],
+            }],
+        };
+        let decoded = decode_write_request(&encode_write_request(&pack).unwrap()).unwrap();
+        assert_eq!(decoded.entries[0].identity, pack.entries[0].identity);
+        assert_eq!(decoded, pack);
+    }
+
+    #[test]
     fn write_pack_round_trips() {
         let pack = PackedWriteRequest {
             entries: vec![
@@ -1104,12 +1142,14 @@ mod tests {
                     chunk_id: chunk(1),
                     slot_index: 7,
                     generation: 3,
+                    identity: WriteIdentity::default(),
                     payload: vec![1, 2, 3, 4],
                 },
                 PackedWriteEntry {
                     chunk_id: chunk(2),
                     slot_index: 8,
                     generation: 4,
+                    identity: WriteIdentity::default(),
                     payload: vec![5, 6],
                 },
             ],
@@ -1131,18 +1171,21 @@ mod tests {
                     chunk_id: chunk(1),
                     slot_index: 7,
                     generation: 3,
+                    identity: WriteIdentity::default(),
                     payload: vec![1, 2, 3, 4],
                 },
                 PackedWriteEntry {
                     chunk_id: chunk(2),
                     slot_index: 8,
                     generation: 4,
+                    identity: WriteIdentity::default(),
                     payload: vec![5, 6],
                 },
                 PackedWriteEntry {
                     chunk_id: chunk(3),
                     slot_index: 9,
                     generation: 5,
+                    identity: WriteIdentity::default(),
                     payload: Vec::new(),
                 },
             ],

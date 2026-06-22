@@ -6,7 +6,7 @@ use crate::client::{
     TargetSession,
 };
 use crate::config::SmokeConfig;
-use kp2::{PackedReadQuery, PackedWriteEntry, PackedWriteReply, PackedWriteRequest};
+use kp2::{PackedReadQuery, PackedWriteEntry, PackedWriteReply, PackedWriteRequest, WriteIdentity};
 
 pub(crate) async fn run_smoke(config: SmokeConfig) -> Result<(), ClientError> {
     let session = TargetSession::connect(&config.endpoint).await?;
@@ -26,6 +26,7 @@ pub(crate) async fn run_smoke(config: SmokeConfig) -> Result<(), ClientError> {
             chunk_id,
             slot_index,
             generation,
+            identity: WriteIdentity::default(),
             payload: payload.clone(),
         });
         query_chunk_ids.push(chunk_id);

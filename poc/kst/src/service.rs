@@ -10,8 +10,8 @@ use h2::{client::SendRequest, RecvStream};
 use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri};
 use kix::{
-    chunk_media_slot_index_for_record, ChunkId, ChunkMediaHandle, ChunkMediaLayoutSpec, KixClient,
-    KixEngine, LocationKind, LocationRecord,
+    chunk_media_slot_index_for_record, ChunkId, ChunkMediaHandle, ChunkMediaLayoutSpec,
+    ChunkSelfDescribingIdentity, KixClient, KixEngine, LocationKind, LocationRecord,
 };
 use kp2::{
     apply_packed_headers, apply_rate_limit_headers, decode_read_query, decode_write_request,
@@ -569,6 +569,8 @@ impl TargetRouter {
                 reservation.lane,
                 chunk_id,
                 generation,
+                // Direct (non-object) single-chunk path carries no object identity yet.
+                ChunkSelfDescribingIdentity::default(),
                 body,
             )
             .map_err(|err| {
@@ -707,6 +709,14 @@ impl TargetRouter {
                 reservation.lane,
                 chunk_id,
                 generation,
+                // Phase 2a: stamp the object identity carried on the KP2 write entry into
+                // the on-media slot header (object_id/version are 0 until KMS BeginObject).
+                ChunkSelfDescribingIdentity {
+                    stripe: entry.identity.stripe,
+                    object_id: entry.identity.object_id,
+                    object_version: entry.identity.object_version,
+                    frag: entry.identity.frag,
+                },
                 &entry.payload,
             ) {
                 Ok(media_result) => {

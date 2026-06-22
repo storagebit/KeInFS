@@ -9,7 +9,7 @@ use crate::config::{BenchmarkConfig, TransferMode};
 use crate::stats::{spawn_stats_publisher, KscRuntimeStats, KscStatsPublisher};
 use kp2::{
     encoded_write_request_len, PackedReadQuery, PackedWriteEntry, PackedWriteReply,
-    PackedWriteRequest,
+    PackedWriteRequest, WriteIdentity,
 };
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -574,6 +574,7 @@ async fn issue_write_pack(
             chunk_id: selected_entry.key.chunk_id,
             slot_index: selected_entry.key.slot_index,
             generation,
+            identity: WriteIdentity::default(),
             payload,
         });
     }
@@ -726,6 +727,7 @@ async fn prefill_keyspace(
                         chunk_id: key.chunk_id,
                         slot_index: key.slot_index,
                         generation,
+                        identity: WriteIdentity::default(),
                         payload,
                     });
                 }

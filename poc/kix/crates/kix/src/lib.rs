@@ -21,6 +21,7 @@ pub use chunk_media::{
     write_chunk_media_tombstone, ChunkMediaHandle, ChunkMediaLayoutKind, ChunkMediaLayoutSpec,
     ChunkMediaReadResult, ChunkMediaReadTiming, ChunkMediaRebuildResult, ChunkMediaRebuildSummary,
     ChunkMediaSpanConfig, ChunkMediaSuperblock, ChunkMediaWriteConfig, ChunkMediaWriteResult,
+    ChunkSelfDescribingIdentity,
     ChunkMediaWriteTiming, CHUNK_MEDIA_ALIGN_BYTES, CHUNK_MEDIA_PUBLICATION_LANES,
     CHUNK_MEDIA_SLOT_HEADER_BYTES, CHUNK_MEDIA_SUPERBLOCK_BYTES,
 };
