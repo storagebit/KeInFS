@@ -10,7 +10,7 @@ use crate::fdb_schema::{
     namespace_path_key,
     object_head_key, object_head_range, object_version_chunk_key, object_version_chunk_prefix,
     object_version_key, placement_task_key, placement_task_range, prefix_end,
-    target_current_fragment_key, target_current_fragment_range,
+    target_current_fragment_key, target_current_fragment_range, target_reverse_log_range,
 };
 use keinctl::proto::{
     BucketRecord, EcProfile, FragmentPlan, FragmentRef, FragmentWriteState, FragmentWriteStatus,
@@ -413,22 +413,41 @@ impl KmsStore {
         if max_versions == 0 {
             return Ok(Vec::new());
         }
-        let (begin, end) = target_current_fragment_range(target_id);
+        let (cur_begin, cur_end) = target_current_fragment_range(target_id);
+        let (rev_begin, rev_end) = target_reverse_log_range(target_id);
         self.db
             .run(move |trx, _| {
-                let begin = begin.clone();
-                let end = end.clone();
+                let cur_begin = cur_begin.clone();
+                let cur_end = cur_end.clone();
+                let rev_begin = rev_begin.clone();
+                let rev_end = rev_end.clone();
                 async move {
-                    let mut stream =
-                        trx.get_ranges_keyvalues(RangeOption::from((begin, end)), false);
                     let mut version_ids = Vec::new();
-                    let mut previous_version_id: Option<String> = None;
+                    let mut seen: HashSet<String> = HashSet::new();
+                    // Legacy secondary index (written by the old commit path and,
+                    // until INC-6, retained by single-shot CommitObject too).
+                    let mut stream =
+                        trx.get_ranges_keyvalues(RangeOption::from((cur_begin, cur_end)), false);
                     while let Some(next) = stream.next().await {
                         let kv = next?;
                         let version_id = decode_target_current_fragment_version_id(kv.key())
                             .map_err(status_to_fdb)?;
-                        if previous_version_id.as_ref() != Some(&version_id) {
-                            previous_version_id = Some(version_id.clone());
+                        if seen.insert(version_id.clone()) {
+                            version_ids.push(version_id);
+                            if version_ids.len() >= max_versions {
+                                return Ok::<Vec<String>, FdbBindingError>(version_ids);
+                            }
+                        }
+                    }
+                    // Per-target reverse log: the sole reverse index for new objects
+                    // once INC-6 drops the legacy secondary index. Deduped against it.
+                    let mut stream =
+                        trx.get_ranges_keyvalues(RangeOption::from((rev_begin, rev_end)), false);
+                    while let Some(next) = stream.next().await {
+                        let kv = next?;
+                        let version_id =
+                            decode_reverse_log_version_id(kv.key()).map_err(status_to_fdb)?;
+                        if seen.insert(version_id.clone()) {
                             version_ids.push(version_id);
                             if version_ids.len() >= max_versions {
                                 break;
@@ -2112,6 +2131,40 @@ fn decode_target_current_fragment_version_id(key: &[u8]) -> Result<String, Statu
         )));
     }
     Ok(segments[1].clone())
+}
+
+fn decode_reverse_log_version_id(key: &[u8]) -> Result<String, Status> {
+    let (_, segments) = decode_segments(key)
+        .map_err(|err| Status::internal(format!("failed to decode reverse-log key: {err}")))?;
+    if segments.len() != 4 {
+        return Err(Status::internal(format!(
+            "reverse-log key has {} segments, expected 4",
+            segments.len()
+        )));
+    }
+    Ok(segments[1].clone())
+}
+
+/// Reverse-log value: generation (u32 BE) | granule_index (u64 BE). object_id is
+/// deliberately absent — GC matches on the version_id carried in the key.
+pub(crate) fn encode_reverse_log_value(generation: u32, granule_index: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12);
+    out.extend_from_slice(&generation.to_be_bytes());
+    out.extend_from_slice(&granule_index.to_be_bytes());
+    out
+}
+
+#[allow(dead_code)]
+fn decode_reverse_log_value(bytes: &[u8]) -> Result<(u32, u64), Status> {
+    if bytes.len() != 12 {
+        return Err(Status::internal(format!(
+            "reverse-log value is {} bytes, expected 12",
+            bytes.len()
+        )));
+    }
+    let generation = u32::from_be_bytes(bytes[0..4].try_into().expect("4-byte generation"));
+    let granule_index = u64::from_be_bytes(bytes[4..12].try_into().expect("8-byte granule"));
+    Ok((generation, granule_index))
 }
 
 fn candidate_destination_target_ids(

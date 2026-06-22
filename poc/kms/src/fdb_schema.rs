@@ -21,6 +21,7 @@ const PREFIX_TARGET_CURRENT_FRAGMENT: u8 = 12;
 const PREFIX_MAINTENANCE_MARKER: u8 = 13;
 const PREFIX_NAMESPACE_PATH: u8 = 14;
 const PREFIX_OBJECT_ID_COUNTER: u8 = 15;
+const PREFIX_TARGET_REVERSE_LOG: u8 = 16;
 
 pub(crate) fn bucket_context_key(bucket_id: &str) -> Vec<u8> {
     encode_key(PREFIX_BUCKET_CONTEXT, &[bucket_id])
@@ -156,6 +157,39 @@ pub(crate) fn target_current_fragment_prefix(target_id: &str) -> Vec<u8> {
 
 pub(crate) fn target_current_fragment_range(target_id: &str) -> (Vec<u8>, Vec<u8>) {
     let prefix = target_current_fragment_prefix(target_id);
+    let end = prefix_end(&prefix);
+    (prefix, end)
+}
+
+/// Append-only per-target reverse log: (target_id) -> {generation, granule_index},
+/// keyed by version_id so it is idempotent under FDB transaction retry and
+/// range-scannable by target_id for rebuild/GC reverse lookup. Mirrors
+/// target_current_fragment_key. The value (generation, granule_index) is encoded by
+/// encode_reverse_log_value; object_id is deliberately absent (GC matches on the
+/// version_id carried in the key).
+pub(crate) fn target_reverse_log_key(
+    target_id: &str,
+    version_id: &str,
+    stripe_index: u32,
+    fragment_index: u32,
+) -> Vec<u8> {
+    encode_key(
+        PREFIX_TARGET_REVERSE_LOG,
+        &[
+            target_id,
+            version_id,
+            &format!("{stripe_index:08x}"),
+            &format!("{fragment_index:08x}"),
+        ],
+    )
+}
+
+pub(crate) fn target_reverse_log_prefix(target_id: &str) -> Vec<u8> {
+    encode_key(PREFIX_TARGET_REVERSE_LOG, &[target_id])
+}
+
+pub(crate) fn target_reverse_log_range(target_id: &str) -> (Vec<u8>, Vec<u8>) {
+    let prefix = target_reverse_log_prefix(target_id);
     let end = prefix_end(&prefix);
     (prefix, end)
 }
