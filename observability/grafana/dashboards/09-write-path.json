@@ -1,0 +1,287 @@
+{
+  "uid": "keinfs-write-path",
+  "title": "KeInFS — Life of a WRITE",
+  "tags": ["keinfs", "write-path", "lifecycle"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus", "current": { "text": "Prometheus", "value": "keinfs-prom" } }
+    ]
+  },
+  "links": [
+    { "title": "Read Path", "type": "link", "url": "/d/keinfs-read-path", "icon": "external link", "tooltip": "Life of a READ, stage by stage" },
+    { "title": "KMS Detail", "type": "link", "url": "/d/keinfs-kms-detail", "icon": "external link", "tooltip": "KMS full RPC/phase decomposition" },
+    { "title": "KST Overview", "type": "link", "url": "/d/keinfs-kst-overview", "icon": "external link", "tooltip": "Storage-target fleet" },
+    { "title": "KST Detail", "type": "link", "url": "/d/keinfs-kst-detail", "icon": "external link", "tooltip": "Single-target full phase decomposition" },
+    { "title": "KIX Index", "type": "link", "url": "/d/keinfs-kix-overview", "icon": "external link", "tooltip": "Chunk-location index fleet" }
+  ],
+  "panels": [
+
+    {
+      "type": "row", "title": "Stage 0 — Client (KSC): control setup, encode, fan-out", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "text", "title": "Not yet instrumented: KSC client write phases (pending C1)",
+      "description": "The KSC smart-client stats root is not yet exported by keinexport — the entire client stage of the write story is dark in Prometheus. This placeholder documents the phase series this row WILL carry once the C1 export (with the B4 renames applied exporter-side) lands.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 1 },
+      "options": {
+        "mode": "markdown",
+        "content": "## Client (KSC) write phases — pending C1 export\n\nNo `keinfs_ksc_*` series exist yet. When the KSC stats root is exported (with the B4 renames applied **exporter-side**, not dashboard-side), this row gains per-phase p99/avg/max panels for:\n\n| Phase (as it will be exported) | What it measures | Caveats |\n|---|---|---|\n| `kms_initiate` → caption **control_setup** | Pre-data control-plane setup **wall** time: merged BeginObject RTT in decentralized mode; max(Begin, Initiate) in joined legacy mode, with legacy ReserveObjectWriteWindow RTTs folded in. | Never caption it \"initiate RPC\" — it is a wall, not one RPC. |\n| `kms_begin` (today stashed in write-side `ec_reconstruct`) | BeginObject RPC RTT alone. | Must be renamed on export; `ec_reconstruct` stays genuine only on reads. |\n| `kms_cluster_config` (today stashed in write-side `kms_resolve`) | GetClusterConfig / target-roster cache resolve time. | Must be renamed on export; `kms_resolve` stays genuine only on reads. |\n| `ec_encode` | Reed–Solomon encode CPU time (KEE). | — |\n| `target_write` **vs** `target_write_wall` | Per-fragment KP2 write time **sum** vs the JoinSet **wall** for the primary fan-out. | **D5 fan-out caveat:** `target_write` inflates with fan-out width AND with retries/repairs; `target_write_wall` covers the primary fan-out only. Plot both, plus `target_write / target_write_wall` as \"realized fan-out concurrency\" — retries inflate the numerator only, so spikes in the ratio without a fan-out change mean retry/repair activity. |\n| `kms_commit` | Commit wall: covers CommitObject single-shot AND MultiCommitObject flush wait AND segmented append+seal. | Never caption it \"CommitObjectWrite\". |\n| per-request subphases | `target_ready_wait`, `target_request_prepare`, `target_send_headers`, `target_send_body`, `target_wait_response`, `target_collect_response`, `target_protocol_decode`, `target_payload_validate`. | Summation caveat as above for multi-stripe flows. |\n\nUntil C1 lands, start the write investigation at **Stage 1 (KMS BeginObject)** below."
+      }
+    },
+
+    {
+      "type": "row", "title": "Stage 1 — KMS BeginObject (one txn)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 10 }
+    },
+    {
+      "type": "timeseries", "title": "BeginObject rate (req/s)",
+      "description": "Merged-begin hot-path RPC rate per KMS instance — this is the current-path write entry point (one FDB txn per object write). Should track client PUT rate 1:1. If legacy initiate_object_write (collapsed row below) carries traffic instead, clients are on the legacy window path.",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "sum by (instance) (rate(keinfs_kms_begin_object_requests[$__rate_interval]))", "refId": "A", "legendFormat": "{{instance}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "BeginObject latency (µs) — avg / p99 / max (pow2-bucketed approx)",
+      "description": "RPC latency for begin_object per KMS instance. p50/p95/p99 are power-of-2 bucketed (quantized steps); avg and max are exact — trust avg+max for trends, p99 for order of magnitude. A healthy merged begin is one FDB txn; sustained p99 growth means FDB contention or cache-miss storms (see phase breakdown to the right).",
+      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kms_rpc_latency_avg_microseconds{rpc=\"begin_object\"}", "refId": "A", "legendFormat": "{{instance}} avg" },
+        { "expr": "keinfs_kms_rpc_latency_microseconds{rpc=\"begin_object\",quantile=\"0.99\"}", "refId": "B", "legendFormat": "{{instance}} p99 (pow2 approx)" },
+        { "expr": "keinfs_kms_rpc_latency_microseconds{rpc=\"begin_object\",quantile=\"1.0\"}", "refId": "C", "legendFormat": "{{instance}} max" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "BeginObject phase breakdown, worst-instance p99 (µs) (pow2-bucketed approx)",
+      "description": "Where BeginObject time goes: request_decode, bucket-context cache hit/miss + load, profile_select, write_profile_class_route/default/alternate (storage-class routing), EC-profile catalog cache, key_normalize, profile_validate, object_parent_* resolution, and the store_begin_resolved FDB txn. The store phase dominating is normal; cache-miss phases dominating means the bucket/profile caches are churning. pow2-bucketed approx.",
+      "gridPos": { "h": 8, "w": 9, "x": 15, "y": 11 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "max by (phase) (keinfs_kms_phase_latency_microseconds{rpc=\"begin_object\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "{{phase}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Storage-class routing decisions (write_profile_class_route, decisions/s)",
+      "description": "Rate of small-object storage-class routing decisions inside BeginObject (commit 0bc1d3e): write_profile_class_route is the routing evaluation; write_profile_default vs write_profile_alternate split shows how many writes were re-routed to a replicated profile. alternate/total is the small-object replicated-route fraction for the workload.",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 19 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "sum by (phase) (rate(keinfs_kms_phase_latency_samples{rpc=\"begin_object\",phase=~\"write_profile_class_route|write_profile_default|write_profile_alternate\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{phase}}" } ]
+    },
+    {
+      "type": "bargauge", "title": "BeginObject phase budget — last p99 (µs) (pow2-bucketed approx)",
+      "description": "Instantaneous per-phase p99 budget of the begin_object txn, worst instance per phase. Read top-down as \"where would I save the most time right now\". pow2-bucketed approx — steps between power-of-2 boundaries are quantization, not regressions.",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 19 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "continuous-GrYlRd" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal", "displayMode": "gradient", "showUnfilled": true, "sortOrder": "desc" },
+      "targets": [ { "expr": "max by (phase) (keinfs_kms_phase_latency_microseconds{rpc=\"begin_object\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "{{phase}}", "instant": true } ]
+    },
+
+    {
+      "type": "row", "title": "Stage 2 — KST fragment ingest (KP2 over h2)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 26 }
+    },
+    {
+      "type": "timeseries", "title": "Ingest queue & execute p99 (µs), worst target (pow2-bucketed approx)",
+      "description": "Admission-to-execution path of a fragment write on the worst target: request_decode (KP2 header parse), ingress_queue_wait (admission lane), execution_queue_wait (direct-write execution group), route_execute (dispatch). Queue-wait phases growing while media phases (Stage 3) stay flat = admission/queue saturation, not slow drives. pow2-bucketed approx.",
+      "gridPos": { "h": 8, "w": 9, "x": 0, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "max by (phase) (keinfs_kst_phase_latency_microseconds{rpc=\"write\",quantile=\"0.99\",phase=~\"request_decode|ingress_queue_wait|execution_queue_wait|route_execute\"})", "refId": "A", "legendFormat": "{{phase}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Body receive & collect p99 (µs), worst target (pow2-bucketed approx)",
+      "description": "body_stream_receive = time pulling the fragment payload off the HTTP/2 stream (network/flow-control bound). body_collect = assembling the payload for media — the KNOWN fsync-tail suspect: a heavy body_collect tail correlating with media_fsync (Stage 3) is the signature identified in the scale runs. pow2-bucketed approx.",
+      "gridPos": { "h": 8, "w": 9, "x": 9, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "max by (phase) (keinfs_kst_phase_latency_microseconds{rpc=\"write\",quantile=\"0.99\",phase=~\"body_stream_receive|body_collect\"})", "refId": "A", "legendFormat": "{{phase}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Write stream rejections (rej/s, must be 0)",
+      "description": "Per-target write-stream admission rejections. Any non-zero rate means clients are being refused write streams — either the target is saturated (check inflight + queue waits) or stream limits are misconfigured. Healthy fleet = flat zero.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 27 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.001 } ] } } },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "rate(keinfs_kst_write_stream_rejections[$__rate_interval])", "refId": "A", "legendFormat": "{{target_id}}" } ]
+    },
+
+    {
+      "type": "row", "title": "Stage 3 — Media durability (raw device, direct I/O)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 }
+    },
+    {
+      "type": "timeseries", "title": "Media write phases p99 (µs), worst target (pow2-bucketed approx)",
+      "description": "The durability path on the worst drive: media_write_prepare (slot/layout prep), media_write_io (direct-I/O submit+complete), media_fsync (flush to media — the tail that gates the whole write). If media_fsync dominates fleet-wide, the drives are the ceiling; if only one target diverges, that drive is the laggard. pow2-bucketed approx.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "max by (phase) (keinfs_kst_phase_latency_microseconds{rpc=\"write\",quantile=\"0.99\",phase=~\"media_write_prepare|media_write_io|media_fsync\"})", "refId": "A", "legendFormat": "{{phase}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "media_fsync p99 per target (µs) (pow2-bucketed approx)",
+      "description": "The single most important write-tail series, split per target. One target stepping up while others stay flat = that drive is degrading (pair with KST Detail and the KIX publish stage). pow2-bucketed approx — avg/max on the fleet panel are exact.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "keinfs_kst_phase_latency_microseconds{rpc=\"write\",phase=\"media_fsync\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{target_id}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Write payload landed per target (B/s)",
+      "description": "Post-EC fragment bytes/s reaching media per target (not client logical bytes). Uneven lines = placement imbalance; a line pinned near a known per-drive ceiling while queue waits (Stage 2) grow = that drive is saturated.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 36 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "rate(keinfs_kst_write_payload_bytes[$__rate_interval])", "refId": "A", "legendFormat": "{{target_id}}" } ]
+    },
+
+    {
+      "type": "row", "title": "Stage 4 — KIX publish (chunk-location index)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 }
+    },
+    {
+      "type": "timeseries", "title": "KIX publish phases p99 (µs), worst target (pow2-bucketed approx)",
+      "description": "Index-publication cost inside the KST write path: kix_lookup, location_map, kix_publish (slot publication lane), publication_retry (retries into a stale/busy lane — should be near zero; a rising retry tail is an early warning for a struggling drive lane). pow2-bucketed approx.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 45 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "max by (phase) (keinfs_kst_phase_latency_microseconds{rpc=\"write\",quantile=\"0.99\",phase=~\"kix_lookup|kix_publish|publication_retry|location_map\"})", "refId": "A", "legendFormat": "{{phase}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "KIX upsert ops (ops/s)",
+      "description": "Fleet KIX index upserts/s — should track fragment-write rate. A gap between fragment writes landing (Stage 3) and upserts here means publications are backing up in the KIX queues. NOTE: KIX instances are labeled kix-<pid> and cannot yet be joined to a KST target_id (exporter gap C9).",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 45 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "rate(keinfs_kix_total_upsert_ops[$__rate_interval])", "refId": "A", "legendFormat": "{{instance}}" } ]
+    },
+    {
+      "type": "text", "title": "Not yet instrumented: per-drive KIX append/checkpoint latency & queue depth (pending C8)",
+      "description": "keinexport only exports KIX fleet totals today; the per-drive and per-shard subtrees are not exported, so the kix_publish tail cannot be attributed to a drive from Grafana.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 45 },
+      "options": {
+        "mode": "markdown",
+        "content": "### Missing here (export gap C8)\n\nThe KIX stat tree records, per drive and per shard, exactly what is needed to diagnose a slow `kix_publish`:\n\n- per-drive `append_latency_*` and `checkpoint_latency_*`\n- per-drive `queue_depth` vs `queue_capacity`, `enqueued`/`dequeued`, `enqueue_retries`\n- per-shard lookup/commit queue depths and get/upsert latency\n\nkeinexport currently exports **fleet totals only**. Until C8 lands, a `kix_publish` tail seen in the left panel can only be chased on-node under `/run/keinfs/kix/<id>/drives/<n>`. Related: C9 — KIX instances carry no `target_id` label, so per-drive series will also need the exporter-side KIX↔KST join label."
+      }
+    },
+
+    {
+      "type": "row", "title": "Stage 5 — Response + Commit (marker-fenced)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 53 }
+    },
+    {
+      "type": "timeseries", "title": "KST write response phases p99 (µs), worst target (pow2-bucketed approx)",
+      "description": "Tail of the fragment write on the target: response_encode, response_send_headers, response_send_body, response_send. These should be tens of µs; growth here with flat media phases points at the h2 connection (flow control, congested client). pow2-bucketed approx.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "max by (phase) (keinfs_kst_phase_latency_microseconds{rpc=\"write\",quantile=\"0.99\",phase=~\"response_encode|response_send_headers|response_send_body|response_send\"})", "refId": "A", "legendFormat": "{{phase}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Commit rate by flavor (req/s)",
+      "description": "All commit flavors, split by rpc: commit_object (single-shot), commit_object_segmented (streaming append+seal), multi_commit_object (batched flush). The flavor mix tells you what the workload is doing — segmented dominating means large-object streams; multi dominating means the client is pipelining small objects.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_requests_total{rpc=~\"commit_object|commit_object_segmented|multi_commit_object\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{rpc}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Commit latency p99 by flavor (µs) (pow2-bucketed approx)",
+      "description": "Per-flavor commit RPC p99. Compare like with like: single-shot commit_object is µs-scale (one FDB txn); commit_object_segmented spans the whole segmented stream (can be minutes by design — long is NOT wrong); multi_commit_object includes batch flush wait. On exporters predating the flavor split, all three report under rpc=\"commit_object\" and the mixed percentile is meaningless — use the phase split panel below instead. pow2-bucketed approx.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 54 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "max by (rpc) (keinfs_kms_rpc_latency_microseconds{rpc=~\"commit_object|commit_object_segmented|multi_commit_object\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "{{rpc}} p99 (pow2 approx)" } ]
+    },
+    {
+      "type": "timeseries", "title": "Commit store-phase split p99 (µs) (pow2-bucketed approx)",
+      "description": "The store phases separate the three commit flavors regardless of rpc labeling: store_commit_object_single_shot (single-txn commit), store_multi_commit_object (batched), append_manifest_segments + seal_object (segmented). This is the authoritative view of commit-side FDB cost per flavor. pow2-bucketed approx.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 62 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "max by (phase) (keinfs_kms_phase_latency_microseconds{rpc=~\"commit_object|commit_object_segmented|multi_commit_object\",quantile=\"0.99\",phase=~\"store_commit_object_single_shot|store_multi_commit_object|append_manifest_segments|seal_object\"})", "refId": "A", "legendFormat": "{{phase}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Fence rejects (must be 0): reclaimed-version commits + committed-slot writes",
+      "description": "The commit/reclaim fence pair. keinfs_kms_commit_rejected_version_reclaimed = a commit arrived for a version the orphan reaper already reclaimed (writer raced the reaper). keinfs_kst_committed_slot_write_rejections = the Guard D backstop, a KP2 write landed on an already-committed slot. Both are correctness guards: ANY non-zero rate is an incident, not noise.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 62 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.001 } ] } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_commit_rejected_version_reclaimed[$__rate_interval]))", "refId": "A", "legendFormat": "kms commit rejected (version reclaimed)" },
+        { "expr": "sum(rate(keinfs_kst_committed_slot_write_rejections[$__rate_interval]))", "refId": "B", "legendFormat": "kst committed-slot write rejections" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Write failure path: forfeit + lease renew (req/s)",
+      "description": "forfeit_object_write = a client abandoning an in-flight write (crash, abort, timeout) — a sustained rate means clients are giving up on writes; correlate with Stage 2/3 tails. renew_write_lease = long-running (segmented) writes keeping their lease alive — expected to track segmented-commit activity, not errors. rpc labels land with the kind-split code change shipping with this overhaul; before it these series are absent (formerly gap C5), so \"no data\" on an old exporter means uninstrumented, not idle.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 62 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_requests_total{rpc=~\"forfeit_object_write|renew_write_lease\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{rpc}}" },
+        { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_errors_total{rpc=~\"forfeit_object_write|renew_write_lease\"}[$__rate_interval]))", "refId": "B", "legendFormat": "{{rpc}} errors" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Legacy window path (reservation era) — non-default", "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 70 },
+      "panels": [
+        {
+          "type": "timeseries", "title": "Legacy write RPC rates (req/s) — initiate / commit_window / commit / abort",
+          "description": "The pre-decentralization window path: InitiateObjectWrite → ReserveObjectWriteWindow → CommitObjectWrite(Window). Should be flat zero when all clients run the current begin→commit path; any traffic here means a client is still on the legacy pipeline (D10: never let the two generations blur in one panel elsewhere).",
+          "gridPos": { "h": 8, "w": 8, "x": 0, "y": 71 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+          "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+          "targets": [ { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_requests_total{rpc=~\"initiate_object_write|commit_object_write|commit_object_write_window|abort_object_write\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{rpc}} (legacy)" } ]
+        },
+        {
+          "type": "timeseries", "title": "Reservation cache hit % + depth (legacy)",
+          "description": "Reservation-era allocation cache serving the legacy window path. Only meaningful while the legacy rates panel shows traffic; hit% collapsing under legacy load meant reservation refill storms. Depth is the live cached-window count.",
+          "gridPos": { "h": 8, "w": 8, "x": 8, "y": 71 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": { "unit": "percentunit", "max": 1, "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } },
+            "overrides": [ { "matcher": { "id": "byName", "options": "cache depth" }, "properties": [ { "id": "unit", "value": "short" }, { "id": "max", "value": null }, { "id": "custom.axisPlacement", "value": "right" } ] } ]
+          },
+          "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+          "targets": [
+            { "expr": "sum(rate(keinfs_kms_reservation_cache_hits[$__rate_interval])) / clamp_min(sum(rate(keinfs_kms_reservation_cache_hits[$__rate_interval])) + sum(rate(keinfs_kms_reservation_cache_misses[$__rate_interval])), 1e-9)", "refId": "A", "legendFormat": "hit %" },
+            { "expr": "sum(keinfs_kms_reservation_cache_depth)", "refId": "B", "legendFormat": "cache depth" }
+          ]
+        },
+        {
+          "type": "timeseries", "title": "Expired write intents (legacy, intents/s)",
+          "description": "Legacy-era write intents expired by the background sweeper. The current-path counterpart is keinfs_kms_write_leases_reaped (paneled on the control-health dashboard). Sustained expiries with legacy traffic = legacy clients abandoning writes.",
+          "gridPos": { "h": 8, "w": 8, "x": 16, "y": 71 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+          "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+          "targets": [ { "expr": "sum(rate(keinfs_kms_expired_write_intents[$__rate_interval]))", "refId": "A", "legendFormat": "expired intents (legacy)" } ]
+        }
+      ]
+    }
+  ]
+}

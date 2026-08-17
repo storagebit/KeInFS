@@ -1,0 +1,421 @@
+{
+  "uid": "keinfs-control-health",
+  "title": "KeInFS — Control-Plane Health",
+  "tags": ["keinfs", "kms", "control-plane"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus", "current": { "text": "Prometheus", "value": "keinfs-prom" } }
+    ]
+  },
+  "links": [
+    { "title": "KMS Detail", "type": "link", "url": "/d/keinfs-kms-detail", "icon": "external link", "tooltip": "Per-RPC / per-phase KMS deep dive" },
+    { "title": "KST Overview", "type": "link", "url": "/d/keinfs-kst-overview", "icon": "external link", "tooltip": "Storage-target fleet" },
+    { "title": "I/O Lifecycle", "type": "link", "url": "/d/keinfs-io-lifecycle", "icon": "external link", "tooltip": "End-to-end write/read funnel" }
+  ],
+  "panels": [
+    {
+      "type": "stat", "title": "Orphan-Version Backlog",
+      "description": "Live count of orphaned object versions waiting for the orphan-version reaper. Steady non-zero under churn is normal; sustained growth means the reaper cannot keep up (check reap_errors and reaper activity below).",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "textMode": "value" },
+      "targets": [ { "expr": "sum(keinfs_kms_orphan_version_backlog)", "refId": "A", "legendFormat": "backlog" } ]
+    },
+    {
+      "type": "stat", "title": "Oldest Orphan Version Age",
+      "description": "Age of the oldest unreaped orphan version. Growing unbounded = a version the reaper cannot process (writer marker stuck, live head guard, or a reap error) — space and index entries for it are not being reclaimed.",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ms", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 300000 }, { "color": "red", "value": 3600000 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "textMode": "value" },
+      "targets": [ { "expr": "max(keinfs_kms_orphan_version_oldest_age_ms)", "refId": "A", "legendFormat": "oldest age" } ]
+    },
+    {
+      "type": "stat", "title": "Orphan Reap Errors (cumulative, must be 0)",
+      "description": "Cumulative errors while reaping orphan versions. Any non-zero value means garbage is accumulating: find the failing version in KMS logs. Alert candidate.",
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value" },
+      "targets": [ { "expr": "sum(keinfs_kms_orphan_version_reap_errors)", "refId": "A", "legendFormat": "reap errors" } ]
+    },
+    {
+      "type": "stat", "title": "Commits Rejected: Version Reclaimed (cumulative, must be 0)",
+      "description": "KMS-side fence: a client tried to commit a version the reaper had already reclaimed. Non-zero = a slow/zombie writer raced the reaper — data is safe (the commit was refused) but the client saw a failed write. Alert candidate.",
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value" },
+      "targets": [ { "expr": "sum(keinfs_kms_commit_rejected_version_reclaimed)", "refId": "A", "legendFormat": "commit rejects" } ]
+    },
+    {
+      "type": "stat", "title": "KST Committed-Slot Write Rejections (cumulative, must be 0)",
+      "description": "KST-side fence backstop: a fragment write arrived for a slot already committed/reclaimed. Non-zero = the fence triangle caught a late writer at the media edge — investigate with the reclaim & commit fences row below. Alert candidate.",
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value" },
+      "targets": [ { "expr": "sum(keinfs_kst_committed_slot_write_rejections)", "refId": "A", "legendFormat": "slot rejects" } ]
+    },
+    {
+      "type": "stat", "title": "Reclaim Fences Cleared (cumulative)",
+      "description": "Cumulative reclaim fences cleared by KMS after orphan reclamation completed. This should tick along with reaper activity; a large gap between versions reaped and fences cleared means fences are being left behind.",
+      "gridPos": { "h": 5, "w": 4, "x": 20, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value" },
+      "targets": [ { "expr": "sum(keinfs_kms_reclaim_fences_cleared)", "refId": "A", "legendFormat": "fences cleared" } ]
+    },
+
+    { "type": "row", "title": "Write leases & markers", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 } },
+    {
+      "type": "timeseries", "title": "Write-lease reaping (per second)",
+      "description": "Rate of write leases reaped by the current-era sweeper vs the legacy expired-write-intent counter (legacy window path only). Sustained lease reaping means clients are dying mid-write or failing to renew — cross-check renew/forfeit RPC rates to the right.",
+      "gridPos": { "h": 8, "w": 10, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_write_leases_reaped[$__rate_interval]))", "refId": "A", "legendFormat": "write_leases_reaped (current path)" },
+        { "expr": "sum(rate(keinfs_kms_expired_write_intents[$__rate_interval]))", "refId": "B", "legendFormat": "expired_write_intents (LEGACY window path)" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Lease-control RPCs (per second)",
+      "description": "Renew and forfeit RPC rates from clients. renew_write_lease should track long-running writes; forfeit_object_write is a client abandoning a write cleanly — a forfeit spike alongside lease reaping points at client-side failures.",
+      "gridPos": { "h": 8, "w": 9, "x": 10, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_requests_total{rpc=~\"renew_write_lease|forfeit_object_write\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{rpc}}" },
+        { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_errors_total{rpc=~\"renew_write_lease|forfeit_object_write\"}[$__rate_interval]))", "refId": "B", "legendFormat": "{{rpc}} errors" }
+      ]
+    },
+    {
+      "type": "stat", "title": "Write Leases Reaped (cumulative)",
+      "description": "Cumulative write leases reaped since KMS start. Zero on a healthy cluster with well-behaved clients; every increment is one writer that vanished without forfeiting.",
+      "gridPos": { "h": 8, "w": 5, "x": 19, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "textMode": "value" },
+      "targets": [ { "expr": "sum(keinfs_kms_write_leases_reaped)", "refId": "A", "legendFormat": "reaped" } ]
+    },
+
+    { "type": "row", "title": "Orphan-version reaper (current mechanism)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 } },
+    {
+      "type": "timeseries", "title": "Backlog over time",
+      "description": "Orphan-version backlog per KMS instance. This is background debt: a sawtooth is healthy (accumulate → reap); a monotonic climb means the reaper is stuck or outpaced. NOT the same mechanism as legacy orphan GC (next row).",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "keinfs_kms_orphan_version_backlog", "refId": "A", "legendFormat": "{{instance}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Oldest orphan age over time",
+      "description": "Age of the oldest unreaped orphan version per KMS instance. A flat plateau that keeps rising linearly = one specific version is unreapable (check skipped_head_live / skipped_writer_alive and reap_errors).",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ms", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "keinfs_kms_orphan_version_oldest_age_ms", "refId": "A", "legendFormat": "{{instance}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Reap errors (per second, must stay 0)",
+      "description": "Rate of orphan-version reap failures. Any blip here is a bug or an FDB availability issue; the affected versions stay in the backlog and pin the oldest-age gauge.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "fixed", "fixedColor": "red" }, "custom": { "fillOpacity": 25, "lineWidth": 1, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "sum(rate(keinfs_kms_orphan_version_reap_errors[$__rate_interval]))", "refId": "A", "legendFormat": "reap errors/s" } ]
+    },
+    {
+      "type": "timeseries", "title": "Reaper activity (per second)",
+      "description": "Scan → claim → reap pipeline rates plus resumed reaps after interruption. Claimed should roughly equal reaped; a persistent gap means reaps are being abandoned mid-flight (look at resumed and reap errors).",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_orphan_version_scans[$__rate_interval]))", "refId": "A", "legendFormat": "scans" },
+        { "expr": "sum(rate(keinfs_kms_orphan_versions_claimed[$__rate_interval]))", "refId": "B", "legendFormat": "claimed" },
+        { "expr": "sum(rate(keinfs_kms_orphan_versions_reaped[$__rate_interval]))", "refId": "C", "legendFormat": "reaped" },
+        { "expr": "sum(rate(keinfs_kms_orphan_versions_resumed[$__rate_interval]))", "refId": "D", "legendFormat": "resumed" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Reaper skips (per second)",
+      "description": "Versions the reaper deliberately left alone: head became live again, the writer's lease is still alive, or a tombstone already covers it. Skips are safety behavior, not errors — but a version stuck in skipped_writer_alive forever means a lease that never expires.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_orphan_versions_skipped_head_live[$__rate_interval]))", "refId": "A", "legendFormat": "skipped: head live" },
+        { "expr": "sum(rate(keinfs_kms_orphan_versions_skipped_writer_alive[$__rate_interval]))", "refId": "B", "legendFormat": "skipped: writer alive" },
+        { "expr": "sum(rate(keinfs_kms_orphan_version_tombstones_skipped[$__rate_interval]))", "refId": "C", "legendFormat": "skipped: tombstone" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Cleanup detail (per second)",
+      "description": "What each reap actually deleted: metadata rows cleared, KCO1 index entries cleared, and storage targets cleaned of fragments. Targets-cleaned lagging rows-cleared means target-side deletion is falling behind metadata deletion.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_orphan_version_rows_cleared[$__rate_interval]))", "refId": "A", "legendFormat": "rows cleared" },
+        { "expr": "sum(rate(keinfs_kms_orphan_version_kco1_cleared[$__rate_interval]))", "refId": "B", "legendFormat": "kco1 cleared" },
+        { "expr": "sum(rate(keinfs_kms_orphan_version_targets_cleaned[$__rate_interval]))", "refId": "C", "legendFormat": "targets cleaned" }
+      ]
+    },
+
+    { "type": "row", "title": "Legacy orphan GC (separate mechanism — not the orphan-version reaper)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 } },
+    {
+      "type": "timeseries", "title": "Legacy orphan GC activity (per second)",
+      "description": "The OLDER, separate orphan mechanism (orphan_gc_*): sweeps allocation orphans from the legacy window path, distinct from the orphan-version reaper above. If the legacy write path carries no traffic these should be flat at 0; activity here means legacy-path writes are still happening.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_orphan_gc_runs[$__rate_interval]))", "refId": "A", "legendFormat": "gc runs" },
+        { "expr": "sum(rate(keinfs_kms_orphan_gc_freed[$__rate_interval]))", "refId": "B", "legendFormat": "freed" },
+        { "expr": "sum(rate(keinfs_kms_orphan_gc_reused[$__rate_interval]))", "refId": "C", "legendFormat": "reused" },
+        { "expr": "sum(rate(keinfs_kms_orphan_gc_skipped_committed[$__rate_interval]))", "refId": "D", "legendFormat": "skipped: committed" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Legacy orphan GC — lease-active skips (per second)",
+      "description": "Legacy-GC candidates skipped because a write lease was still active. Persistent activity means legacy-path writers are long-lived enough to collide with the GC interval.",
+      "gridPos": { "h": 8, "w": 7, "x": 12, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "fixed", "fixedColor": "orange" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "sum(rate(keinfs_kms_orphan_gc_lease_active[$__rate_interval]))", "refId": "A", "legendFormat": "lease active skips" } ]
+    },
+    {
+      "type": "stat", "title": "Legacy GC Freed (cumulative)",
+      "description": "Cumulative allocations freed by the legacy orphan GC since KMS start. On a cluster running only the current write path this stays frozen — movement means legacy traffic exists.",
+      "gridPos": { "h": 8, "w": 5, "x": 19, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "orange" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value" },
+      "targets": [ { "expr": "sum(keinfs_kms_orphan_gc_freed)", "refId": "A", "legendFormat": "freed" } ]
+    },
+
+    { "type": "row", "title": "Reclaim & commit fences", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 } },
+    {
+      "type": "timeseries", "title": "Fence triangle (per second)",
+      "description": "The three fence signals together: fences cleared (normal reclaim completion), KMS commits rejected because the version was reclaimed, and KST writes rejected against committed slots. Cleared ticking with reaper activity is healthy; ANY rejection is a caught race and warrants investigation even though data stayed safe.",
+      "gridPos": { "h": 8, "w": 9, "x": 0, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_reclaim_fences_cleared[$__rate_interval]))", "refId": "A", "legendFormat": "reclaim fences cleared" },
+        { "expr": "sum(rate(keinfs_kms_commit_rejected_version_reclaimed[$__rate_interval]))", "refId": "B", "legendFormat": "KMS commit rejected (version reclaimed)" },
+        { "expr": "sum(rate(keinfs_kst_committed_slot_write_rejections[$__rate_interval]))", "refId": "C", "legendFormat": "KST committed-slot write rejections (fleet)" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Committed-slot write rejections per target",
+      "description": "KST fence backstop broken out per target (cumulative counter shown raw so a single historical rejection stays visible). One target accumulating rejections points at a client repeatedly retrying stale fragments toward that drive.",
+      "gridPos": { "h": 8, "w": 8, "x": 9, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "keinfs_kst_committed_slot_write_rejections", "refId": "A", "legendFormat": "{{target_id}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Commit RPC rate by flavor (per second)",
+      "description": "All commit flavors — single-shot commit_object, streamed commit_object_segmented, and batched multi_commit_object — split by RPC. Context for the fence panels: rejections should be vanishingly rare relative to this commit volume.",
+      "gridPos": { "h": 8, "w": 7, "x": 17, "y": 41 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_requests_total{rpc=~\"commit_object|commit_object_segmented|multi_commit_object\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{rpc}}" } ]
+    },
+
+    { "type": "row", "title": "Storage-class routing", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 } },
+    {
+      "type": "timeseries", "title": "Write-profile routing decisions (per second)",
+      "description": "BeginObject storage-class routing: every write passes write_profile_class_route; write_profile_alternate counts small objects rerouted to a bucket's replicated profile, write_profile_default counts writes kept on the bucket's default EC profile. alternate/route ratio = fraction of small-object traffic.",
+      "gridPos": { "h": 8, "w": 9, "x": 0, "y": 50 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "sum by (phase) (rate(keinfs_kms_phase_latency_samples{rpc=\"begin_object\",phase=~\"write_profile_class_route|write_profile_default|write_profile_alternate\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{phase}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Routing decision latency (µs) — pow2-bucketed approx",
+      "description": "Latency of the write_profile_class_route phase inside BeginObject. Should be near-zero (a cached catalog lookup); growth means the EC-profile catalog cache is thrashing. Note: p99 is a power-of-2 bucketed approximation; avg is exact.",
+      "gridPos": { "h": 8, "w": 9, "x": 9, "y": 50 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kms_phase_latency_microseconds{rpc=\"begin_object\",phase=\"write_profile_class_route\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "p99 (pow2 approx) {{instance}}" },
+        { "expr": "keinfs_kms_phase_latency_avg_microseconds{rpc=\"begin_object\",phase=\"write_profile_class_route\"}", "refId": "B", "legendFormat": "avg {{instance}}" }
+      ]
+    },
+    {
+      "type": "stat", "title": "EC-Profile Catalog Cache Hit %",
+      "description": "Hit ratio of the EC-profile catalog cache feeding profile selection and class routing (from begin_object phase sample counters). Should sit near 100% in steady state; misses mean FDB round-trips on the write hot path.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 50 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 0.9 }, { "color": "green", "value": 0.99 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "textMode": "value" },
+      "targets": [ { "expr": "sum(rate(keinfs_kms_phase_latency_samples{rpc=\"begin_object\",phase=\"ec_profile_catalog_cache_hit\"}[$__rate_interval])) / (sum(rate(keinfs_kms_phase_latency_samples{rpc=\"begin_object\",phase=~\"ec_profile_catalog_cache_hit|ec_profile_catalog_cache_miss\"}[$__rate_interval])) > 0)", "refId": "A", "legendFormat": "hit ratio" } ]
+    },
+
+    { "type": "row", "title": "FDB txn health", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 58 } },
+    {
+      "type": "text", "title": "Not yet instrumented: FDB transaction health",
+      "description": "Placeholder for the FoundationDB transaction-health row. Nothing to render until KMS instruments its FDB client.",
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 59 },
+      "options": { "mode": "markdown", "content": "**Missing instrumentation (gap C6).** The KMS stat tree exposes **no FoundationDB metrics at all** — no txn commit latency, no conflict/retry counts, no transaction-too-old counters — despite the multi-threaded FDB client (commit 61ba0a1). Until KMS instruments the FDB layer and keinexport exports it, FDB stalls will only show up indirectly as inflated `store_*` phase latencies on the KMS Detail dashboard.\n\nPlanned panels for this row once C6 lands: FDB commit latency (avg/p99/max), conflict-retry rate, txn-too-old rate, per-shard txn volume." }
+    },
+
+    { "type": "row", "title": "Capacity & occupancy", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 64 } },
+    {
+      "type": "timeseries", "title": "Net granules by storage class",
+      "description": "Physical slots (granules) attributable to each storage class: committed minus deleted, counted by KMS at commit/delete time. These are counters since KMS process start — a restart resets them to zero, so read per-class growth rate and mix, not absolute level; KST granule occupancy (Fleet Overview → Capacity) is the absolute truth for physical fill.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 65 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "granules" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "sum by (class) (keinfs_kms_class_committed_granules_total) - sum by (class) (keinfs_kms_class_deleted_granules_total)", "refId": "A", "legendFormat": "{{class}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Net logical bytes by storage class",
+      "description": "Logical object bytes attributable to each storage class: committed minus deleted. Same caveat as the granule panel: counters since KMS process start (restarts reset to zero) — use this for per-class growth and traffic mix, and KST occupancy for absolute physical truth.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 65 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "logical bytes" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "sum by (class) (keinfs_kms_class_committed_logical_bytes_total) - sum by (class) (keinfs_kms_class_deleted_logical_bytes_total)", "refId": "A", "legendFormat": "{{class}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Physical amplification by class (x)",
+      "description": "Physical bytes consumed per logical byte stored, by class: net granules × average extent size ÷ net logical bytes. Expect rep-1-2 to cost ~3x at extent-filling object sizes and worse below (a tiny object still burns whole granules on 3 targets); shrunk-EC costs ~10 granules per ≤ 1 MiB object. A class drifting upward means its object-size mix is getting smaller/less efficient — reconsider its routing threshold or profile.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 65 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 2, "min": 0, "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never", "axisLabel": "x (physical / logical)" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "(sum by (class) (keinfs_kms_class_committed_granules_total) - sum by (class) (keinfs_kms_class_deleted_granules_total)) * scalar(avg(keinfs_kst_extent_bytes)) / clamp_min(sum by (class) (keinfs_kms_class_committed_logical_bytes_total) - sum by (class) (keinfs_kms_class_deleted_logical_bytes_total), 1)", "refId": "A", "legendFormat": "{{class}}" } ]
+    },
+    {
+      "type": "stat", "title": "Commit rate by class (obj/s)",
+      "description": "Objects committed per second per storage class (5m rate). Shows where write traffic is landing after storage-class routing — small-object traffic should appear under the replicated class if routing is working. A class stuck at 0 while its buckets take writes means routing never selects it; compare with the routing-decision panel above.",
+      "gridPos": { "h": 5, "w": 8, "x": 0, "y": 73 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "decimals": 2, "color": { "mode": "palette-classic" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value_and_name", "justifyMode": "center" },
+      "targets": [ { "expr": "sum by (class) (rate(keinfs_kms_class_committed_objects_total[5m]))", "refId": "A", "legendFormat": "{{class}}" } ]
+    },
+
+    { "type": "row", "title": "Target inventory & admin", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 78 } },
+    {
+      "type": "timeseries", "title": "Inventory & placement RPCs (per second)",
+      "description": "Target registration, heartbeats, inventory listing, admin state changes, and computed-placement reservations. heartbeat_target should be a steady floor of targets × heartbeat rate; a drop = targets falling out of the inventory. reserve_computed_placement tracks decentralized-placement write setup.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 79 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_requests_total{rpc=~\"register_target|heartbeat_target|list_targets|set_target_state|reserve_computed_placement\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{rpc}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Target failure / lifecycle RPCs (per second)",
+      "description": "Failure reports and drain/recover/retire admin actions. Anything non-zero here is an operator action or a client reporting a bad target — correlate with rebuild activity and per-target error counters on the KST overview.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 79 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_requests_total{rpc=~\"report_target_failure|drain_target|recover_target|retire_target|delete_namespace_entry\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{rpc}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Repair writes (per second)",
+      "description": "repair_object_write is the degraded-write path: a client repairing fragments after a failed target. Should be 0 in steady state; sustained activity means clients keep hitting bad targets — check which targets in the failure-RPC panel.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 79 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_rpc_requests_total{rpc=\"repair_object_write\"}[$__rate_interval]))", "refId": "A", "legendFormat": "repair_object_write" },
+        { "expr": "sum(rate(keinfs_kms_rpc_errors_total{rpc=\"repair_object_write\"}[$__rate_interval]))", "refId": "B", "legendFormat": "repair errors" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Repair phase latency (µs) — pow2-bucketed approx",
+      "description": "Where repair-write time goes inside KMS: replacement-placement reservation vs the store write. Note: p99 is a power-of-2 bucketed approximation; avg is exact.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 87 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kms_phase_latency_microseconds{rpc=\"repair_object_write\",phase=~\"kas_reserve_replacement|store_repair_object_write\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{phase}} p99 (pow2 approx)" },
+        { "expr": "keinfs_kms_phase_latency_avg_microseconds{rpc=\"repair_object_write\",phase=~\"kas_reserve_replacement|store_repair_object_write\"}", "refId": "B", "legendFormat": "{{phase}} avg" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Heartbeat / placement RPC latency (µs) — pow2-bucketed approx",
+      "description": "Latency of heartbeat_target and reserve_computed_placement. Heartbeats are the target-liveness heartbeat of the whole inventory: rising latency here predicts spurious target-down decisions. Note: p99 is a power-of-2 bucketed approximation; avg is exact.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 87 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kms_rpc_latency_microseconds{rpc=~\"heartbeat_target|reserve_computed_placement\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{rpc}} p99 (pow2 approx)" },
+        { "expr": "keinfs_kms_rpc_latency_avg_microseconds{rpc=~\"heartbeat_target|reserve_computed_placement\"}", "refId": "B", "legendFormat": "{{rpc}} avg" }
+      ]
+    },
+
+    { "type": "row", "title": "Background sweeper", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 95 } },
+    {
+      "type": "timeseries", "title": "Sweeper runs (per second)",
+      "description": "Background sweeper execution rate per KMS instance. Should be a steady cadence at the configured interval; gaps mean the sweeper is stuck (and lease reaping / orphan scanning stop with it).",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 96 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [ { "expr": "rate(keinfs_kms_background_runs[$__rate_interval])", "refId": "A", "legendFormat": "{{instance}}" } ]
+    },
+    {
+      "type": "timeseries", "title": "Sweeper run latency (µs, avg)",
+      "description": "Average wall time of one sweeper run and of its release work. A run time approaching the sweep interval means the sweeper saturates and background debt (backlog, unreaped leases) starts growing.",
+      "gridPos": { "h": 8, "w": 10, "x": 8, "y": 96 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kms_background_run_latency_avg_microseconds", "refId": "A", "legendFormat": "run avg {{instance}}" },
+        { "expr": "keinfs_kms_background_release_latency_avg_microseconds", "refId": "B", "legendFormat": "release avg {{instance}}" }
+      ]
+    },
+    {
+      "type": "stat", "title": "Sweeper Runs (cumulative)",
+      "description": "Cumulative background sweeper runs since KMS start. Frozen value while the process is up = the sweeper task died.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 96 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "fixed", "fixedColor": "blue" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value" },
+      "targets": [ { "expr": "sum(keinfs_kms_background_runs)", "refId": "A", "legendFormat": "runs" } ]
+    },
+
+    { "type": "row", "title": "Rebuild (KRS)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 104 } },
+    {
+      "type": "text", "title": "Not yet instrumented: KRS rebuild daemon",
+      "description": "Placeholder for the rebuild row. The rebuild story is dark until keinexport gains keinfs_krs_* families.",
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 105 },
+      "options": { "mode": "markdown", "content": "**Missing export (gap C2).** keinexport exports **zero `keinfs_krs_*` families**, so the rebuild daemon (leased tasks, active task, failed tasks, rebuilt bytes) has no dashboard presence. Rebuild progress after a drive failure is currently only observable via the KRS stat tree on disk and indirectly via KMS `repair_object_write` / target-failure RPC rates above.\n\nPlanned panels once C2 lands: leased vs completed rebuild tasks, active task gauge, failed tasks (must-be-0), rebuilt bytes/s per target." }
+    }
+  ]
+}

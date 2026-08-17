@@ -1,0 +1,26 @@
+name: Public repository safety
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Exercise sanitizer detectors
+        run: python3 tools/check-public-safety.py --self-test
+      - name: Scan the complete tracked tree
+        run: python3 tools/check-public-safety.py --worktree
+      - name: Scan Git history for secrets
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"

@@ -1,0 +1,12 @@
+# Baseline KRS config rendered by the root toolchain.
+# KRS is daemon-per-storage-server work, so keep the lease owner tied to the
+# actual host instead of pretending the daemon is fungible.
+
+kms_endpoint = {{KRS_KMS_ENDPOINT}}
+kas_endpoint = {{KRS_KAS_ENDPOINTS}}
+lease_owner = {{KRS_LEASE_OWNER}}
+max_tasks = 64
+lease_ttl_ms = 30000
+poll_ms = 1000
+stats_root = {{KRS_STATS_ROOT}}
+stats_publish_ms = 250

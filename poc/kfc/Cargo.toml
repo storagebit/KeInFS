@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andreas Krause / storagebit
+#
+# kfc: the KeInFS FUSE client binary (KFC v2). It is now a thin CLI shell over
+# the portable `kfc-core` engine and the `kfc-transport` FUSE shim. The `fuse`
+# feature pulls in `kfc-transport` (and transitively `fuser`); without it the
+# `mount` subcommand reports that FUSE support was not built, while `mode-bench`
+# (which talks to KSC directly) still works.
+[package]
+name = "kfc"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[[bin]]
+name = "kfc"
+path = "src/main.rs"
+
+[features]
+default = []
+fuse = ["dep:kfc-transport"]
+# FUSE-over-io_uring transport (Phase 5; Linux + kernel >= 6.14). The binary must
+# be built with this feature for the io_uring backend to be compiled in; it is
+# then selected at runtime only when KFC_IO_URING=1 (see select_backend).
+io-uring = ["fuse", "kfc-transport/io-uring"]
+
+[dependencies]
+kfc-core = { path = "../kfc-core" }
+kfc-transport = { path = "../kfc-transport", optional = true }
+ksc = { path = "../ksc" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "time"] }

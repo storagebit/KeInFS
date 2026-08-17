@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+[package]
+name = "keinexport"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[[bin]]
+name = "keinexport"
+path = "src/main.rs"
+
+[dependencies]
+keinbuild = { path = "../keinbuild" }
+serde_json = "1"
+
+[build-dependencies]
+keinbuild = { path = "../keinbuild" }

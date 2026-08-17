@@ -1,0 +1,246 @@
+{
+  "uid": "keinfs-read-path",
+  "title": "KeInFS — Life of a READ",
+  "tags": ["keinfs", "read-path", "lifecycle"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus", "current": { "text": "Prometheus", "value": "keinfs-prom" } }
+    ]
+  },
+  "links": [
+    { "title": "Write Path", "type": "link", "url": "/d/keinfs-write-path", "icon": "external link", "tooltip": "Life of a WRITE, stage by stage" },
+    { "title": "KMS Detail", "type": "link", "url": "/d/keinfs-kms-detail", "icon": "external link", "tooltip": "Metadata service deep dive" },
+    { "title": "KST Overview", "type": "link", "url": "/d/keinfs-kst-overview", "icon": "external link", "tooltip": "Storage target fleet" },
+    { "title": "KST Detail", "type": "link", "url": "/d/keinfs-kst-detail", "icon": "external link", "tooltip": "Single-target full phase decomposition" },
+    { "title": "I/O Drilldown", "type": "link", "url": "/d/keinfs-io-drilldown", "icon": "external link", "tooltip": "Generic phase explorer" }
+  ],
+  "panels": [
+    {
+      "type": "row", "title": "Stage 0 — Client (KSC): resolve → connect → read → reconstruct", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "type": "text", "title": "Not yet instrumented: KSC client read metrics",
+      "description": "Placeholder for the client stage of the read story. The KSC stats root is not exported yet (gap C1), so Stage 0 is dark in Grafana.",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 1 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Pending exporter work (gap C1):** the entire KSC client stats root is unexported — no `keinfs_ksc_*` families exist on the exporter. Once C1 lands, this row gains:\n\n- **`kms_resolve`** — read-resolve RTT to KMS (ResolveObjectRead / ResolveObjectHead). Zero on a client-side cache hit.\n- **`target_connect`** — HTTP/2 session establishment to KST.\n- **`target_read`** — per-fragment read time (per-fragment *sum*: inflates with fan-out and retries; multi-stripe summation caveat applies).\n- **`ec_reconstruct`** — genuine Reed–Solomon reconstruction on reads. **This is the ONLY degraded-read signal anywhere in the system**: no KMS or KST metric distinguishes a fast-path read from a degraded read. Until C1 lands, degraded reads are invisible in Grafana. (Note: on *write* flows the same field is a stash hack holding the BeginObject RTT — the exporter must apply the B4 renames before these series appear, or this panel would lie.)\n- **`target_payload_validate` / `target_protocol_decode`** — client-side KP2 decode + CRC validation cost.\n\nUntil then: infer client health indirectly from Stage 1 resolve latency and Stage 2–4 KST-side read latency."
+      }
+    },
+
+    {
+      "type": "row", "title": "Stage 1 — KMS resolve (ResolveObjectRead, read cache, route cache)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 }
+    },
+    {
+      "type": "timeseries", "title": "ResolveObjectRead rate & errors",
+      "description": "Read-resolve RPC rate per KMS instance, plus its error rate. This is the metadata lookup every uncached client read performs. Errors should be 0; a rate collapse while clients are active = clients are being served from their own cache, or resolve is failing upstream.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(keinfs_kms_rpc_requests_total{rpc=\"resolve_object_read\"}[$__rate_interval])", "refId": "A", "legendFormat": "{{instance}} resolve/s" },
+        { "expr": "rate(keinfs_kms_rpc_errors_total{rpc=\"resolve_object_read\"}[$__rate_interval])", "refId": "B", "legendFormat": "{{instance}} errors/s" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "ResolveObjectRead latency (avg / p99 / max)",
+      "description": "Read-resolve latency per KMS instance. p99 is a pow2-bucketed approximation (quantile-labeled gauge, power-of-2 buckets — steps like 65536 µs are quantization, not workload); avg and max are exact. Healthy resolve on a warm read cache is sub-millisecond; a jump here delays every uncached read before a single data byte moves.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kms_rpc_latency_avg_microseconds{rpc=\"resolve_object_read\"}", "refId": "A", "legendFormat": "{{instance}} avg" },
+        { "expr": "keinfs_kms_rpc_latency_microseconds{rpc=\"resolve_object_read\",quantile=\"0.99\"}", "refId": "B", "legendFormat": "{{instance}} p99 (pow2-bucketed approx)" },
+        { "expr": "keinfs_kms_rpc_latency_microseconds{rpc=\"resolve_object_read\",quantile=\"1.0\"}", "refId": "C", "legendFormat": "{{instance}} max" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "ResolveObjectHead rate & latency — populates after next KMS deploy",
+      "description": "The decentralized head-only resolve (rpc=resolve_object_head). The RPC kind was just added in code (gap C5) — this panel populates after the next KMS deploy; until then it renders no data by design (visible gap, not a broken query). Once live, this is THE decentralized-read metadata-load signal. Latency p99 is pow2-bucketed approx.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } }, "overrides": [ { "matcher": { "id": "byFrameRefID", "options": "B" }, "properties": [ { "id": "unit", "value": "µs" }, { "id": "custom.axisPlacement", "value": "right" } ] } ] },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(keinfs_kms_rpc_requests_total{rpc=\"resolve_object_head\"}[$__rate_interval])", "refId": "A", "legendFormat": "{{instance}} head resolves/s" },
+        { "expr": "keinfs_kms_rpc_latency_microseconds{rpc=\"resolve_object_head\",quantile=\"0.99\"}", "refId": "B", "legendFormat": "{{instance}} p99 µs (pow2-bucketed approx)" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Read-cache activity (hit / miss / store per second)",
+      "description": "KMS read-cache phase occurrence rates under rpc=resolve_object_read (derived from phase sample counters). Hits should dominate under a steady read workload; a miss+store surge = cold cache or an invalidation storm (see the invalidations panel). This IS the resolve fast path — misses pay the full store lookup.",
+      "gridPos": { "h": 8, "w": 7, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum by (phase) (rate(keinfs_kms_phase_latency_samples{rpc=\"resolve_object_read\",phase=~\"read_cache_hit|read_cache_miss|read_cache_store\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{phase}}" }
+      ]
+    },
+    {
+      "type": "stat", "title": "Read-cache hit %",
+      "description": "Share of resolve_object_read requests served from the KMS read cache over the current rate window. High (>90%) under steady reads = fast path healthy. A sustained drop means resolves are paying store-lookup cost — correlate with the invalidations panel.",
+      "gridPos": { "h": 8, "w": 4, "x": 7, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 0.6 }, { "color": "green", "value": 0.9 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "textMode": "value" },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_phase_latency_samples{rpc=\"resolve_object_read\",phase=\"read_cache_hit\"}[$__rate_interval])) / (sum(rate(keinfs_kms_phase_latency_samples{rpc=\"resolve_object_read\",phase=\"read_cache_hit\"}[$__rate_interval])) + sum(rate(keinfs_kms_phase_latency_samples{rpc=\"resolve_object_read\",phase=\"read_cache_miss\"}[$__rate_interval])))", "refId": "A", "legendFormat": "hit %" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Read-cache invalidations (all / namespace / object)",
+      "description": "Read-cache invalidation rates by scope. Object-scope invalidations track overwrite/delete churn on read-hot keys; namespace- or all-scope spikes wipe large cache regions and will show up as a miss surge + resolve latency bump on the panels to the left. Frequent 'all' invalidations under normal operation are a bug signal.",
+      "gridPos": { "h": 8, "w": 6, "x": 11, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum by (phase) (rate(keinfs_kms_phase_latency_samples{phase=~\"read_cache_invalidate_(all|namespace|object)\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{phase}}" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Route cache (hits / misses / discovery)",
+      "description": "KMS route-cache behavior: how often the shard/route for a key is answered from cache vs requiring a discovery lookup or discovery RPC. Discovery RPCs should be rare after warm-up; a sustained discovery-RPC rate = topology churn or a cache-sizing problem, and it adds RTTs in front of every affected resolve.",
+      "gridPos": { "h": 8, "w": 7, "x": 17, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_route_cache_hits[$__rate_interval]))", "refId": "A", "legendFormat": "route cache hits/s" },
+        { "expr": "sum(rate(keinfs_kms_route_cache_misses[$__rate_interval]))", "refId": "B", "legendFormat": "route cache misses/s" },
+        { "expr": "sum(rate(keinfs_kms_route_discovery_lookups[$__rate_interval]))", "refId": "C", "legendFormat": "discovery lookups/s" },
+        { "expr": "sum(rate(keinfs_kms_route_discovery_rpcs[$__rate_interval]))", "refId": "D", "legendFormat": "discovery RPCs/s" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Stage 2 — KST read execution (admission & queueing)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 }
+    },
+    {
+      "type": "timeseries", "title": "Queue wait p99: direct-read pool vs packed-serial ingress (µs)",
+      "description": "execution_queue_wait = wait for the direct-read execution pool (single-chunk direct reads); ingress_queue_wait = wait in the serial ingress lane (packed multi-chunk reads). p99 per target, pow2-bucketed approx. If ingress_queue_wait climbs while execution_queue_wait stays flat, the packed-serial lane is the bottleneck (packed reads queue behind each other); the reverse means the direct-read pool is undersized or the drive is slow. Compare against Stage 3 media phases to separate queueing from media time.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kst_phase_latency_microseconds{rpc=\"read\",phase=\"execution_queue_wait\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{target_id}} exec-queue (direct pool) p99" },
+        { "expr": "keinfs_kst_phase_latency_microseconds{rpc=\"read\",phase=\"ingress_queue_wait\",quantile=\"0.99\"}", "refId": "B", "legendFormat": "{{target_id}} ingress-queue (packed serial) p99" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "kix_lookup p99 per target (µs)",
+      "description": "Time the read spends resolving chunk locations in the KIX in-memory live map before touching media. p99, pow2-bucketed approx. Normally near-zero (in-memory); growth here points at KIX shard contention or lookup-queue depth — cross-check the KIX dashboards (per-drive detail pending gap C8).",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kst_phase_latency_microseconds{rpc=\"read\",phase=\"kix_lookup\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{target_id}} p99 (pow2-bucketed approx)" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Read stream admission rejections (/s)",
+      "description": "Rate of read streams rejected at admission per target. Must be 0 in a healthy fleet — any non-zero value means clients are being pushed back before execution (admission limits hit) and read latency at the client will spike with retries. Correlate with the queue-wait panel: rejections with high ingress wait = the target is genuinely saturated.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 25 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 0.001 } ] } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(keinfs_kst_read_stream_rejections[$__rate_interval])", "refId": "A", "legendFormat": "{{target_id}} rejections/s" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Stage 3 — Media read (raw device, direct I/O)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 }
+    },
+    {
+      "type": "timeseries", "title": "Media read phases p99 per target (µs)",
+      "description": "The on-drive read decomposition: media_header_validate (chunk header check), media_payload_read (the actual device read — normally dominant), media_payload_copy (buffer copy), media_crc (integrity check). p99, pow2-bucketed approx. If media_payload_read on one target diverges from the fleet, that drive is the laggard; if media_crc grows, suspect CPU contention on the target, not the drive.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "keinfs_kst_phase_latency_microseconds{rpc=\"read\",phase=~\"media_header_validate|media_payload_read|media_payload_copy|media_crc\",quantile=\"0.99\"}", "refId": "A", "legendFormat": "{{target_id}} {{phase}}" }
+      ]
+    },
+    {
+      "type": "bargauge", "title": "Media read phase budget — fleet max of last p99 (µs)",
+      "description": "Worst-target snapshot of each media read phase's current p99 (pow2-bucketed approx). Reads left-to-right as the media time budget: the tallest bar is where the slowest drive spends its read time. Use it to decide which phase to chase in the timeseries panel.",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1000 }, { "color": "red", "value": 10000 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal", "displayMode": "gradient", "showUnfilled": true },
+      "targets": [
+        { "expr": "max by (phase) (keinfs_kst_phase_latency_microseconds{rpc=\"read\",phase=~\"media_header_validate|media_payload_read|media_payload_copy|media_crc\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "{{phase}}" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Publication retry rate (stale-lane retry, /s)",
+      "description": "Rate of reads that had to retry because the slot-publication lane served a stale location. This is the degraded-lane early-warning signal on the KST side: a rising retry rate means the slot publication lanes are lagging media commits, and read latency tails will follow. Healthy steady state is ~0.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 34 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(keinfs_kst_phase_latency_samples{rpc=\"read\",phase=\"publication_retry\"}[$__rate_interval])", "refId": "A", "legendFormat": "{{target_id}} retries/s" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Stage 4 — Response & packed efficiency", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 42 }
+    },
+    {
+      "type": "timeseries", "title": "Response phases p99 (rpc=read, µs)",
+      "description": "Cost of shipping the read result back over KP2/HTTP-2: response_encode, response_send_headers, response_send_body, response_send. p99 per phase across targets, pow2-bucketed approx. Growth in response_send_body with flat media phases = network/flow-control backpressure from the client, not a storage problem.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 43 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "max by (phase) (keinfs_kst_phase_latency_microseconds{rpc=\"read\",phase=~\"response_encode|response_send_headers|response_send_body|response_send\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "{{phase}} p99 (fleet max, pow2-bucketed approx)" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Packed vs total read requests (/s)",
+      "description": "keinfs_kst_kp2_packed_read_requests rate vs the total read RPC rate per target. The gap between the two is the direct single-chunk read rate. A packed share near 100% under small-object workloads is expected; packed reads take the serial ingress lane (see Stage 2 queue-wait split), so a high packed share plus rising ingress_queue_wait = packing is the throughput limiter.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 43 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(keinfs_kst_kp2_packed_read_requests[$__rate_interval])", "refId": "A", "legendFormat": "{{target_id}} packed reads/s" },
+        { "expr": "rate(keinfs_kst_rpc_requests_total{rpc=\"read\"}[$__rate_interval])", "refId": "B", "legendFormat": "{{target_id}} total reads/s" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Read payload served per target (B/s)",
+      "description": "Wire-level read payload bytes/s served from media per target. Note this is fragment/wire bytes, not client logical bytes — with EC striping and packing, wire bytes can exceed logical bytes by a large factor (the 64x sequential read-amplification class of problem). The logical-bytes counterpart is pending gap C3 (see placeholder below).",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 43 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "Bps", "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 12, "lineWidth": 1, "gradientMode": "opacity", "showPoints": "never" } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "rate(keinfs_kst_read_payload_bytes[$__rate_interval])", "refId": "A", "legendFormat": "{{target_id}}" }
+      ]
+    },
+    {
+      "type": "text", "title": "Not yet instrumented: packed-read chunks & logical bytes (read-amplification)",
+      "description": "Placeholder for the packed-read efficiency metrics that keinexport does not export yet (gap C3).",
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 51 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Pending exporter work (gap C3):** the KST `kp2` stat subtree records `packed_read_chunks` and `packed_read_logical_payload_bytes` (and the write-side equivalents), but keinexport only exports `packed_read_requests`. Once C3 lands, this row gains:\n\n- **Chunks per packed read** (`packed_read_chunks / packed_read_requests`) — packing efficiency; low values mean the packed lane's serialization cost is not being amortized.\n- **Logical vs wire bytes** (`packed_read_logical_payload_bytes` vs `keinfs_kst_read_payload_bytes`) — the direct read-amplification ratio. This is the panel that would have caught the 64x sequential-read amplification found in the KFC v2 work.\n\nUntil then, read amplification can only be inferred by comparing client-observed goodput against the per-target wire B/s panel above."
+      }
+    }
+  ]
+}

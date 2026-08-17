@@ -1,0 +1,6697 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright (C) 2026 Andreas Krause / storagebit
+
+use crate::client::{
+    ClientError, CompletionMode, RequestPhaseTimes, TargetSession, TargetSessionOptions,
+};
+use futures_util::StreamExt;
+use kee::{EcProfile as KeeProfile, FailureDomain as KeeFailureDomain, KeeEngine, PreparedEcPlan};
+use keinctl::proto::kms_client::KmsClient;
+use keinctl::proto::{
+    AbortObjectWriteRequest, BeginObjectRequest, CommitObjectRequest, CommitObjectSeal,
+    CommitObjectSegment, CommitObjectWriteRequest, ForfeitObjectWriteRequest, LandedFragmentRow,
+    ManifestSegment, MultiCommitObjectRequest, RenewWriteLeaseRequest,
+    CommitObjectWriteWindowRequest,
+    DeleteObjectRequest, DeletedObjectVersion, EcProfile, FailureDomain, FragmentPlan, FragmentRef,
+    GetClusterConfigRequest, InitiateObjectWriteRequest, MetadataInvalidationEvent, ObjectHead,
+    ObjectVersionManifest, RepairObjectWriteRequest,
+    ReserveObjectWriteWindowRequest, ResolveObjectHeadRequest, ResolveObjectReadRequest,
+    StripeManifest, TargetRecord, WriteIntent,
+};
+use kp2::{
+    ChunkId, ChunkRange, PackedReadQuery, PackedWriteEntry, PackedWriteRequest, WriteIdentity,
+    MAX_PACK_PAYLOAD_BYTES,
+};
+use prost::Message;
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::fs::File;
+use std::future::Future;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::task::JoinSet;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{sleep, timeout};
+use tonic::transport::{Channel, Endpoint};
+
+const CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(120);
+// The append-then-seal stream does one KMS transaction per segment (~512 stripes); a multi-TiB
+// object streams thousands of them before the seal returns, so this bounds the whole streamed
+// commit far more generously than a single unary control RPC.
+const SEGMENTED_COMMIT_TIMEOUT: Duration = Duration::from_secs(600);
+// A multi-TiB write runs far longer than the KMS write-lease TTL (default 15 min), so a long
+// write heartbeats RenewWriteLease to keep its granules lease-protected until the seal clears
+// the lease. Renew well inside the TTL; push the expiry a full TTL out each beat.
+const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
+const LEASE_HEARTBEAT_TTL_MS: u64 = 900_000;
+// How often the connection-state observability emitter logs per-endpoint pool health + keepalive
+// ping latency during a write (gated on KSC_CONN_TRACE=1; off = zero cost).
+const CONN_STATS_EMIT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Diagnostic gate (KSC_CONN_TRACE=1): periodically emit per-endpoint connection-pool state +
+/// keepalive ping RTT so the data-plane connection layer is observable end-to-end.
+fn conn_stats_trace_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("KSC_CONN_TRACE")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const TARGET_IO_TIMEOUT: Duration = Duration::from_secs(10);
+const TARGET_SAME_PLAN_RETRY_ATTEMPTS: usize = 2;
+const TARGET_SAME_PLAN_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const COMMIT_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(50);
+const COMMIT_RETRY_BACKOFF_CEILING: Duration = Duration::from_millis(500);
+/// Ceiling on how long a KP2 429 `Retry-After` (or computed exponential backoff)
+/// may stall a same-target retry. A misbehaving or hostile target cannot park a
+/// write task for longer than this.
+const TARGET_RETRY_BACKOFF_CEILING: Duration = Duration::from_secs(3);
+pub const DEFAULT_WRITE_WINDOW_MAX_STRIPES: usize = 4096;
+// Keep this SMALL (16). A bigger window means bigger per-batch EC-encode bursts; once the
+// per-object connection fan-out makes the network writes fast, a large batch (64 stripes ~= 8 GiB
+// of data at 16 MiB fragments) cannot be encoded fast enough to keep the drives fed, so the
+// targets sit idle through the encode and throughput collapses into a sawtooth. Measured on the
+// lab: window=64 + fan-out = 0.68 GiB/s with dead 0.0 troughs; window=16 + fan-out = 2.11 GiB/s
+// dead steady (the encode/write pipeline stays balanced). Small batches win.
+pub const DEFAULT_WRITE_WINDOW_INFLIGHT_STRIPES: usize = 16;
+/// Default ceiling on concurrent in-flight fragment writes to distinct storage
+/// targets — the adaptive write limiter's `max`. Decoupled from the stripe-pipelining
+/// knob above: one EC batch fans across many distinct targets (a 16-stripe x (8+3)
+/// batch touches 44-88 of them), so per-endpoint write concurrency must scale with the
+/// target fan-out, not with how many stripes are encoded at once. Previously both were
+/// seeded from `write_window_inflight_stripes` (16), so dozens of targets sat idle.
+pub const DEFAULT_WRITE_INFLIGHT_ENDPOINTS: usize = 64;
+/// Additive-increase step (in permits) applied to the adaptive write limiter
+/// after a batch completes with no 429 observed, until it recovers to the
+/// configured ceiling. Sized so post-429 recovery toward a wide ceiling is practical
+/// rather than crawling back one permit at a time.
+const ADAPTIVE_INFLIGHT_RECOVERY_STEP: usize = 4;
+/// How long a fetched cluster placement config (salt + roster + topology epoch) is reused
+/// before a refetch. Short so a roster change is picked up promptly; the write path also
+/// hard-refreshes on any epoch advance (BeginObject's epoch is passed as a floor).
+const CLUSTER_CONFIG_CACHE_TTL: Duration = Duration::from_secs(15);
+/// Distinct h2 connections opened to each storage target, shared process-wide and reused
+/// round-robin across all write/read clients. One shared connection funnels every
+/// concurrent fragment for a target through a single KST-side receive pump — measured as
+/// the dominant `body_collect` cost at scale — so fanning across N connections gives the
+/// target N parallel receive pumps. Bounded (not per-worker) so the process-wide FD count
+/// stays N x targets regardless of how many `ObjectClient`s share the pool.
+const TARGET_CONNECTIONS_PER_ENDPOINT: usize = 8;
+const KMS_GRPC_INITIAL_STREAM_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
+const KMS_GRPC_INITIAL_CONNECTION_WINDOW_BYTES: u32 = 256 * 1024 * 1024;
+pub const DEFAULT_KMS_GRPC_MAX_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
+const KMS_GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KMS_GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_READ_RESOLVE_CACHE_TTL: Duration = Duration::from_secs(1);
+const DEFAULT_READ_PAYLOAD_CACHE_MAX_ENTRIES: usize = 1024;
+const DEFAULT_READ_PAYLOAD_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
+const DEFAULT_READ_PAYLOAD_CACHE_MAX_OBJECT_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_READ_WINDOW_MAX_STRIPES: usize = 64;
+pub const DEFAULT_METADATA_NOTIFICATION_SUBJECT: &str = "keinfs.kms.events";
+
+#[derive(Debug)]
+pub enum ObjectError {
+    Transport(String),
+    Metadata(String),
+    ControlStatus(tonic::Status),
+    Data(ClientError),
+    Codec(kee::KeeError),
+}
+
+impl fmt::Display for ObjectError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(message) | Self::Metadata(message) => f.write_str(message),
+            Self::ControlStatus(status) => write!(f, "{status}"),
+            Self::Data(err) => write!(f, "{err}"),
+            Self::Codec(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for ObjectError {}
+
+impl ObjectError {
+    /// Extract the KP2 429 backpressure signal from a data-plane error, if any.
+    /// Only `ObjectError::Data` wraps a `ClientError` that can carry the
+    /// `x-kp2-*` headers KST emits on a 429; every other variant yields the
+    /// empty (non-rate-limited) signal.
+    fn rate_limit_signal(&self) -> RateLimitSignal {
+        match self {
+            Self::Data(err) => RateLimitSignal::from_client_error(err),
+            _ => RateLimitSignal::default(),
+        }
+    }
+}
+
+/// Structured KP2 429 backpressure signal pulled off a `ClientError` before it
+/// is flattened to a log string. Carrying these fields (rather than the message
+/// alone) lets the retry path honor `Retry-After` and lets the adaptive limiter
+/// shrink toward the target's advertised `max-in-flight`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RateLimitSignal {
+    rate_limited: bool,
+    retry_after_ms: Option<u64>,
+    limit_max_inflight: Option<usize>,
+}
+
+impl RateLimitSignal {
+    fn from_client_error(err: &ClientError) -> Self {
+        if !err.is_rate_limited() {
+            return Self::default();
+        }
+        Self {
+            rate_limited: true,
+            retry_after_ms: err.retry_after_ms(),
+            limit_max_inflight: err.limit_max_inflight(),
+        }
+    }
+}
+
+impl From<ClientError> for ObjectError {
+    fn from(value: ClientError) -> Self {
+        Self::Data(value)
+    }
+}
+
+impl From<kee::KeeError> for ObjectError {
+    fn from(value: kee::KeeError) -> Self {
+        Self::Codec(value)
+    }
+}
+
+impl From<tonic::Status> for ObjectError {
+    fn from(value: tonic::Status) -> Self {
+        Self::ControlStatus(value)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ObjectPutResult {
+    pub intent: WriteIntent,
+    pub manifest: ObjectVersionManifest,
+    pub ec_profile: EcProfile,
+    pub phases: ObjectPhaseTimes,
+}
+
+#[derive(Clone, Debug)]
+pub struct ObjectGetResult {
+    pub payload: Vec<u8>,
+    pub manifest: ObjectVersionManifest,
+    pub ec_profile: EcProfile,
+    pub phases: ObjectPhaseTimes,
+    pub missing_fragments: usize,
+    pub data_fragment_reads: usize,
+    pub parity_fragment_reads: usize,
+    pub reconstructed: bool,
+}
+
+/// Result of a stripe-granular ranged read. `payload` covers `[offset,
+/// offset+payload.len())` of the object (clamped to the object length). Built
+/// by reading only the stripes the requested range touches, instead of
+/// materializing the whole object.
+#[derive(Clone, Debug)]
+pub struct RangedGetResult {
+    pub payload: Vec<u8>,
+    pub offset: u64,
+    pub object_length_bytes: u64,
+    pub manifest: ObjectVersionManifest,
+    pub ec_profile: EcProfile,
+    pub phases: ObjectPhaseTimes,
+    pub missing_fragments: usize,
+    pub data_fragment_reads: usize,
+    pub parity_fragment_reads: usize,
+    pub reconstructed: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ObjectDeleteResult {
+    pub deleted_versions: Vec<DeletedObjectVersion>,
+    pub fragment_delete_attempts: u64,
+    pub fragment_delete_successes: u64,
+    pub reclaimed_granules: u64,
+    pub cleanup_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ObjectPhaseTimes {
+    /// Overall pre-data control setup wall on writes (contains `kms_begin` and
+    /// `kms_cluster_config` below plus intent/window handling).
+    pub kms_initiate: Duration,
+    /// Write path only: the BeginObject RPC's own RTT.
+    pub kms_begin: Duration,
+    /// Write path only: the cluster-config/roster resolve (cached hit vs the
+    /// O(targets) KMS roster scan on TTL/epoch miss).
+    pub kms_cluster_config: Duration,
+    pub kms_commit: Duration,
+    /// Read path only: object-head/manifest resolve.
+    pub kms_resolve: Duration,
+    pub ec_encode: Duration,
+    /// Read path only: Reed–Solomon reconstruction on degraded reads.
+    pub ec_reconstruct: Duration,
+    pub target_connect: Duration,
+    pub target_write: Duration,
+    /// True wall-clock spent in the concurrent fragment fan-out, summed per batch.
+    /// `target_write` above sums each concurrent fragment's own duration, so it counts
+    /// the same wall-clock window once per fragment — it inflates with fan-out width even
+    /// when the writes ran fully in parallel. This field measures one `Instant` around the
+    /// whole `JoinSet` drain instead, so `target_write / target_write_wall` reveals the
+    /// realized fan-out concurrency and the gap localizes any serialization to the data path.
+    /// Caveat: only the PRIMARY fan-out feeds this wall. Same-target retry and cross-target
+    /// repair writes add to `target_write` (the sum) but not here, so the ratio is a faithful
+    /// concurrency estimate only on retry-free batches; under heavy 429/retry pressure
+    /// `target_write` grows while this stays flat, biasing the ratio toward apparent
+    /// concurrency. Read the two values together, not the ratio alone, when retries occur.
+    pub target_write_wall: Duration,
+    pub target_read: Duration,
+    pub target_ready_wait: Duration,
+    pub target_request_prepare: Duration,
+    pub target_send_headers: Duration,
+    pub target_send_body: Duration,
+    pub target_wait_response: Duration,
+    pub target_collect_response: Duration,
+    pub target_protocol_decode: Duration,
+    pub target_payload_validate: Duration,
+}
+
+/// Cluster-wide constants a client fetches once to compute placement locally: the
+/// per-cluster salt (folded into computed chunk ids and placement weights) plus the
+/// current target snapshot and its content-derived topology epoch.
+#[derive(Clone, Debug)]
+pub struct ClusterConfig {
+    pub cluster_salt: Vec<u8>,
+    pub topology_epoch: u64,
+    pub targets: Vec<TargetRecord>,
+}
+
+pub struct ObjectClient {
+    kms: KmsEndpointBalancer,
+    target_sessions: HashMap<String, TargetSession>,
+    /// Per-client cache of the FULL connection pool per endpoint (not just one pick). The write
+    /// fan-out picks a connection round-robin PER endpoint-batch from this, so a SINGLE object's
+    /// many fragments to one target spread across all N connections (N receive pumps) instead of
+    /// funneling through one — the measured single-object fan-out fix. Reads keep using the
+    /// single cached `target_sessions` pick above.
+    target_session_pools: HashMap<String, TargetSessionPool>,
+    /// Process-wide pool of N independent connections per target, shared across all
+    /// `ObjectClient`s. The per-client `target_sessions` above caches ONE round-robin
+    /// pick from each pool, so a target's concurrent fragments fan across N receive pumps.
+    shared_target_sessions: Arc<tokio::sync::Mutex<HashMap<String, TargetSessionPool>>>,
+    bucket_profiles: HashMap<String, EcProfile>,
+    shared_read_cache: SharedObjectMetadataCache,
+    prepared_encoders: HashMap<String, PreparedEncodeWorkspace>,
+    /// When `Some`, this client recycles EC encode buffers through a free-list
+    /// registry shared with the rest of its write-client pool (see
+    /// [`SharedShardFreelists`]) so per-client retention does not multiply by the
+    /// pool size. `None` for standalone/read clients (own per-client free-list).
+    shared_shard_freelists: Option<SharedShardFreelists>,
+    session_options: TargetSessionOptions,
+    write_window_max_stripes: usize,
+    write_window_inflight_stripes: usize,
+    /// When set, object writes commit through the single-shot `CommitObject` path
+    /// (one KMS transaction: manifest + per-target reverse log + CAS head flip)
+    /// instead of the window/commit write-intent path. Create-only for now.
+    single_shot_commit: bool,
+    /// When set, the client computes fragment placement (HRW) + chunk ids locally from
+    /// the cluster config and reserves granules on the computed targets, instead of the
+    /// central window reserve. Implies `single_shot_commit`. Create-only for now.
+    decentralized: bool,
+    /// Fault injection for lease-fenced GC validation: when set, a single-shot/decentralized
+    /// put writes all fragments durably (allocate-mode) but then returns WITHOUT issuing
+    /// CommitObject, leaving the object's granules occupied with no head and no reverse-log
+    /// row (the lease stays until it expires). This is the deterministic kill-mid-write the
+    /// GC must reclaim. Debug-only; never a normal write mode.
+    fault_skip_commit: bool,
+    /// Adaptive concurrency gate for fragment writes (KP2 429 backpressure).
+    /// Shared (`Arc`) so the per-fragment write tasks spawned inside
+    /// `write_prepared_stripe_batch_with_sessions` hold permits across the await.
+    write_inflight_limiter: Arc<AdaptiveWriteLimiter>,
+    /// Cached cluster placement config (salt + roster + topology epoch). Populated on
+    /// first use and reused within a short TTL so the decentralized read/write hot path
+    /// does not issue a `GetClusterConfig` RPC (an O(targets) roster scan + salt read on
+    /// one hot KMS shard) per object. The write path passes BeginObject's `topology_epoch`
+    /// as a floor so a roster change forces a fresh roster BEFORE HRW placement — a stale
+    /// roster would target the wrong (or decommissioned) nodes.
+    cluster_config_cache: Option<(Instant, ClusterConfig)>,
+    /// When `Some`, single-shot/decentralized object commits are enqueued to a process-shared
+    /// batching committer (one `MultiCommitObject` per flush, amortizing the per-object FDB
+    /// commit) instead of one `CommitObject` RPC each. `None` keeps the per-object path.
+    committer: Option<ObjectCommitter>,
+}
+
+#[derive(Debug)]
+struct FragmentWriteFailure {
+    stripe_index: u32,
+    fragment_index: u32,
+    message: String,
+    /// True when the underlying KST replied HTTP 429 (KP2 backpressure).
+    rate_limited: bool,
+    /// `x-kp2-retry-after-ms` value, when the target advertised one.
+    retry_after_ms: Option<u64>,
+    /// `x-kp2-limit-max-in-flight` value, used to shrink the adaptive limiter.
+    limit_max_inflight: Option<usize>,
+}
+
+impl FragmentWriteFailure {
+    /// Build a failure carrying a structured 429 signal alongside the log
+    /// message. Used at every wrap site so retry/backpressure logic can inspect
+    /// the signal instead of re-parsing the flattened message.
+    fn new(
+        stripe_index: u32,
+        fragment_index: u32,
+        message: String,
+        signal: RateLimitSignal,
+    ) -> Self {
+        Self {
+            stripe_index,
+            fragment_index,
+            message,
+            rate_limited: signal.rate_limited,
+            retry_after_ms: signal.retry_after_ms,
+            limit_max_inflight: signal.limit_max_inflight,
+        }
+    }
+
+    /// Build a failure with no rate-limit signal (e.g. join errors, length
+    /// mismatches) — the common case where there is no `ClientError` to inspect.
+    fn plain(stripe_index: u32, fragment_index: u32, message: String) -> Self {
+        Self::new(
+            stripe_index,
+            fragment_index,
+            message,
+            RateLimitSignal::default(),
+        )
+    }
+}
+
+#[derive(Default)]
+struct RetryWriteResult {
+    failures: Vec<FragmentWriteFailure>,
+    phases: RequestPhaseTimes,
+    connect_elapsed: Duration,
+    write_elapsed: Duration,
+    landed: Vec<LandedFragment>,
+}
+
+/// Where a fragment actually landed, as reported by the storage target's write reply.
+/// With target-local allocation the granule is target-chosen, so the manifest (and the
+/// reverse log built from it) must record the reported granule, not the placeholder the
+/// client sent. Keyed by (stripe, fragment) when merged into the assembled manifest.
+#[derive(Clone, Copy)]
+struct LandedFragment {
+    stripe_index: u32,
+    fragment_index: u32,
+    granule_index: u64,
+    generation: u32,
+}
+
+/// Overlays the target-reported landing of each fragment onto the single-shot plans the
+/// manifest is assembled from, so the committed reverse log records the granule the target
+/// actually chose (under allocate-mode the plan carried `kp2::GRANULE_ALLOCATE`).
+fn apply_landed_fragments(
+    plans: &mut HashMap<(u32, u32), FragmentPlan>,
+    landed: &[LandedFragment],
+) {
+    for entry in landed {
+        if let Some(plan) = plans.get_mut(&(entry.stripe_index, entry.fragment_index)) {
+            plan.granule_index = entry.granule_index;
+            plan.generation = entry.generation;
+        }
+    }
+}
+
+struct PreparedStripeWrite {
+    stripe_index: u32,
+    plans: Vec<FragmentPlan>,
+    fragments: Vec<Vec<u8>>,
+}
+
+struct PreparedStripeWriteResult {
+    prepared: PreparedStripeWrite,
+    failures: Vec<FragmentWriteFailure>,
+}
+
+struct PreparedStripeBatchWriteResult {
+    stripe_results: Vec<PreparedStripeWriteResult>,
+    phases: RequestPhaseTimes,
+    /// Sum of each fragment's own write duration (counts the concurrent window once per
+    /// fragment). Kept for backward-compatible `target_write` reporting.
+    write_elapsed: Duration,
+    /// Wall-clock around the whole concurrent fan-out (permit acquisition through the last
+    /// fragment's completion). Near `write_elapsed / fan_out_width` when the fan-out is
+    /// truly concurrent; approaches `write_elapsed` if the writes serialize.
+    write_wall: Duration,
+    landed: Vec<LandedFragment>,
+}
+
+struct BatchedTargetWritePlan {
+    endpoint: String,
+    target_id: String,
+    stripe_index: u32,
+    fragment_index: u32,
+    granule_index: u64,
+    generation: u32,
+    object_id: u32,
+    version: u32,
+    chunk_id: ChunkId,
+    payload: Vec<u8>,
+}
+
+struct BatchedTargetReadPlan {
+    endpoint: String,
+    stripe_index: u32,
+    fragment_index: usize,
+    chunk_id: ChunkId,
+    payload_bytes: usize,
+}
+
+struct WindowStripeReadState {
+    stripe_index: usize,
+    needed_data_fragments: usize,
+    fragments: Vec<Option<Vec<u8>>>,
+}
+
+struct StripeReadResult {
+    payload: Vec<u8>,
+    missing_fragments: usize,
+    data_fragment_reads: usize,
+    parity_fragment_reads: usize,
+    reconstructed: bool,
+    phases: ObjectPhaseTimes,
+}
+
+#[derive(Clone)]
+struct KmsEndpointBalancer {
+    channels: Arc<Vec<Channel>>,
+    next: Arc<AtomicUsize>,
+    grpc_max_message_bytes: usize,
+}
+
+/// Process-wide KMS channel registry: one multiplexed channel set per canonical
+/// (endpoint set, message cap), shared by every `ObjectClient` in the process.
+/// Without it each client opened its own TCP+h2 connection per endpoint, so a
+/// deep pipeline fleet (workers x depth x endpoints, across nodes) hit the KMS
+/// listeners with a thousand-connection burst — dropped SYNs then rode the
+/// kernel retransmit ladder into ~30 s client construction stalls. The values
+/// are async-once cells so concurrent first constructions await one leader's
+/// connect instead of racing their own (a depth-N pipeline cold start would
+/// otherwise burst N full connect sets and drop all but one).
+fn global_kms_balancers(
+) -> &'static std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<KmsEndpointBalancer>>>> {
+    static BALANCERS: OnceLock<
+        std::sync::Mutex<HashMap<String, Arc<tokio::sync::OnceCell<KmsEndpointBalancer>>>>,
+    > = OnceLock::new();
+    BALANCERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// The non-cached outcomes of a shared-balancer connect: a partial channel set is
+/// handed to the caller without being cached (so the registry never freezes a
+/// degraded view), and a total failure propagates as the plain error.
+enum SharedConnectOutcome {
+    Partial(KmsEndpointBalancer),
+    Failed(ObjectError),
+}
+
+impl From<ObjectError> for SharedConnectOutcome {
+    fn from(err: ObjectError) -> Self {
+        Self::Failed(err)
+    }
+}
+
+/// Cap on each recycling free-list's length, in shard sets (one set = all EC
+/// fragments for one stripe). The free-list is shared across kfc-core's
+/// round-robin write-client pool via [`SharedShardFreelists`]; without this
+/// bound a burst of concurrent encodes would leave it holding every buffer ever
+/// taken — the 2026-06 write-RAM growth, which retained roughly
+/// `pool_size x one-put-working-set` (~5 GiB on a 16-core client). Sized to the
+/// write pipeline's per-put working set: one batch's shards are in flight on the
+/// network while the next batch's are being encoded, so two batches' worth must
+/// recycle or `take_shards` finds the list empty and allocates fresh every cycle.
+const SHARD_POOL_FREELIST_CAP: usize = 2 * DEFAULT_WRITE_WINDOW_INFLIGHT_STRIPES;
+
+/// A per-EC-profile registry of shard recycling free-lists, shared across a pool
+/// of `ObjectClient`s so they recycle encode buffers through ONE bounded pool
+/// per profile instead of each client retaining its own working set forever.
+pub type SharedShardFreelists = Arc<Mutex<HashMap<String, Arc<Mutex<Vec<Vec<Vec<u8>>>>>>>>;
+
+/// Create an empty shared shard free-list registry to pass to a pool of write
+/// clients via [`ObjectClient::connect_with_options_sharing_shard_pool`].
+pub fn new_shared_shard_freelists() -> SharedShardFreelists {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Default ceiling on the estimated bytes a process keeps in flight across every
+/// [`PutPipeline`] (payloads plus their EC expansion). Submissions past it wait,
+/// so pipelined callers cannot grow client RSS without bound no matter how many
+/// pipelines or workers the process runs.
+pub const DEFAULT_PIPELINE_INFLIGHT_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Budget-permit granularity: coarse enough that a semaphore holds the whole
+/// budget in `u32` permits, fine enough that small objects don't over-reserve.
+const PIPELINE_BUDGET_PERMIT_BYTES: u64 = 64 * 1024;
+
+/// The result side of one pipelined put; resolves when the object commits (or
+/// its write fails — every error surfaces here, never on `submit`).
+pub struct PutTicket {
+    receiver: oneshot::Receiver<Result<ObjectPutResult, ObjectError>>,
+}
+
+impl PutTicket {
+    /// Waits for the pipelined put to commit and returns its result.
+    pub async fn wait(self) -> Result<ObjectPutResult, ObjectError> {
+        self.receiver.await.map_err(|_| {
+            ObjectError::Metadata("pipelined put task ended without reporting a result".into())
+        })?
+    }
+}
+
+/// A ticket is directly awaitable: `ticket.await` == `ticket.wait().await`, so
+/// callers can hold tickets in ordinary future combinators (join_all, select).
+impl std::future::Future for PutTicket {
+    type Output = Result<ObjectPutResult, ObjectError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.receiver).poll(cx).map(|res| {
+            res.map_err(|_| {
+                ObjectError::Metadata(
+                    "pipelined put task ended without reporting a result".into(),
+                )
+            })?
+        })
+    }
+}
+
+/// A depth-bounded pipeline of whole-object puts: up to `depth` objects run
+/// concurrently from ONE logical submitter, so a next object's control RPCs and
+/// encode overlap the current objects' data phases — the per-object serial chain
+/// (begin -> encode -> write -> commit) stops gating the submitter's throughput.
+///
+/// Each in-flight put runs on its own [`ObjectClient`], but the clients share the
+/// process substrate: target connection pools, one EC-buffer recycling registry,
+/// and one process-wide in-flight-bytes budget (submissions block once the
+/// process's estimated in-flight bytes reach the budget — task-count limits alone
+/// cannot bound memory across many workers). Same-key submissions serialize:
+/// `submit` waits for an in-flight put of the same (bucket, key) to finish first,
+/// because the decentralized commit is create-only and concurrent same-key puts
+/// would just race the head CAS.
+pub struct PutPipeline {
+    idle: Vec<ObjectClient>,
+    joins: JoinSet<PipelineCompletion>,
+    inflight_keys: std::collections::HashSet<(String, String)>,
+    byte_budget: Arc<tokio::sync::Semaphore>,
+    depth: usize,
+}
+
+struct PipelineCompletion {
+    client: ObjectClient,
+    bucket_id: String,
+    key: String,
+}
+
+/// One process-wide budget semaphore shared by every pipeline in the process.
+fn pipeline_byte_budget() -> Arc<tokio::sync::Semaphore> {
+    static BUDGET: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    BUDGET
+        .get_or_init(|| {
+            let permits = (DEFAULT_PIPELINE_INFLIGHT_BUDGET_BYTES
+                / PIPELINE_BUDGET_PERMIT_BYTES) as usize;
+            Arc::new(tokio::sync::Semaphore::new(permits))
+        })
+        .clone()
+}
+
+impl PutPipeline {
+    /// Builds a pipeline of `depth` clients sharing one EC-buffer registry (and the
+    /// process-global connection pools + byte budget).
+    pub async fn connect(
+        kms_endpoints: &[String],
+        options: ObjectClientOptions,
+        depth: usize,
+    ) -> Result<Self, ObjectError> {
+        let depth = depth.max(1);
+        let freelists = new_shared_shard_freelists();
+        // Construct the depth clients concurrently: with the process-shared KMS
+        // channel registry each construction is cheap after the first, and a fleet
+        // of pipelines no longer serializes hundreds of constructions per node.
+        let constructions = (0..depth).map(|_| {
+            ObjectClient::connect_with_options_sharing_shard_pool(
+                kms_endpoints,
+                options.clone(),
+                freelists.clone(),
+            )
+        });
+        let mut idle = Vec::with_capacity(depth);
+        for client in futures_util::future::join_all(constructions).await {
+            idle.push(client?);
+        }
+        Ok(Self {
+            idle,
+            joins: JoinSet::new(),
+            inflight_keys: std::collections::HashSet::new(),
+            byte_budget: pipeline_byte_budget(),
+            depth,
+        })
+    }
+
+    /// Submits one whole-object put. Returns once the pipeline has capacity (depth,
+    /// same-key serialization, and the process byte budget) — the put itself keeps
+    /// running; its outcome arrives on the returned [`PutTicket`].
+    pub async fn submit(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+        payload: Vec<u8>,
+    ) -> Result<PutTicket, ObjectError> {
+        // Fault injection for pipeline crash validation: die abruptly while the
+        // pipeline holds in-flight objects in distinct phases, leaving their markers
+        // and granules for the orphan-version reaper.
+        if self.joins.len() >= self.depth.saturating_sub(1)
+            && std::env::var("KSC_FAULT_DIE_MID_PIPELINE").is_ok()
+        {
+            eprintln!(
+                "KSC_FAULT_DIE_MID_PIPELINE: aborting with {} puts in flight",
+                self.joins.len()
+            );
+            std::process::abort();
+        }
+        // Estimated in-flight bytes: payload plus EC expansion. The exact profile is
+        // unknown until begin resolves it, so reserve 2x the payload (covers 8+2's
+        // 1.25x; replicated small-object classes reserve their own tickets when they
+        // land). Rounded up to permit granularity, floored at one permit.
+        let estimated = payload.len() as u64 * 2;
+        let permits =
+            u32::try_from(estimated.div_ceil(PIPELINE_BUDGET_PERMIT_BYTES).max(1)).map_err(
+                |_| {
+                    ObjectError::Metadata(format!(
+                        "pipelined payload of {} bytes exceeds the in-flight budget",
+                        payload.len()
+                    ))
+                },
+            )?;
+        let key_slot = (bucket_id.to_string(), key.to_string());
+        // Same-key serialization + depth: drain completions until this submission
+        // is admissible.
+        while self.inflight_keys.contains(&key_slot) || self.joins.len() >= self.depth {
+            self.drain_one().await?;
+        }
+        let budget = Arc::clone(&self.byte_budget)
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| ObjectError::Metadata("pipeline byte budget closed".into()))?;
+        let mut client = self
+            .idle
+            .pop()
+            .expect("an idle pipeline client per free depth slot");
+        let (sender, receiver) = oneshot::channel();
+        let bucket_owned = bucket_id.to_string();
+        let key_owned = key.to_string();
+        self.inflight_keys.insert(key_slot);
+        self.joins.spawn(async move {
+            let result = client
+                .put_object_single_stripe(&bucket_owned, &key_owned, &payload)
+                .await;
+            drop(budget);
+            let _ = sender.send(result);
+            PipelineCompletion {
+                client,
+                bucket_id: bucket_owned,
+                key: key_owned,
+            }
+        });
+        Ok(PutTicket { receiver })
+    }
+
+    /// Waits for every in-flight put to finish. Individual outcomes are on their
+    /// tickets; this only returns pipeline-level failures (a panicked put task).
+    pub async fn drain(&mut self) -> Result<(), ObjectError> {
+        while !self.joins.is_empty() {
+            self.drain_one().await?;
+        }
+        Ok(())
+    }
+
+    async fn drain_one(&mut self) -> Result<(), ObjectError> {
+        let Some(joined) = self.joins.join_next().await else {
+            return Ok(());
+        };
+        let completion = joined.map_err(|err| {
+            ObjectError::Metadata(format!("pipelined put task did not complete: {err}"))
+        })?;
+        self.inflight_keys
+            .remove(&(completion.bucket_id, completion.key));
+        self.idle.push(completion.client);
+        Ok(())
+    }
+}
+
+/// Thread-safe pool of reusable EC shard buffer sets.
+///
+/// The encode/reconstruct work runs on `spawn_blocking` worker threads, so the
+/// recycling pool has to be shareable and lockable rather than living behind the
+/// `&mut self` of the async task. `plan` is cheap to clone (an `EcProfile` plus a
+/// `&'static` table reference), so blocking tasks take an owned copy.
+#[derive(Clone)]
+struct ShardPool {
+    plan: PreparedEcPlan,
+    reusable_shards: Arc<Mutex<Vec<Vec<Vec<u8>>>>>,
+}
+
+impl ShardPool {
+    fn new(plan: PreparedEcPlan, reusable_shards: Arc<Mutex<Vec<Vec<Vec<u8>>>>>) -> Self {
+        Self {
+            plan,
+            reusable_shards,
+        }
+    }
+
+    fn take_shards(&self) -> Vec<Vec<u8>> {
+        self.reusable_shards
+            .lock()
+            .unwrap()
+            .pop()
+            .unwrap_or_else(|| self.plan.allocate_output_buffers())
+    }
+
+    fn return_shards(&self, shards: Vec<Vec<u8>>) {
+        // Bound the (possibly shared) free-list at the per-put working set;
+        // buffers beyond the cap are dropped (freed) rather than retained, so a
+        // burst of concurrent encodes cannot grow the recycling pool without
+        // limit. See [`SHARD_POOL_FREELIST_CAP`].
+        let mut reusable = self.reusable_shards.lock().unwrap();
+        if reusable.len() < SHARD_POOL_FREELIST_CAP {
+            reusable.push(shards);
+        }
+    }
+}
+
+struct PreparedEncodeWorkspace {
+    pool: ShardPool,
+}
+
+struct CachedResolvedRead {
+    manifest: ObjectVersionManifest,
+    ec_profile: EcProfile,
+    inserted_at: Instant,
+}
+
+struct CachedPayloadRead {
+    payload: Arc<[u8]>,
+    inserted_at: Instant,
+}
+
+struct SharedObjectMetadataCacheInner {
+    state: Mutex<SharedObjectMetadataCacheState>,
+    read_resolve_cache_ttl: Duration,
+    read_payload_cache_max_entries: usize,
+    read_payload_cache_max_bytes: usize,
+    read_payload_cache_max_object_bytes: usize,
+}
+
+struct SharedObjectMetadataCacheState {
+    resolved_reads: HashMap<(String, String), CachedResolvedRead>,
+    cached_payloads: HashMap<(String, String, String), CachedPayloadRead>,
+    cached_payload_order: VecDeque<(String, String, String)>,
+    cached_payload_bytes: usize,
+}
+
+#[derive(Clone)]
+struct SharedObjectMetadataCache {
+    inner: Arc<SharedObjectMetadataCacheInner>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SharedObjectMetadataCacheKey {
+    kms_endpoints: Vec<String>,
+    notification_nats_url: Option<String>,
+    notification_subject: String,
+    read_resolve_cache_ttl_ms: u64,
+    read_payload_cache_max_entries: usize,
+    read_payload_cache_max_bytes: usize,
+    read_payload_cache_max_object_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ObjectClientOptions {
+    pub read_completion_mode: CompletionMode,
+    pub write_completion_mode: CompletionMode,
+    pub write_window_max_stripes: usize,
+    pub write_window_inflight_stripes: usize,
+    /// Ceiling on concurrent in-flight fragment writes to distinct targets (the
+    /// adaptive write limiter's `max`). Decoupled from `write_window_inflight_stripes`
+    /// so a wide EC batch fans out across many targets at once instead of being pinned
+    /// to the stripe-pipelining depth.
+    pub write_inflight_endpoints: usize,
+    pub kms_grpc_max_message_bytes: usize,
+    pub read_resolve_cache_ttl: Duration,
+    pub read_payload_cache_max_entries: usize,
+    pub read_payload_cache_max_bytes: usize,
+    pub read_payload_cache_max_object_bytes: usize,
+    pub metadata_notification_nats_url: Option<String>,
+    pub metadata_notification_subject: String,
+    /// Opt into the single-shot `CommitObject` write path (default off).
+    pub single_shot_commit: bool,
+    /// Opt into computed (decentralized) placement + chunk ids (default off; implies
+    /// single-shot commit).
+    pub decentralized: bool,
+    /// Fault injection (debug): write fragments then skip CommitObject, to validate the
+    /// lease-fenced GC. Default off.
+    pub fault_skip_commit: bool,
+    /// Coalesce up to this many object-head commits into one `MultiCommitObject` per flush
+    /// (process-shared across all clients to the same KMS endpoints). `1` (default) disables
+    /// batching and uses the per-object `CommitObject` path.
+    pub commit_batch_max: usize,
+    /// How long a partial commit batch lingers, waiting to fill, before it flushes.
+    pub commit_linger: Duration,
+}
+
+impl Default for ObjectClientOptions {
+    fn default() -> Self {
+        Self {
+            read_completion_mode: CompletionMode::Interrupt,
+            write_completion_mode: CompletionMode::Interrupt,
+            write_window_max_stripes: DEFAULT_WRITE_WINDOW_MAX_STRIPES,
+            write_window_inflight_stripes: DEFAULT_WRITE_WINDOW_INFLIGHT_STRIPES,
+            write_inflight_endpoints: DEFAULT_WRITE_INFLIGHT_ENDPOINTS,
+            kms_grpc_max_message_bytes: DEFAULT_KMS_GRPC_MAX_MESSAGE_BYTES,
+            read_resolve_cache_ttl: DEFAULT_READ_RESOLVE_CACHE_TTL,
+            read_payload_cache_max_entries: DEFAULT_READ_PAYLOAD_CACHE_MAX_ENTRIES,
+            read_payload_cache_max_bytes: DEFAULT_READ_PAYLOAD_CACHE_MAX_BYTES,
+            read_payload_cache_max_object_bytes: DEFAULT_READ_PAYLOAD_CACHE_MAX_OBJECT_BYTES,
+            metadata_notification_nats_url: None,
+            metadata_notification_subject: DEFAULT_METADATA_NOTIFICATION_SUBJECT.to_string(),
+            // The central allocator/KAS is gone, so the decentralized path (computed
+            // placement + target-local allocation + single-shot commit) is the ONLY write
+            // path and therefore the default. `single_shot_commit` is implied by it.
+            single_shot_commit: true,
+            decentralized: true,
+            fault_skip_commit: false,
+            commit_batch_max: 1,
+            commit_linger: Duration::from_millis(2),
+        }
+    }
+}
+
+impl ObjectClientOptions {
+    fn normalized(self) -> Self {
+        Self {
+            read_completion_mode: self.read_completion_mode,
+            write_completion_mode: self.write_completion_mode,
+            write_window_max_stripes: self.write_window_max_stripes.max(1),
+            write_window_inflight_stripes: self.write_window_inflight_stripes.max(1),
+            write_inflight_endpoints: self.write_inflight_endpoints.max(1),
+            kms_grpc_max_message_bytes: self.kms_grpc_max_message_bytes.max(1),
+            read_resolve_cache_ttl: if self.read_resolve_cache_ttl.is_zero() {
+                DEFAULT_READ_RESOLVE_CACHE_TTL
+            } else {
+                self.read_resolve_cache_ttl
+            },
+            read_payload_cache_max_entries: self.read_payload_cache_max_entries.max(1),
+            read_payload_cache_max_bytes: self.read_payload_cache_max_bytes.max(1),
+            read_payload_cache_max_object_bytes: self
+                .read_payload_cache_max_object_bytes
+                .max(1)
+                .min(self.read_payload_cache_max_bytes.max(1)),
+            metadata_notification_nats_url: self
+                .metadata_notification_nats_url
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            metadata_notification_subject: if self.metadata_notification_subject.trim().is_empty() {
+                DEFAULT_METADATA_NOTIFICATION_SUBJECT.to_string()
+            } else {
+                self.metadata_notification_subject.trim().to_string()
+            },
+            single_shot_commit: self.single_shot_commit,
+            decentralized: self.decentralized,
+            fault_skip_commit: self.fault_skip_commit,
+            commit_batch_max: self.commit_batch_max.max(1),
+            commit_linger: self.commit_linger,
+        }
+    }
+}
+
+impl From<ObjectClientOptions> for TargetSessionOptions {
+    fn from(value: ObjectClientOptions) -> Self {
+        Self {
+            read_completion_mode: value.read_completion_mode,
+            write_completion_mode: value.write_completion_mode,
+        }
+    }
+}
+
+impl PreparedEncodeWorkspace {
+    fn new(plan: PreparedEcPlan, reusable_shards: Arc<Mutex<Vec<Vec<Vec<u8>>>>>) -> Self {
+        Self {
+            pool: ShardPool::new(plan, reusable_shards),
+        }
+    }
+}
+
+impl SharedObjectMetadataCache {
+    fn new(options: &ObjectClientOptions) -> Self {
+        Self {
+            inner: Arc::new(SharedObjectMetadataCacheInner {
+                state: Mutex::new(SharedObjectMetadataCacheState {
+                    resolved_reads: HashMap::new(),
+                    cached_payloads: HashMap::new(),
+                    cached_payload_order: VecDeque::new(),
+                    cached_payload_bytes: 0,
+                }),
+                read_resolve_cache_ttl: options.read_resolve_cache_ttl,
+                read_payload_cache_max_entries: options.read_payload_cache_max_entries,
+                read_payload_cache_max_bytes: options.read_payload_cache_max_bytes,
+                read_payload_cache_max_object_bytes: options.read_payload_cache_max_object_bytes,
+            }),
+        }
+    }
+
+    fn shared_for(kms_endpoints: &[String], options: &ObjectClientOptions) -> Self {
+        let key = SharedObjectMetadataCacheKey {
+            kms_endpoints: canonicalize_endpoints(kms_endpoints),
+            notification_nats_url: options.metadata_notification_nats_url.clone(),
+            notification_subject: options.metadata_notification_subject.clone(),
+            read_resolve_cache_ttl_ms: options.read_resolve_cache_ttl.as_millis() as u64,
+            read_payload_cache_max_entries: options.read_payload_cache_max_entries,
+            read_payload_cache_max_bytes: options.read_payload_cache_max_bytes,
+            read_payload_cache_max_object_bytes: options.read_payload_cache_max_object_bytes,
+        };
+        let registry = global_object_metadata_caches();
+        let mut registry = registry.lock().unwrap();
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            return Self { inner: existing };
+        }
+        let cache = Self::new(options);
+        if let Some(nats_url) = options.metadata_notification_nats_url.clone() {
+            cache.spawn_invalidator(nats_url, options.metadata_notification_subject.clone());
+        }
+        registry.insert(key, Arc::downgrade(&cache.inner));
+        cache
+    }
+
+    fn cached_resolved_read(
+        &self,
+        bucket_id: &str,
+        key: &str,
+    ) -> Option<(ObjectVersionManifest, EcProfile)> {
+        let cache_key = (bucket_id.to_string(), key.to_string());
+        let mut state = self.inner.state.lock().unwrap();
+        let cached = state.resolved_reads.get(&cache_key)?;
+        if cached.inserted_at.elapsed() > self.inner.read_resolve_cache_ttl {
+            state.resolved_reads.remove(&cache_key);
+            return None;
+        }
+        Some((cached.manifest.clone(), cached.ec_profile.clone()))
+    }
+
+    fn cache_resolved_read(&self, manifest: ObjectVersionManifest, ec_profile: EcProfile) {
+        self.inner.state.lock().unwrap().resolved_reads.insert(
+            (manifest.bucket_id.clone(), manifest.key.clone()),
+            CachedResolvedRead {
+                manifest,
+                ec_profile,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    fn cached_payload_read(&self, manifest: &ObjectVersionManifest) -> Option<Vec<u8>> {
+        let cache_key = (
+            manifest.bucket_id.clone(),
+            manifest.key.clone(),
+            manifest.version_id.clone(),
+        );
+        let mut state = self.inner.state.lock().unwrap();
+        let cached = state.cached_payloads.get(&cache_key)?;
+        if cached.inserted_at.elapsed() > self.inner.read_resolve_cache_ttl {
+            Self::remove_cached_payload_locked(&mut state, &cache_key);
+            return None;
+        }
+        Some(cached.payload.as_ref().to_vec())
+    }
+
+    fn cache_payload_read(&self, manifest: &ObjectVersionManifest, payload: &[u8]) {
+        if payload.is_empty() || payload.len() > self.inner.read_payload_cache_max_object_bytes {
+            return;
+        }
+        let cache_key = (
+            manifest.bucket_id.clone(),
+            manifest.key.clone(),
+            manifest.version_id.clone(),
+        );
+        let payload_arc: Arc<[u8]> = Arc::from(payload.to_vec());
+        let payload_len = payload_arc.len();
+        let mut state = self.inner.state.lock().unwrap();
+        Self::remove_cached_payload_locked(&mut state, &cache_key);
+        while state.cached_payloads.len() >= self.inner.read_payload_cache_max_entries
+            || state.cached_payload_bytes.saturating_add(payload_len)
+                > self.inner.read_payload_cache_max_bytes
+        {
+            let Some(oldest) = state.cached_payload_order.pop_front() else {
+                break;
+            };
+            Self::remove_cached_payload_locked(&mut state, &oldest);
+        }
+        state.cached_payload_bytes = state.cached_payload_bytes.saturating_add(payload_len);
+        state.cached_payload_order.push_back(cache_key.clone());
+        state.cached_payloads.insert(
+            cache_key,
+            CachedPayloadRead {
+                payload: payload_arc,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    fn invalidate_key(&self, bucket_id: &str, key: &str) {
+        let mut state = self.inner.state.lock().unwrap();
+        state
+            .resolved_reads
+            .remove(&(bucket_id.to_string(), key.to_string()));
+        let cache_keys = state
+            .cached_payloads
+            .keys()
+            .filter(|(cached_bucket, cached_key, _)| {
+                cached_bucket == bucket_id && cached_key == key
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for cache_key in cache_keys {
+            Self::remove_cached_payload_locked(&mut state, &cache_key);
+        }
+    }
+
+    fn invalidate_namespace(&self, namespace_id: &str) {
+        let mut state = self.inner.state.lock().unwrap();
+        let removed_keys = state
+            .resolved_reads
+            .iter()
+            .filter(|(_, cached)| cached.manifest.namespace_id == namespace_id)
+            .map(|((bucket_id, key), _)| (bucket_id.clone(), key.clone()))
+            .collect::<Vec<_>>();
+        state
+            .resolved_reads
+            .retain(|_, cached| cached.manifest.namespace_id != namespace_id);
+        let cache_keys = state
+            .cached_payloads
+            .keys()
+            .filter(|(bucket_id, key, _)| {
+                removed_keys.iter().any(|(removed_bucket, removed_key)| {
+                    removed_bucket == bucket_id && removed_key == key
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for cache_key in cache_keys {
+            Self::remove_cached_payload_locked(&mut state, &cache_key);
+        }
+    }
+
+    fn invalidate_all(&self) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.resolved_reads.clear();
+        state.cached_payloads.clear();
+        state.cached_payload_order.clear();
+        state.cached_payload_bytes = 0;
+    }
+
+    fn remove_cached_payload_locked(
+        state: &mut SharedObjectMetadataCacheState,
+        cache_key: &(String, String, String),
+    ) {
+        if let Some(cached) = state.cached_payloads.remove(cache_key) {
+            state.cached_payload_bytes = state
+                .cached_payload_bytes
+                .saturating_sub(cached.payload.len());
+        }
+        if let Some(position) = state
+            .cached_payload_order
+            .iter()
+            .position(|candidate| candidate == cache_key)
+        {
+            state.cached_payload_order.remove(position);
+        }
+    }
+
+    fn spawn_invalidator(&self, nats_url: String, subject: String) {
+        let cache = self.clone();
+        tokio::spawn(async move {
+            cache.nats_invalidation_loop(nats_url, subject).await;
+        });
+    }
+
+    async fn nats_invalidation_loop(self, nats_url: String, subject: String) {
+        loop {
+            match async_nats::connect(&nats_url).await {
+                Ok(client) => match client.subscribe(subject.clone()).await {
+                    Ok(mut subscriber) => {
+                        while let Some(message) = subscriber.next().await {
+                            let event =
+                                decode_metadata_invalidation_event(message.payload.as_ref());
+                            if event.namespace_id.is_empty() {
+                                self.invalidate_all();
+                            } else if !event.bucket_id.is_empty() && !event.key.is_empty() {
+                                self.invalidate_key(&event.bucket_id, &event.key);
+                            } else {
+                                self.invalidate_namespace(&event.namespace_id);
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                },
+                Err(_) => {}
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+fn global_object_metadata_caches(
+) -> &'static Mutex<HashMap<SharedObjectMetadataCacheKey, Weak<SharedObjectMetadataCacheInner>>> {
+    static CACHES: OnceLock<
+        Mutex<HashMap<SharedObjectMetadataCacheKey, Weak<SharedObjectMetadataCacheInner>>>,
+    > = OnceLock::new();
+    CACHES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn canonicalize_endpoints(endpoints: &[String]) -> Vec<String> {
+    let mut canonical = endpoints
+        .iter()
+        .map(|endpoint| endpoint.trim().to_string())
+        .filter(|endpoint| !endpoint.is_empty())
+        .collect::<Vec<_>>();
+    canonical.sort();
+    canonical.dedup();
+    canonical
+}
+
+fn decode_metadata_invalidation_event(payload: &[u8]) -> MetadataInvalidationEvent {
+    MetadataInvalidationEvent::decode(payload).unwrap_or_else(|_| MetadataInvalidationEvent {
+        namespace_id: std::str::from_utf8(payload)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string(),
+        bucket_id: String::new(),
+        key: String::new(),
+        entry_id: String::new(),
+        parent_entry_id: String::new(),
+        event_kind: 0,
+        version_id: String::new(),
+    })
+}
+
+impl ObjectClient {
+    pub async fn connect(kms_endpoints: &[String]) -> Result<Self, ObjectError> {
+        Self::connect_with_options(kms_endpoints, ObjectClientOptions::default()).await
+    }
+
+    pub async fn connect_with_options(
+        kms_endpoints: &[String],
+        options: ObjectClientOptions,
+    ) -> Result<Self, ObjectError> {
+        let options = options.normalized();
+        let session_options = TargetSessionOptions::from(options.clone());
+        let shared_read_cache = SharedObjectMetadataCache::shared_for(kms_endpoints, &options);
+        let kms = KmsEndpointBalancer::shared(kms_endpoints, options.kms_grpc_max_message_bytes)
+            .await?;
+        // When batching is enabled, attach the process-shared committer for these KMS
+        // endpoints (spawning its flush task once on first use). Keyed on the canonical
+        // endpoint set so every client in the process coalesces into one committer.
+        let committer = if options.commit_batch_max > 1 {
+            let key = canonicalize_endpoints(kms_endpoints).join(",");
+            Some(global_object_committer(
+                &key,
+                &kms,
+                options.commit_batch_max,
+                options.commit_linger,
+            ))
+        } else {
+            None
+        };
+        Ok(Self {
+            kms,
+            target_sessions: HashMap::new(),
+            target_session_pools: HashMap::new(),
+            shared_target_sessions: global_target_sessions(),
+            bucket_profiles: HashMap::new(),
+            shared_read_cache,
+            prepared_encoders: HashMap::new(),
+            shared_shard_freelists: None,
+            session_options,
+            write_window_max_stripes: options.write_window_max_stripes,
+            write_window_inflight_stripes: options.write_window_inflight_stripes,
+            single_shot_commit: options.single_shot_commit,
+            decentralized: options.decentralized,
+            fault_skip_commit: options.fault_skip_commit,
+            // Start at the full endpoint ceiling (back off adaptively on 429), decoupled
+            // from the stripe-pipelining depth so a wide EC batch fans out immediately.
+            write_inflight_limiter: Arc::new(AdaptiveWriteLimiter::new(
+                options.write_inflight_endpoints,
+                options.write_inflight_endpoints,
+            )),
+            cluster_config_cache: None,
+            committer,
+        })
+    }
+
+    /// Like [`Self::connect_with_options`] but recycles EC encode buffers through
+    /// the caller-provided shared free-list registry, so a pool of write clients
+    /// shares ONE bounded recycling pool per profile instead of each retaining
+    /// its own working set. Use [`new_shared_shard_freelists`] to create the
+    /// registry once and pass a clone to every client in the pool.
+    pub async fn connect_with_options_sharing_shard_pool(
+        kms_endpoints: &[String],
+        options: ObjectClientOptions,
+        shared_shard_freelists: SharedShardFreelists,
+    ) -> Result<Self, ObjectError> {
+        let mut client = Self::connect_with_options(kms_endpoints, options).await?;
+        client.shared_shard_freelists = Some(shared_shard_freelists);
+        Ok(client)
+    }
+
+    /// Resolves an object for reading, returning a manifest + EC profile. On the
+    /// decentralized path it fetches only the head and RECONSTRUCTS the fragment layout
+    /// by computation (placement + chunk ids); otherwise it fetches the stored manifest.
+    async fn resolve_for_read(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+    ) -> Result<(ObjectVersionManifest, EcProfile), ObjectError> {
+        if self.decentralized {
+            return self.resolve_decentralized_read(bucket_id, key).await;
+        }
+        let mut kms = self.kms.client();
+        let resolved = control_rpc(
+            "KMS ResolveObjectRead",
+            kms.resolve_object_read(ResolveObjectReadRequest {
+                bucket_id: bucket_id.to_string(),
+                key: key.to_string(),
+            }),
+        )
+        .await?
+        .into_inner();
+        let manifest = resolved.manifest.ok_or_else(|| {
+            ObjectError::Metadata("KMS ResolveObjectRead did not return manifest".to_string())
+        })?;
+        let ec_profile = resolved.ec_profile.ok_or_else(|| {
+            ObjectError::Metadata("KMS ResolveObjectRead did not return ec_profile".to_string())
+        })?;
+        Ok((manifest, ec_profile))
+    }
+
+    /// Decentralized resolve: fetch only the head (object geometry), then reconstruct the
+    /// fragment layout locally from computed placement + chunk ids — no manifest is read.
+    async fn resolve_decentralized_read(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+    ) -> Result<(ObjectVersionManifest, EcProfile), ObjectError> {
+        let resolved = {
+            let mut kms = self.kms.client();
+            control_rpc(
+                "KMS ResolveObjectHead",
+                kms.resolve_object_head(ResolveObjectHeadRequest {
+                    bucket_id: bucket_id.to_string(),
+                    key: key.to_string(),
+                }),
+            )
+            .await?
+            .into_inner()
+        };
+        let head = resolved.head.ok_or_else(|| {
+            ObjectError::Metadata("KMS ResolveObjectHead did not return a head".to_string())
+        })?;
+        let ec_profile = resolved.ec_profile.ok_or_else(|| {
+            ObjectError::Metadata("KMS ResolveObjectHead did not return ec_profile".to_string())
+        })?;
+        let cluster = self.fetch_cluster_config().await?;
+        let manifest =
+            reconstruct_manifest_from_head(bucket_id, key, &head, &ec_profile, &cluster)?;
+        Ok((manifest, ec_profile))
+    }
+
+    /// Raw `GetClusterConfig` RPC (uncached). Server side this is an O(targets) roster
+    /// range-scan plus the salt read on one hot KMS shard, so the hot path goes through
+    /// [`Self::cluster_config_cached`] instead.
+    async fn fetch_cluster_config_uncached(&mut self) -> Result<ClusterConfig, ObjectError> {
+        let mut kms = self.kms.client();
+        let reply = control_rpc(
+            "KMS GetClusterConfig",
+            kms.get_cluster_config(GetClusterConfigRequest {}),
+        )
+        .await?
+        .into_inner();
+        Ok(ClusterConfig {
+            cluster_salt: reply.cluster_salt,
+            topology_epoch: reply.topology_epoch,
+            targets: reply.targets,
+        })
+    }
+
+    /// Cluster placement config, cached within [`CLUSTER_CONFIG_CACHE_TTL`]. Refetches
+    /// when the cached entry is stale OR its topology epoch is behind `min_epoch`. Pass
+    /// `min_epoch = 0` when any current roster is acceptable (reads); the write path passes
+    /// BeginObject's `topology_epoch` so a roster advance forces a fresh roster BEFORE HRW
+    /// placement (a stale roster would place fragments on the wrong/decommissioned nodes).
+    async fn cluster_config_cached(&mut self, min_epoch: u64) -> Result<ClusterConfig, ObjectError> {
+        if let Some((fetched_at, cfg)) = &self.cluster_config_cache {
+            if fetched_at.elapsed() < CLUSTER_CONFIG_CACHE_TTL && cfg.topology_epoch >= min_epoch {
+                return Ok(cfg.clone());
+            }
+        }
+        let cfg = self.fetch_cluster_config_uncached().await?;
+        self.cluster_config_cache = Some((Instant::now(), cfg.clone()));
+        Ok(cfg)
+    }
+
+    /// Fetches the cluster-wide placement constants (salt + topology snapshot + epoch),
+    /// served from a short-TTL client cache so the decentralized read/write hot path does
+    /// not pay a `GetClusterConfig` round trip (and KMS hot-shard scan) per object.
+    pub async fn fetch_cluster_config(&mut self) -> Result<ClusterConfig, ObjectError> {
+        self.cluster_config_cached(0).await
+    }
+
+    pub async fn put_object_single_stripe(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+        payload: &[u8],
+    ) -> Result<ObjectPutResult, ObjectError> {
+        self.invalidate_resolved_read(bucket_id, key);
+        let result = self
+            .put_object_stream(bucket_id, key, payload.len() as u64, |offset, len| {
+                let start = usize::try_from(offset).map_err(|_| {
+                    ObjectError::Metadata(format!(
+                        "object write offset {} overflowed payload indexing for {}/{}",
+                        offset, bucket_id, key
+                    ))
+                })?;
+                let end = start.saturating_add(len);
+                let chunk = payload.get(start..end).ok_or_else(|| {
+                    ObjectError::Metadata(format!(
+                        "object write chunk {}..{} is out of range for {}/{} payload {}",
+                        start,
+                        end,
+                        bucket_id,
+                        key,
+                        payload.len()
+                    ))
+                })?;
+                Ok(chunk.to_vec())
+            })
+            .await?;
+        self.cache_payload_read(&result.manifest, payload);
+        Ok(result)
+    }
+
+    /// Stream an object whose payload lives in `path`, treating `logical_length`
+    /// as the AUTHORITATIVE object length rather than re-stat'ing the file.
+    ///
+    /// The caller (kfc commit) snapshots `(path, logical_length)` atomically under
+    /// the handle lock; passing that length in (instead of `std::fs::metadata`)
+    /// removes the commit-vs-concurrent-write TOCTOU: a concurrent extend of the
+    /// temp file cannot make the committed object longer than the snapshot, and a
+    /// concurrent shrink cannot make a per-stripe read hit EOF. Every per-stripe
+    /// read is clamped to `[0, logical_length)`; any short read at the tail (a
+    /// sparse hole or a racing truncate) is zero-filled rather than erroring, so
+    /// the streamed length always equals the snapshot length.
+    pub async fn put_object_from_path(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+        path: &Path,
+        logical_length: u64,
+    ) -> Result<ObjectPutResult, ObjectError> {
+        self.invalidate_resolved_read(bucket_id, key);
+        let logical_length_bytes = logical_length;
+        let mut file = File::open(path).map_err(|err| {
+            ObjectError::Metadata(format!(
+                "failed to open object payload path {}: {err}",
+                path.display()
+            ))
+        })?;
+        self.put_object_stream(bucket_id, key, logical_length_bytes, move |offset, len| {
+            // The per-stripe range is already clamped to the logical length by
+            // stripe_payload_range (it keys off logical_length_bytes), so `len`
+            // never exceeds the authoritative length. A short physical read here
+            // means the temp file is sparse or was concurrently truncated — fill
+            // the remainder with zeros so the streamed byte count matches the
+            // snapshot length instead of failing the whole commit.
+            file.seek(SeekFrom::Start(offset)).map_err(|err| {
+                ObjectError::Metadata(format!(
+                    "failed to seek object payload path {} to {}: {err}",
+                    path.display(),
+                    offset
+                ))
+            })?;
+            let mut chunk = vec![0u8; len];
+            let mut filled = 0usize;
+            while filled < len {
+                match file.read(&mut chunk[filled..]) {
+                    Ok(0) => break, // physical EOF before logical EOF => zero-fill tail
+                    Ok(n) => filled += n,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        return Err(ObjectError::Metadata(format!(
+                            "failed to read {} bytes from object payload path {} at {}: {err}",
+                            len,
+                            path.display(),
+                            offset
+                        )));
+                    }
+                }
+            }
+            Ok(chunk)
+        })
+        .await
+    }
+
+    async fn put_object_stream<F>(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+        logical_length_bytes: u64,
+        mut read_range: F,
+    ) -> Result<ObjectPutResult, ObjectError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, ObjectError>,
+    {
+        let mut phases = ObjectPhaseTimes::default();
+        let initiated_started = Instant::now();
+        let mut kms = self.kms.client();
+        // True once this write's context came from a merged BeginObject: the server
+        // minted marker+lease with NO write-intent row, so failure cleanup goes
+        // through ForfeitObjectWrite (marker -> reclaiming) instead of AbortObjectWrite.
+        let mut merged_begin = false;
+        let (
+            mut intent,
+            ec_profile,
+            object_id,
+            object_version,
+            mut initial_window_plans,
+            mut initial_window_stripe_count,
+            begin_topology_epoch,
+        ) = if self.decentralized {
+            // ONE merged BeginObject replaces the InitiateObjectWrite+BeginObject
+            // pair: the reply carries the effective profile, stripe count, and parent
+            // context, halving the pre-data control RTTs and dropping the intent row
+            // entirely. stripe_count == 0 marks a server that predates the merged
+            // begin — fall back to the two-RPC flow so mixed fleets keep working.
+            let begin_started = Instant::now();
+            let begun = control_rpc(
+                "KMS BeginObject",
+                kms.begin_object(BeginObjectRequest {
+                    namespace_id: String::new(),
+                    bucket_id: bucket_id.to_string(),
+                    key: key.to_string(),
+                    logical_length_bytes,
+                    resolve_write_context: true,
+                }),
+            )
+            .await?
+            .into_inner();
+            phases.kms_begin += begin_started.elapsed();
+            if begun.stripe_count > 0 {
+                merged_begin = true;
+                let ec_profile = begun.ec_profile.clone().ok_or_else(|| {
+                    ObjectError::Metadata("KMS BeginObject did not return ec_profile".to_string())
+                })?;
+                // The deterministic write id doubles as the KP2 session label and the
+                // committed version_id; no server-minted intent id exists.
+                let write_id = format!("{}:{}", begun.object_id, begun.version);
+                let intent = WriteIntent {
+                    intent_id: write_id.clone(),
+                    version_id: write_id,
+                    bucket_id: bucket_id.to_string(),
+                    key: key.to_string(),
+                    logical_length_bytes,
+                    ec_profile_id: ec_profile.id.clone(),
+                    stripe_count: begun.stripe_count,
+                    namespace_id: begun.namespace_id.clone(),
+                    bucket_entry_id: begun.bucket_entry_id.clone(),
+                    parent_entry_id: begun.parent_entry_id.clone(),
+                    parent_path: begun.parent_path.clone(),
+                    ..Default::default()
+                };
+                (
+                    intent,
+                    ec_profile,
+                    begun.object_id,
+                    begun.version,
+                    Vec::new(),
+                    0usize,
+                    begun.topology_epoch,
+                )
+            } else {
+                let initiated = control_rpc(
+                    "KMS InitiateObjectWrite",
+                    kms.initiate_object_write(InitiateObjectWriteRequest {
+                        bucket_id: bucket_id.to_string(),
+                        key: key.to_string(),
+                        logical_length_bytes,
+                        // Decentralized placement is client-computed; no allocator
+                        // reservation is requested — only the intent metadata.
+                        initial_window_stripe_count: 0,
+                    }),
+                )
+                .await?
+                .into_inner();
+                let intent = initiated.intent.ok_or_else(|| {
+                    ObjectError::Metadata(
+                        "KMS InitiateObjectWrite did not return intent".to_string(),
+                    )
+                })?;
+                let ec_profile = initiated.ec_profile.ok_or_else(|| {
+                    ObjectError::Metadata(
+                        "KMS InitiateObjectWrite did not return ec_profile".to_string(),
+                    )
+                })?;
+                (
+                    intent,
+                    ec_profile,
+                    begun.object_id,
+                    begun.version,
+                    initiated.initial_fragment_plans,
+                    initiated.initial_window_stripe_count as usize,
+                    begun.topology_epoch,
+                )
+            }
+        } else {
+            // Legacy window path: InitiateObjectWrite and BeginObject share no data,
+            // so they run CONCURRENTLY on two channel handles — the joined wall time
+            // is max(the two RTTs) instead of their sum. If Initiate fails after
+            // Begin already landed, the minted marker+lease simply expire and the
+            // orphan-version reaper retires them.
+            let mut kms_begin = self.kms.client();
+            let initiate_fut = control_rpc(
+                "KMS InitiateObjectWrite",
+                kms.initiate_object_write(InitiateObjectWriteRequest {
+                    bucket_id: bucket_id.to_string(),
+                    key: key.to_string(),
+                    logical_length_bytes,
+                    initial_window_stripe_count: self.write_window_max_stripes as u32,
+                }),
+            );
+            let begin_fut = async {
+                let begin_started = Instant::now();
+                let reply = control_rpc(
+                    "KMS BeginObject",
+                    kms_begin.begin_object(BeginObjectRequest {
+                        namespace_id: String::new(),
+                        bucket_id: bucket_id.to_string(),
+                        key: key.to_string(),
+                        logical_length_bytes: 0,
+                        resolve_write_context: false,
+                    }),
+                )
+                .await;
+                (reply, begin_started.elapsed())
+            };
+            let (initiated, (begun, begin_elapsed)) = tokio::join!(initiate_fut, begin_fut);
+            let initiated = initiated?.into_inner();
+            let begun = begun?.into_inner();
+            phases.kms_begin += begin_elapsed;
+            let intent = initiated.intent.ok_or_else(|| {
+                ObjectError::Metadata("KMS InitiateObjectWrite did not return intent".to_string())
+            })?;
+            let ec_profile = initiated.ec_profile.ok_or_else(|| {
+                ObjectError::Metadata(
+                    "KMS InitiateObjectWrite did not return ec_profile".to_string(),
+                )
+            })?;
+            (
+                intent,
+                ec_profile,
+                begun.object_id,
+                begun.version,
+                initiated.initial_fragment_plans,
+                initiated.initial_window_stripe_count as usize,
+                begun.topology_epoch,
+            )
+        };
+        phases.kms_initiate = initiated_started.elapsed();
+        self.bucket_profiles
+            .insert(bucket_id.to_string(), ec_profile.clone());
+        let profile_id = ec_profile.id.clone();
+        let stripe_logical_bytes = stripe_logical_bytes(&ec_profile)?;
+        let stripe_count = usize::try_from(intent.stripe_count).map_err(|_| {
+            ObjectError::Metadata(format!(
+                "write intent {} declares invalid stripe count {}",
+                intent.intent_id, intent.stripe_count
+            ))
+        })?;
+        // The single-shot/decentralized on-media self-describing identity (and the computed
+        // chunk id) use u16 stripe/version fields, and the lease-fenced GC + the commit
+        // reconstruct the reverse-log key from them. Fail fast — before writing fragments
+        // that would collide on chunk id and be rejected at commit — if this object would
+        // exceed that range. (Both currently distant: create-only => version 1, and 65536
+        // stripes is a very large object.)
+        if self.single_shot_commit || self.decentralized {
+            if stripe_count > usize::from(u16::MAX) + 1 {
+                return Err(ObjectError::Metadata(format!(
+                    "object {bucket_id}/{key} has {stripe_count} stripes, over the {} a single-shot/decentralized commit's u16 on-media identity supports",
+                    usize::from(u16::MAX) + 1
+                )));
+            }
+            if object_version > u32::from(u16::MAX) {
+                return Err(ObjectError::Metadata(format!(
+                    "object {bucket_id}/{key} version {object_version} exceeds the {} a single-shot/decentralized commit's u16 on-media identity supports",
+                    u16::MAX
+                )));
+            }
+        }
+        if initial_window_stripe_count == 0 {
+            initial_window_stripe_count = fragment_window_stripe_count(&initial_window_plans);
+        }
+
+        let decentralized = self.decentralized;
+        let single_shot = self.single_shot_commit || decentralized;
+        // The decentralized path computes placement + chunk ids locally from the cluster
+        // config (salt, topology epoch, target roster) instead of the central reserve.
+        let cluster_placement = if decentralized {
+            // Pass BeginObject's epoch as a floor: if the cached roster is behind the
+            // epoch KMS just minted this object against, hard-refresh before computing
+            // HRW placement so fragments never target a stale/decommissioned roster.
+            let cluster_cfg_started = Instant::now();
+            let cfg = self.cluster_config_cached(begin_topology_epoch).await?;
+            phases.kms_cluster_config += cluster_cfg_started.elapsed();
+            // target_id -> endpoint, so a computed placement can address the target
+            // directly without a central reservation handing back an endpoint.
+            let endpoints: HashMap<String, String> = cfg
+                .targets
+                .iter()
+                .map(|target| (target.target_id.clone(), target.endpoint.clone()))
+                .collect();
+            // Pre-warm: establish all N connections to EVERY roster target up front (overlapping
+            // the first stripe's encode) so the first batch does not pay the pool's connect cost
+            // incrementally, and so the pool is fully ready (keepalive-pinged) before the writes.
+            self.ensure_endpoint_pools(endpoints.values().cloned().collect())
+                .await?;
+            let targets = cfg
+                .targets
+                .iter()
+                .map(keinctl::placement::PlacementTarget::from_record)
+                .collect::<Vec<_>>();
+            let failure_domain = FailureDomain::try_from(ec_profile.failure_domain)
+                .unwrap_or(FailureDomain::Unspecified);
+            Some((cfg.cluster_salt, cfg.topology_epoch, targets, failure_domain, endpoints))
+        } else {
+            None
+        };
+
+        let result = async {
+            // Single-shot path: accumulate the placement that actually won for every
+            // fragment (the reservation plan, overlaid with the repaired plan if a
+            // fragment was relocated). Keyed by (stripe, fragment); the final entry is
+            // the durable on-media location, since the target stores each fragment at
+            // exactly the requested granule/generation. Empty (and unused) on the
+            // window/commit write-intent path.
+            // Long writes (the segmented-commit path) outlast the KMS write-lease TTL, so
+            // heartbeat RenewWriteLease in the background until this scope exits. The seal
+            // clears the lease; AbortOnDrop tears the task down on every exit (success, error,
+            // early return) so a doomed write never keeps renewing its lease. Small objects
+            // skip it entirely — they finish well inside the lease, and the segmented-path
+            // gate keeps this off the hot small-object path.
+            let _lease_heartbeat = (decentralized && stripe_count > SEAL_SEGMENT_STRIPES).then(|| {
+                let mut hb_kms = self.kms.client();
+                AbortOnDrop(tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(LEASE_HEARTBEAT_INTERVAL);
+                    ticker.tick().await; // first tick is immediate; the lease is freshly issued
+                    loop {
+                        ticker.tick().await;
+                        let _ = hb_kms
+                            .renew_write_lease(RenewWriteLeaseRequest {
+                                object_id,
+                                lease_ttl_ms: LEASE_HEARTBEAT_TTL_MS,
+                            })
+                            .await;
+                    }
+                }))
+            });
+            // Connection-state observability: while KSC_CONN_TRACE=1, periodically emit per-endpoint
+            // pool health + keepalive ping RTT so the data-plane connection layer is observable
+            // live during the write. AbortOnDrop stops it when the put returns.
+            let _conn_stats_emit = conn_stats_trace_enabled().then(|| {
+                AbortOnDrop(tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(CONN_STATS_EMIT_INTERVAL);
+                    loop {
+                        ticker.tick().await;
+                        for s in crate::client::snapshot_conn_stats() {
+                            eprintln!(
+                                "ksc_conn_stats endpoint={} conns_alive={}/{} ping_rtt_us_min={} ping_rtt_us_avg={} ping_rtt_us_max={} ping_failures={}",
+                                s.endpoint, s.alive_conns, s.total_conns,
+                                s.ping_rtt_us_min, s.ping_rtt_us_avg, s.ping_rtt_us_max, s.ping_failures,
+                            );
+                        }
+                    }
+                }))
+            });
+            let mut single_shot_plans: HashMap<(u32, u32), FragmentPlan> = HashMap::new();
+            let fragments_per_stripe =
+                (ec_profile.data_fragments + ec_profile.parity_fragments) as usize;
+            // Large decentralized objects stream their manifest segments to KMS DURING
+            // the write loop (each landed 512-stripe block sent immediately), leaving
+            // only the tail + seal for the end instead of the whole ceil(S/512)+1
+            // append chain after the last byte. Same gate as the buffered segmented
+            // path; the batched-committer and small single-shot paths are untouched.
+            let mut streaming_commit = (single_shot
+                && decentralized
+                && stripe_count > SEAL_SEGMENT_STRIPES
+                && self.committer.is_none()
+                // fault_skip_commit must leave NO reverse-log rows (its documented
+                // orphan state); streaming would append some mid-loop before the
+                // skip, so it stays on the buffered path.
+                && !self.fault_skip_commit
+                && streaming_segmented_commit_enabled())
+            .then(|| {
+                StreamingSegmentedCommit::open(
+                    self.kms.client(),
+                    format!("{object_id}:{object_version}"),
+                )
+            });
+            let mut window_start = 0usize;
+            while window_start < stripe_count {
+                let default_window_stripe_count = (stripe_count - window_start)
+                    .min(self.write_window_max_stripes);
+                let (window_stripe_count, window_plans) = if let Some((
+                    salt,
+                    _epoch,
+                    placement_targets,
+                    failure_domain,
+                    endpoints,
+                )) = cluster_placement.as_ref()
+                {
+                    // Compute each stripe's targets (HRW) + chunk ids locally and address
+                    // them directly; each target self-allocates the granule (allocate-mode),
+                    // so there is NO central reservation. The placement is reproducible by a
+                    // reader from the same cluster config, and the granule the target chooses
+                    // is captured from the write reply (see apply_landed_fragments).
+                    let count = default_window_stripe_count;
+                    let fragments_per_stripe =
+                        (ec_profile.data_fragments + ec_profile.parity_fragments) as usize;
+                    let no_excluded = std::collections::HashSet::new();
+                    let mut plans = Vec::with_capacity(count.saturating_mul(fragments_per_stripe));
+                    for offset in 0..count {
+                        let stripe_index = (window_start + offset) as u32;
+                        let stripe_targets = keinctl::placement::place_stripe(
+                            salt,
+                            object_id,
+                            object_version as u16,
+                            stripe_index,
+                            fragments_per_stripe,
+                            *failure_domain,
+                            placement_targets,
+                            &no_excluded,
+                        )
+                        .map_err(|err| {
+                            ObjectError::Metadata(format!(
+                                "computed placement failed for {}/{} stripe {}: {}",
+                                bucket_id, key, stripe_index, err
+                            ))
+                        })?;
+                        for (fragment_index, target_id) in stripe_targets.iter().enumerate() {
+                            let endpoint = endpoints.get(target_id).ok_or_else(|| {
+                                ObjectError::Metadata(format!(
+                                    "computed target {target_id} for {bucket_id}/{key} stripe {stripe_index} is not in the cluster roster"
+                                ))
+                            })?;
+                            plans.push(FragmentPlan {
+                                fragment_index: fragment_index as u32,
+                                chunk_id: ChunkId::for_fragment(
+                                    salt,
+                                    object_id,
+                                    object_version as u16,
+                                    stripe_index as u16,
+                                    fragment_index as u16,
+                                )
+                                .0
+                                .to_vec(),
+                                target_id: target_id.clone(),
+                                endpoint: endpoint.clone(),
+                                // The target picks the granule itself; a fresh write needs
+                                // no generation, and the reply reports both back.
+                                granule_index: kp2::GRANULE_ALLOCATE,
+                                generation: 0,
+                                stripe_index,
+                            });
+                        }
+                    }
+                    (count, plans)
+                } else if window_start == 0
+                    && initial_window_stripe_count > 0
+                    && !initial_window_plans.is_empty()
+                {
+                    (
+                        initial_window_stripe_count.min(default_window_stripe_count),
+                        std::mem::take(&mut initial_window_plans),
+                    )
+                } else {
+                    let phase_started = Instant::now();
+                    let reserved = control_rpc(
+                        "KMS ReserveObjectWriteWindow",
+                        kms.reserve_object_write_window(ReserveObjectWriteWindowRequest {
+                            intent_id: intent.intent_id.clone(),
+                            start_stripe_index: window_start as u32,
+                            stripe_count: default_window_stripe_count as u32,
+                        }),
+                    )
+                    .await?
+                    .into_inner();
+                    phases.kms_initiate += phase_started.elapsed();
+                    (default_window_stripe_count, reserved.fragment_plans)
+                };
+                if single_shot {
+                    for plan in &window_plans {
+                        single_shot_plans
+                            .insert((plan.stripe_index, plan.fragment_index), plan.clone());
+                    }
+                }
+                // Producer/consumer pipeline: the CPU-bound EC encode of the next
+                // inflight batch (off the tokio runtime via spawn_blocking) overlaps
+                // the network fragment writes of the current batch, instead of the
+                // old behaviour of encoding the whole inflight batch before issuing
+                // any I/O. `prefetched` holds the already-encoded next batch.
+                let pool = self.prepared_shard_pool(&ec_profile)?;
+                let mut prefetched: Option<EncodedStripeBatch> = None;
+                let mut stripe_offset = 0usize;
+                while stripe_offset < window_stripe_count {
+                    let stripe_batch_len = (window_stripe_count - stripe_offset)
+                        .min(self.write_window_inflight_stripes);
+
+                    let EncodedStripeBatch {
+                        prepared_batch,
+                        batch_plans,
+                        ec_encode: _,
+                    } = match prefetched.take() {
+                        Some(batch) => batch,
+                        None => {
+                            let batch = encode_stripe_batch(
+                                pool.clone(),
+                                &window_plans,
+                                window_start,
+                                stripe_offset,
+                                stripe_batch_len,
+                                logical_length_bytes as usize,
+                                stripe_logical_bytes,
+                                &mut read_range,
+                            )
+                            .await?;
+                            phases.ec_encode += batch.ec_encode;
+                            batch
+                        }
+                    };
+
+                    let phase_started = Instant::now();
+                    self.ensure_target_sessions(&batch_plans).await?;
+                    phases.target_connect += phase_started.elapsed();
+                    let session_snapshot = Arc::new(snapshot_target_sessions(
+                        &self.target_session_pools,
+                        &batch_plans,
+                        &intent.intent_id,
+                    )?);
+
+                    // Determine whether a subsequent inflight batch exists; if so,
+                    // encode it concurrently with the current batch's network writes.
+                    let next_offset = stripe_offset + stripe_batch_len;
+                    let next_batch_len = (window_stripe_count.saturating_sub(next_offset))
+                        .min(self.write_window_inflight_stripes);
+
+                    let intent_id = intent.intent_id.clone();
+                    let write_future = write_prepared_stripe_batch_with_sessions(
+                        session_snapshot,
+                        &intent_id,
+                        object_id,
+                        object_version,
+                        prepared_batch,
+                        Arc::clone(&self.write_inflight_limiter),
+                    );
+
+                    let batch_write = if next_batch_len > 0 {
+                        let encode_future = encode_stripe_batch(
+                            pool.clone(),
+                            &window_plans,
+                            window_start,
+                            next_offset,
+                            next_batch_len,
+                            logical_length_bytes as usize,
+                            stripe_logical_bytes,
+                            &mut read_range,
+                        );
+                        let (batch_write, next_batch) = tokio::join!(write_future, encode_future);
+                        let next_batch = next_batch?;
+                        phases.ec_encode += next_batch.ec_encode;
+                        prefetched = Some(next_batch);
+                        batch_write?
+                    } else {
+                        write_future.await?
+                    };
+                    accumulate_target_request_phases(&mut phases, &batch_write.phases);
+                    phases.target_write += batch_write.write_elapsed;
+                    phases.target_write_wall += batch_write.write_wall;
+                    if single_shot {
+                        // Record where each fragment landed so the committed manifest /
+                        // reverse log names the target-chosen granule.
+                        apply_landed_fragments(&mut single_shot_plans, &batch_write.landed);
+                    }
+
+                    for stripe_result in batch_write.stripe_results {
+                        let stripe_index = stripe_result.prepared.stripe_index;
+                        let mut write_failures = stripe_result.failures;
+
+                        if !write_failures.is_empty() {
+                            let retry_result = self
+                                .retry_fragment_failures_same_target(
+                                    &intent.intent_id,
+                                    object_id,
+                                    object_version,
+                                    &stripe_result.prepared.plans,
+                                    &stripe_result.prepared.fragments,
+                                    std::mem::take(&mut write_failures),
+                                )
+                                .await?;
+                            accumulate_target_request_phases(&mut phases, &retry_result.phases);
+                            phases.target_connect += retry_result.connect_elapsed;
+                            phases.target_write += retry_result.write_elapsed;
+                            if single_shot {
+                                apply_landed_fragments(&mut single_shot_plans, &retry_result.landed);
+                            }
+                            write_failures = retry_result.failures;
+                        }
+
+                        if !write_failures.is_empty() {
+                            // Cross-target repair (RepairObjectWrite) reassigns via the
+                            // central write-intent, which does not know the decentralized
+                            // computed placement, so the decentralized path aborts instead
+                            // of repairing (CRUSH-fallback repair is a later step).
+                            if decentralized
+                                || write_failures.len() > ec_profile.parity_fragments as usize
+                            {
+                                if merged_begin {
+                                    // No intent row exists: forfeit flips the marker to
+                                    // reclaiming so the reaper retires the write's rows
+                                    // and granules without waiting out the lease TTL.
+                                    let _ = kms
+                                        .forfeit_object_write(ForfeitObjectWriteRequest {
+                                            object_id,
+                                            version: object_version,
+                                        })
+                                        .await;
+                                } else {
+                                    let _ = kms
+                                        .abort_object_write(AbortObjectWriteRequest {
+                                            intent_id: intent.intent_id.clone(),
+                                        })
+                                        .await;
+                                }
+                                self.return_prepared_shards(
+                                    &profile_id,
+                                    stripe_result.prepared.fragments,
+                                );
+                                return Err(ObjectError::Transport(format!(
+                                    "KSC object write to {}/{} failed on stripe {} before commit: {}",
+                                    bucket_id,
+                                    key,
+                                    stripe_index,
+                                    join_fragment_failures(&write_failures)
+                                )));
+                            }
+
+                            let failed_fragments = write_failures
+                                .iter()
+                                .map(|failure| FragmentRef {
+                                    stripe_index: failure.stripe_index,
+                                    fragment_index: failure.fragment_index,
+                                })
+                                .collect::<Vec<_>>();
+                            let repaired = control_rpc(
+                                "KMS RepairObjectWrite",
+                                kms.repair_object_write(RepairObjectWriteRequest {
+                                    intent_id: intent.intent_id.clone(),
+                                    failed_fragments: failed_fragments.clone(),
+                                }),
+                            )
+                            .await?
+                            .into_inner()
+                            .intent
+                            .ok_or_else(|| {
+                                ObjectError::Metadata(
+                                    "KMS RepairObjectWrite did not return repaired intent".to_string(),
+                                )
+                            })?;
+                            let retry_plans = failed_fragments
+                                .iter()
+                                .map(|fragment_ref| {
+                                    repaired
+                                        .fragment_plans
+                                        .iter()
+                                        .find(|plan| {
+                                            plan.stripe_index == fragment_ref.stripe_index
+                                                && plan.fragment_index == fragment_ref.fragment_index
+                                        })
+                                        .cloned()
+                                        .ok_or_else(|| {
+                                            ObjectError::Metadata(format!(
+                                                "repaired intent {} is missing stripe {} fragment plan {}",
+                                                repaired.intent_id,
+                                                fragment_ref.stripe_index,
+                                                fragment_ref.fragment_index
+                                            ))
+                                        })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            if single_shot {
+                                // Repair relocates the failed fragments to fresh
+                                // placement; record it so the manifest names where the
+                                // bytes actually landed, not the abandoned original.
+                                for plan in &retry_plans {
+                                    single_shot_plans.insert(
+                                        (plan.stripe_index, plan.fragment_index),
+                                        plan.clone(),
+                                    );
+                                }
+                            }
+                            let phase_started = Instant::now();
+                            self.ensure_target_sessions(&retry_plans).await?;
+                            phases.target_connect += phase_started.elapsed();
+                            let phase_started = Instant::now();
+                            let (retry_write_failures, retry_rpc_phases, retry_landed) = self
+                                .write_fragment_plans(
+                                    &repaired.intent_id,
+                                    object_id,
+                                    object_version,
+                                    &retry_plans,
+                                    &stripe_result.prepared.fragments,
+                                )
+                                .await?;
+                            write_failures = retry_write_failures;
+                            accumulate_target_request_phases(&mut phases, &retry_rpc_phases);
+                            if single_shot {
+                                apply_landed_fragments(&mut single_shot_plans, &retry_landed);
+                            }
+                            phases.target_write += phase_started.elapsed();
+
+                            if !write_failures.is_empty() {
+                                let retry_result = self
+                                    .retry_fragment_failures_same_target(
+                                        &repaired.intent_id,
+                                        object_id,
+                                        object_version,
+                                        &retry_plans,
+                                        &stripe_result.prepared.fragments,
+                                        std::mem::take(&mut write_failures),
+                                    )
+                                    .await?;
+                                accumulate_target_request_phases(&mut phases, &retry_result.phases);
+                                phases.target_connect += retry_result.connect_elapsed;
+                                phases.target_write += retry_result.write_elapsed;
+                                if single_shot {
+                                    apply_landed_fragments(&mut single_shot_plans, &retry_result.landed);
+                                }
+                                write_failures = retry_result.failures;
+                            }
+
+                            if !write_failures.is_empty() {
+                                let _ = kms
+                                    .abort_object_write(AbortObjectWriteRequest {
+                                        intent_id: repaired.intent_id.clone(),
+                                    })
+                                    .await;
+                                self.return_prepared_shards(
+                                    &profile_id,
+                                    stripe_result.prepared.fragments,
+                                );
+                                return Err(ObjectError::Transport(format!(
+                                    "KSC object write to {}/{} failed on stripe {} after repair: {}",
+                                    bucket_id,
+                                    key,
+                                    stripe_index,
+                                    join_fragment_failures(&write_failures)
+                                )));
+                            }
+                            intent = repaired;
+                        }
+
+                        self.return_prepared_shards(&profile_id, stripe_result.prepared.fragments);
+                    }
+
+                    stripe_offset += stripe_batch_len;
+
+                    // Every stripe below (window_start + stripe_offset) is now fully
+                    // landed (its batch and all retries resolved synchronously above),
+                    // so stream any full 512-stripe segments that just completed.
+                    if let Some(stream) = streaming_commit.as_mut() {
+                        stream
+                            .flush_ready(
+                                &single_shot_plans,
+                                window_start + stripe_offset,
+                                fragments_per_stripe,
+                            )
+                            .await;
+                    }
+                }
+
+                if !single_shot {
+                    // The single-shot path commits the whole object once at the end
+                    // (no per-window write-intent progression), so skip this RPC.
+                    let phase_started = Instant::now();
+                    control_rpc(
+                        "KMS CommitObjectWriteWindow",
+                        kms.commit_object_write_window(CommitObjectWriteWindowRequest {
+                            intent_id: intent.intent_id.clone(),
+                            successful_fragments: window_plans
+                                .iter()
+                                .map(|plan| FragmentRef {
+                                    stripe_index: plan.stripe_index,
+                                    fragment_index: plan.fragment_index,
+                                })
+                                .collect(),
+                        }),
+                    )
+                    .await?;
+                    phases.kms_commit += phase_started.elapsed();
+                }
+                window_start += window_stripe_count;
+            }
+
+            let phase_started = Instant::now();
+            let manifest = if single_shot {
+                // Assemble the manifest from the placement that won for every
+                // fragment, then commit it in a single KMS transaction.
+                let mut stripes: Vec<StripeManifest> = (0..stripe_count)
+                    .map(|_| StripeManifest {
+                        fragments: Vec::new(),
+                    })
+                    .collect();
+                for ((stripe_index, _fragment_index), plan) in single_shot_plans.drain() {
+                    let stripe = stripes.get_mut(stripe_index as usize).ok_or_else(|| {
+                        ObjectError::Metadata(format!(
+                            "single-shot commit references missing stripe {} for {}/{}",
+                            stripe_index, bucket_id, key
+                        ))
+                    })?;
+                    stripe.fragments.push(plan);
+                }
+                for (stripe_index, stripe) in stripes.iter_mut().enumerate() {
+                    stripe
+                        .fragments
+                        .sort_unstable_by_key(|plan| plan.fragment_index);
+                    if stripe.fragments.len() != fragments_per_stripe {
+                        return Err(ObjectError::Metadata(format!(
+                            "single-shot commit assembled {} of {} fragments for stripe {} of {}/{}",
+                            stripe.fragments.len(),
+                            fragments_per_stripe,
+                            stripe_index,
+                            bucket_id,
+                            key
+                        )));
+                    }
+                }
+                // Deterministic version id makes the commit idempotent under retry.
+                let manifest = ObjectVersionManifest {
+                    version_id: format!("{object_id}:{object_version}"),
+                    bucket_id: bucket_id.to_string(),
+                    key: key.to_string(),
+                    logical_length_bytes,
+                    ec_profile_id: profile_id.clone(),
+                    stripes,
+                    namespace_id: intent.namespace_id.clone(),
+                    object_entry_id: intent.object_entry_id.clone(),
+                    bucket_entry_id: intent.bucket_entry_id.clone(),
+                };
+                // Fault injection for lease-fenced GC validation: the fragments are durable
+                // (allocate-mode granules occupied on the targets) but no CommitObject is
+                // issued, so the object has NO head, NO reverse-log rows, and its write lease
+                // stays until it expires — exactly the orphan state the GC must reclaim. The
+                // operator reads the printed object_id to inspect/await the reclaim.
+                if self.fault_skip_commit {
+                    return Err(ObjectError::Metadata(format!(
+                        "fault-skip-commit: wrote {}/{} fragments WITHOUT committing (object_id={} version={} version_id={}:{}); granules are orphaned for GC validation",
+                        bucket_id, key, object_id, object_version, object_id, object_version
+                    )));
+                }
+                // Fault injection: hold the fully-landed write here before its commit,
+                // long enough for the marker TTL to lapse and the GC/reaper to act —
+                // the delayed commit then MUST be rejected by the reclaim fence or the
+                // claimed marker instead of flipping a head onto freed granules.
+                if let Ok(value) = std::env::var("KSC_FAULT_STALL_BEFORE_COMMIT_MS") {
+                    if let Ok(stall_ms) = value.parse::<u64>() {
+                        if stall_ms > 0 {
+                            eprintln!(
+                                "fault-stall-before-commit: {}/{} (version_id={}:{}) stalling {} ms with fragments landed and no commit",
+                                bucket_id, key, object_id, object_version, stall_ms
+                            );
+                            sleep(Duration::from_millis(stall_ms)).await;
+                        }
+                    }
+                }
+                let expected_prior_version = object_version.saturating_sub(1);
+                // The fragment bytes are already durable; this only flips metadata,
+                // so the helper retries transport failures idempotently and never
+                // rewrites data.
+                // Decentralized writes record the placement epoch they computed against;
+                // the centrally-reserved single-shot path records none.
+                let topology_epoch = cluster_placement
+                    .as_ref()
+                    .map(|(_, epoch, _, _, _)| *epoch)
+                    .unwrap_or(0);
+                let commit_result: Result<(), ObjectError> = if let Some(committer) =
+                    &self.committer
+                {
+                    // Batched commit: enqueue this object's head and await its
+                    // MultiCommitObject flush, so commits from many concurrent writers fold
+                    // into one FDB transaction.
+                    let request = build_commit_object_request(
+                        object_id,
+                        object_version,
+                        expected_prior_version,
+                        &manifest,
+                        &intent.parent_entry_id,
+                        &intent.parent_path,
+                        topology_epoch,
+                        decentralized,
+                        decentralized && merged_begin,
+                    );
+                    committer.commit(request).await.map(|_head| ())
+                } else if decentralized && manifest.stripes.len() > SEAL_SEGMENT_STRIPES {
+                    // Too large for one FDB commit transaction: append-then-seal. When the
+                    // stream stayed healthy through the write loop, only its tail + seal
+                    // remain (the bulk was appended during the data phase); otherwise the
+                    // stream never opened or broke early (before any seal), so re-send the
+                    // whole manifest on the buffered path — its appends are idempotent.
+                    // A healthy stream sends its tail + seal; finish() returns Ok(None)
+                    // if a send fails BEFORE the seal (safe to re-send on the buffered
+                    // path). A stream that never opened or broke mid-loop also falls
+                    // through to buffered — its earlier appends are idempotent. A
+                    // post-seal error (Err) is ambiguous and flows to the forfeit
+                    // handler below, exactly like a buffered seal failure.
+                    let streamed = match streaming_commit.take() {
+                        Some(stream) if stream.healthy => {
+                            let seal = CommitObjectSeal {
+                                object_id,
+                                namespace_id: manifest.namespace_id.clone(),
+                                bucket_id: manifest.bucket_id.clone(),
+                                key: manifest.key.clone(),
+                                version: object_version,
+                                expected_prior_version,
+                                parent_entry_id: intent.parent_entry_id.clone(),
+                                parent_path: intent.parent_path.clone(),
+                                topology_epoch,
+                                logical_length_bytes: manifest.logical_length_bytes,
+                                ec_profile_id: manifest.ec_profile_id.clone(),
+                                version_id: manifest.version_id.clone(),
+                                object_entry_id: manifest.object_entry_id.clone(),
+                            };
+                            stream.finish(seal, &manifest.stripes).await
+                        }
+                        _ => Ok(None),
+                    };
+                    match streamed {
+                        Ok(Some(_head)) => Ok(()),
+                        Ok(None) => commit_object_segmented_rpc(
+                            &mut kms,
+                            object_id,
+                            object_version,
+                            expected_prior_version,
+                            &manifest,
+                            &intent.parent_entry_id,
+                            &intent.parent_path,
+                            topology_epoch,
+                        )
+                        .await
+                        .map(|_head| ()),
+                        Err(err) => Err(err),
+                    }
+                } else {
+                    commit_object_single_shot_rpc(
+                        &mut kms,
+                        object_id,
+                        object_version,
+                        expected_prior_version,
+                        &manifest,
+                        &intent.parent_entry_id,
+                        &intent.parent_path,
+                        topology_epoch,
+                        decentralized,
+                        decentralized && merged_begin,
+                    )
+                    .await
+                    .map(|_head| ())
+                };
+                if let Err(err) = commit_result {
+                    if merged_begin {
+                        // Best-effort: flip the failed write's marker to reclaiming so
+                        // the reaper retires its rows and granules promptly. Safe when
+                        // the commit actually landed and only the reply was lost — the
+                        // commit already cleared the marker and forfeit no-ops on an
+                        // absent one.
+                        let _ = kms
+                            .forfeit_object_write(ForfeitObjectWriteRequest {
+                                object_id,
+                                version: object_version,
+                            })
+                            .await;
+                    }
+                    return Err(err);
+                }
+                manifest
+            } else {
+                let committed = control_rpc(
+                    "KMS CommitObjectWrite",
+                    kms.commit_object_write(CommitObjectWriteRequest {
+                        intent_id: intent.intent_id.clone(),
+                        successful_fragments: Vec::new(),
+                    }),
+                )
+                .await?
+                .into_inner();
+                committed.manifest.ok_or_else(|| {
+                    ObjectError::Metadata(
+                        "KMS CommitObjectWrite did not return manifest".to_string(),
+                    )
+                })?
+            };
+            phases.kms_commit += phase_started.elapsed();
+            self.cache_resolved_read(manifest.clone(), ec_profile.clone());
+            Ok(ObjectPutResult {
+                intent,
+                manifest,
+                ec_profile,
+                phases,
+            })
+        }
+        .await;
+        result
+    }
+
+    /// Stripe-granular ranged read: returns the object bytes in `[offset,
+    /// offset+len)` (clamped to the object length) by reading only the stripes
+    /// the range touches, rather than materializing the whole object. Built on
+    /// `read_single_stripe` + the uniform stripe geometry; no protocol change.
+    /// Byte-granular fast path for a clamped window `[start, end)`: when the
+    /// window lies entirely inside ONE present data fragment, fetch just those
+    /// bytes with a single ranged KP2 packed read (one chunk, one sub-range)
+    /// instead of reading the whole stripe. Returns `Ok(None)` — so the caller
+    /// falls back to the full stripe loop (with reconstruction) — when the
+    /// window spans fragments/stripes, lands in the parity-padded tail, or the
+    /// fragment read does not return exactly the requested bytes (e.g. missing).
+    async fn try_byte_granular_read(
+        &mut self,
+        manifest: &ObjectVersionManifest,
+        ec_profile: &EcProfile,
+        object_len: u64,
+        start: u64,
+        end: u64,
+        phases: &mut ObjectPhaseTimes,
+    ) -> Result<Option<RangedGetResult>, ObjectError> {
+        let fragment_bytes = ec_profile.fragment_bytes as u64;
+        let data_fragments = ec_profile.data_fragments as usize;
+        if fragment_bytes == 0 || data_fragments == 0 || end <= start {
+            return Ok(None);
+        }
+        let stripe_width = fragment_bytes * data_fragments as u64;
+        // Single stripe?
+        if start / stripe_width != (end - 1) / stripe_width {
+            return Ok(None);
+        }
+        let stripe_index = (start / stripe_width) as usize;
+        let stripe_local_start = start - stripe_index as u64 * stripe_width;
+        let stripe_local_end = end - stripe_index as u64 * stripe_width;
+        // Single data fragment?
+        if stripe_local_start / fragment_bytes != (stripe_local_end - 1) / fragment_bytes {
+            return Ok(None);
+        }
+        let fragment_index = (stripe_local_start / fragment_bytes) as usize;
+        // Must be a real data fragment for this (possibly partial) stripe.
+        let stripe_logical_bytes =
+            stripe_logical_length_bytes(manifest, ec_profile, stripe_index as u32);
+        if fragment_index >= needed_data_fragment_count(ec_profile, stripe_logical_bytes) {
+            return Ok(None);
+        }
+        let Some(stripe) = manifest.stripes.get(stripe_index) else {
+            return Ok(None);
+        };
+        let Some(plan) = stripe.fragments.get(fragment_index) else {
+            return Ok(None);
+        };
+        let chunk_id = chunk_id_from_proto(&plan.chunk_id)?;
+        let fragment_offset = stripe_local_start - fragment_index as u64 * fragment_bytes;
+        let fragment_len = (end - start) as u32;
+
+        let plans = std::slice::from_ref(plan);
+        let (connect_elapsed, _connect_failures) = self.ensure_read_target_sessions(plans).await;
+        phases.target_connect += connect_elapsed;
+        let Some(session) = self.target_sessions.get(&plan.endpoint).cloned() else {
+            return Ok(None);
+        };
+
+        let query = PackedReadQuery {
+            chunk_ids: vec![chunk_id],
+            ranges: Some(vec![ChunkRange {
+                offset: fragment_offset,
+                length: fragment_len,
+            }]),
+        };
+        let read_started = Instant::now();
+        let reply = match data_rpc(
+            "target ranged read",
+            TARGET_IO_TIMEOUT,
+            session.packed_read(&query, fragment_len as usize),
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            // Any RPC failure: fall back to the proven full-stripe path.
+            Err(_) => return Ok(None),
+        };
+        phases.target_read += read_started.elapsed();
+        accumulate_target_request_phases(phases, &reply.phases);
+        let Some(entry) = reply.value.entries.into_iter().next() else {
+            return Ok(None);
+        };
+        // 200 with exactly the requested bytes, or fall back (missing fragment,
+        // short read, or anything unexpected).
+        if entry.status_code != 200 || entry.payload.len() != fragment_len as usize {
+            return Ok(None);
+        }
+        Ok(Some(RangedGetResult {
+            payload: entry.payload,
+            offset: start,
+            object_length_bytes: object_len,
+            manifest: manifest.clone(),
+            ec_profile: ec_profile.clone(),
+            phases: *phases,
+            missing_fragments: 0,
+            data_fragment_reads: 1,
+            parity_fragment_reads: 0,
+            reconstructed: false,
+        }))
+    }
+
+    pub async fn get_object_range(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<RangedGetResult, ObjectError> {
+        let mut phases = ObjectPhaseTimes::default();
+        let (manifest, ec_profile) = if let Some(cached) = self.cached_resolved_read(bucket_id, key)
+        {
+            cached
+        } else {
+            let phase_started = Instant::now();
+            let (manifest, ec_profile) = self.resolve_for_read(bucket_id, key).await?;
+            phases.kms_resolve = phase_started.elapsed();
+            self.cache_resolved_read(manifest.clone(), ec_profile.clone());
+            (manifest, ec_profile)
+        };
+
+        // Clamp the requested window to the object's logical length.
+        let object_len = manifest.logical_length_bytes;
+        let start = offset.min(object_len);
+        let end = offset.saturating_add(len).min(object_len);
+        let empty = |manifest: ObjectVersionManifest, ec_profile: EcProfile, phases| RangedGetResult {
+            payload: Vec::new(),
+            offset: start,
+            object_length_bytes: object_len,
+            manifest,
+            ec_profile,
+            phases,
+            missing_fragments: 0,
+            data_fragment_reads: 0,
+            parity_fragment_reads: 0,
+            reconstructed: false,
+        };
+        if end <= start {
+            return Ok(empty(manifest, ec_profile, phases));
+        }
+
+        // Whole-object payload-cache fast path: slice the window out of a cached
+        // full payload with zero target I/O. Never write a partial slice back —
+        // the payload cache is keyed whole-object.
+        if let Some(full) = self.cached_payload_read(&manifest) {
+            let lo = (start as usize).min(full.len());
+            let hi = (end as usize).min(full.len());
+            let mut result = empty(manifest, ec_profile, phases);
+            if lo < hi {
+                result.payload = full[lo..hi].to_vec();
+            }
+            return Ok(result);
+        }
+
+        if manifest.stripes.is_empty() {
+            return Err(ObjectError::Metadata(
+                "manifest has no stripes for a non-empty ranged read".to_string(),
+            ));
+        }
+
+        // Byte-granular fast path: a window inside one present data fragment is
+        // served by a single ranged KP2 packed read (~the asked bytes), not the
+        // whole stripe. Falls through to the full stripe loop on any miss.
+        if let Some(result) = self
+            .try_byte_granular_read(&manifest, &ec_profile, object_len, start, end, &mut phases)
+            .await?
+        {
+            return Ok(result);
+        }
+
+        // read_single_stripe's reconstruct path needs the encoder prepared.
+        self.ensure_prepared_encoder(&ec_profile)?;
+
+        // Uniform stripe width W = data_fragments * fragment_bytes. Every stripe
+        // but the last is exactly W; read_single_stripe truncates each returned
+        // payload to that stripe's logical length, so we slice directly into it.
+        let stripe_width = stripe_logical_bytes(&ec_profile)? as u64;
+        if stripe_width == 0 {
+            return Err(ObjectError::Metadata(
+                "EC profile has a zero-width stripe geometry".to_string(),
+            ));
+        }
+        let (first_stripe, last_stripe) = range_to_stripe_indices(start, end, stripe_width);
+        if last_stripe >= manifest.stripes.len() {
+            return Err(ObjectError::Metadata(format!(
+                "ranged read [{start}, {end}) maps to stripe {last_stripe} but manifest carries {} stripes",
+                manifest.stripes.len()
+            )));
+        }
+
+        let mut out = Vec::with_capacity((end - start) as usize);
+        let mut missing_fragments = 0_usize;
+        let mut data_fragment_reads = 0_usize;
+        let mut parity_fragment_reads = 0_usize;
+        let mut reconstructed_any = false;
+
+        for stripe_index in first_stripe..=last_stripe {
+            let stripe = self
+                .read_single_stripe(bucket_id, key, &manifest, &ec_profile, stripe_index)
+                .await?;
+            add_object_phase_times(&mut phases, &stripe.phases);
+            missing_fragments += stripe.missing_fragments;
+            data_fragment_reads += stripe.data_fragment_reads;
+            parity_fragment_reads += stripe.parity_fragment_reads;
+            reconstructed_any |= stripe.reconstructed;
+
+            let (slice_start, slice_end) =
+                stripe_slice_bounds(start, end, stripe_index, stripe_width, stripe.payload.len());
+            if slice_start < slice_end {
+                out.extend_from_slice(&stripe.payload[slice_start..slice_end]);
+            }
+        }
+
+        Ok(RangedGetResult {
+            payload: out,
+            offset: start,
+            object_length_bytes: object_len,
+            manifest,
+            ec_profile,
+            phases,
+            missing_fragments,
+            data_fragment_reads,
+            parity_fragment_reads,
+            reconstructed: reconstructed_any,
+        })
+    }
+
+    pub async fn get_object_single_stripe(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+    ) -> Result<ObjectGetResult, ObjectError> {
+        let mut phases = ObjectPhaseTimes::default();
+        let (manifest, ec_profile) = if let Some(cached) = self.cached_resolved_read(bucket_id, key)
+        {
+            cached
+        } else {
+            let phase_started = Instant::now();
+            let (manifest, ec_profile) = self.resolve_for_read(bucket_id, key).await?;
+            phases.kms_resolve = phase_started.elapsed();
+            self.cache_resolved_read(manifest.clone(), ec_profile.clone());
+            (manifest, ec_profile)
+        };
+        if let Some(payload) = self.cached_payload_read(&manifest) {
+            return Ok(ObjectGetResult {
+                payload,
+                manifest,
+                ec_profile,
+                phases,
+                missing_fragments: 0,
+                data_fragment_reads: 0,
+                parity_fragment_reads: 0,
+                reconstructed: false,
+            });
+        }
+        self.ensure_prepared_encoder(&ec_profile)?;
+        let data_fragments = ec_profile.data_fragments as usize;
+        if manifest.stripes.is_empty() {
+            if manifest.logical_length_bytes == 0 {
+                return Ok(ObjectGetResult {
+                    payload: Vec::new(),
+                    manifest,
+                    ec_profile,
+                    phases,
+                    missing_fragments: 0,
+                    data_fragment_reads: 0,
+                    parity_fragment_reads: 0,
+                    reconstructed: false,
+                });
+            }
+            return Err(ObjectError::Metadata("manifest has no stripes".to_string()));
+        }
+        let payload_capacity = usize::try_from(manifest.logical_length_bytes).unwrap_or(usize::MAX);
+        let mut out = Vec::with_capacity(payload_capacity);
+        let mut missing_fragments = 0_usize;
+        let mut data_fragment_reads = 0_usize;
+        let mut parity_fragment_reads = 0_usize;
+        let mut reconstructed_any = false;
+
+        for window_start in (0..manifest.stripes.len()).step_by(DEFAULT_READ_WINDOW_MAX_STRIPES) {
+            let window_end =
+                (window_start + DEFAULT_READ_WINDOW_MAX_STRIPES).min(manifest.stripes.len());
+            let mut window_states = Vec::with_capacity(window_end - window_start);
+            let mut window_plans = Vec::new();
+            for stripe_index in window_start..window_end {
+                let stripe = &manifest.stripes[stripe_index];
+                if stripe.fragments.len() < data_fragments {
+                    return Err(ObjectError::Metadata(format!(
+                        "manifest stripe only carries {} fragments but profile {} needs {} data fragments",
+                        stripe.fragments.len(),
+                        ec_profile.id,
+                        data_fragments
+                    )));
+                }
+                let stripe_logical_bytes =
+                    stripe_logical_length_bytes(&manifest, &ec_profile, stripe_index as u32);
+                let needed_data_fragments =
+                    needed_data_fragment_count(&ec_profile, stripe_logical_bytes);
+                for fragment_index in 0..needed_data_fragments {
+                    let plan = stripe.fragments[fragment_index].clone();
+                    window_plans.push(BatchedTargetReadPlan {
+                        endpoint: plan.endpoint.clone(),
+                        stripe_index: stripe_index as u32,
+                        fragment_index,
+                        chunk_id: chunk_id_from_proto(&plan.chunk_id)?,
+                        payload_bytes: data_fragment_payload_bytes(
+                            &ec_profile,
+                            stripe_logical_bytes,
+                            fragment_index,
+                        ),
+                    });
+                }
+                window_states.push(WindowStripeReadState {
+                    stripe_index,
+                    needed_data_fragments,
+                    fragments: vec![None; needed_data_fragments],
+                });
+            }
+
+            let needed_connect_plans = window_states
+                .iter()
+                .flat_map(|state| {
+                    manifest.stripes[state.stripe_index]
+                        .fragments
+                        .iter()
+                        .take(state.needed_data_fragments)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let (connect_elapsed, _) = self
+                .ensure_read_target_sessions(&needed_connect_plans)
+                .await;
+            phases.target_connect += connect_elapsed;
+
+            let batched_read = read_plans_batched_with_sessions(
+                Arc::new(self.target_sessions.clone()),
+                window_start,
+                &mut window_states,
+                window_plans,
+            )
+            .await?;
+            accumulate_target_request_phases(&mut phases, &batched_read.phases);
+            phases.target_read += batched_read.read_elapsed;
+            data_fragment_reads += needed_connect_plans.len();
+
+            for state in window_states {
+                if state.fragments.iter().all(Option::is_some) {
+                    for fragment in state.fragments {
+                        out.extend_from_slice(fragment.as_ref().ok_or_else(|| {
+                            ObjectError::Metadata(
+                                "healthy batched read path lost a data fragment after validation"
+                                    .to_string(),
+                            )
+                        })?);
+                    }
+                    continue;
+                }
+
+                let stripe_result = self
+                    .read_single_stripe(bucket_id, key, &manifest, &ec_profile, state.stripe_index)
+                    .await?;
+                out.extend_from_slice(&stripe_result.payload);
+                missing_fragments += stripe_result.missing_fragments;
+                data_fragment_reads += stripe_result.data_fragment_reads;
+                parity_fragment_reads += stripe_result.parity_fragment_reads;
+                reconstructed_any |= stripe_result.reconstructed;
+                add_object_phase_times(&mut phases, &stripe_result.phases);
+            }
+        }
+
+        out.truncate(manifest.logical_length_bytes as usize);
+        self.cache_payload_read(&manifest, &out);
+        Ok(ObjectGetResult {
+            payload: out,
+            manifest,
+            ec_profile,
+            phases,
+            missing_fragments,
+            data_fragment_reads,
+            parity_fragment_reads,
+            reconstructed: reconstructed_any,
+        })
+    }
+
+    pub async fn delete_object(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+        version_ids: &[String],
+    ) -> Result<ObjectDeleteResult, ObjectError> {
+        let mut kms = self.kms.client();
+        let deleted = control_rpc(
+            "KMS DeleteObject",
+            kms.delete_object(DeleteObjectRequest {
+                bucket_id: bucket_id.to_string(),
+                key: key.to_string(),
+                version_ids: version_ids.to_vec(),
+            }),
+        )
+        .await?
+        .into_inner();
+        self.invalidate_resolved_read(bucket_id, key);
+        Ok(ObjectDeleteResult {
+            deleted_versions: deleted.deleted_versions,
+            fragment_delete_attempts: deleted.fragment_delete_attempts,
+            fragment_delete_successes: deleted.fragment_delete_successes,
+            reclaimed_granules: deleted.reclaimed_granules,
+            cleanup_complete: deleted.cleanup_complete,
+        })
+    }
+
+    async fn read_plans(
+        &self,
+        plans: &[FragmentPlan],
+        fragments: &mut [Option<Vec<u8>>],
+        version_id: &str,
+    ) -> Result<(Vec<String>, RequestPhaseTimes), ObjectError> {
+        let mut reads = JoinSet::new();
+        let mut failures = Vec::new();
+        for plan in plans {
+            let Some(session) = self.target_sessions.get(&plan.endpoint).cloned() else {
+                failures.push(format!(
+                    "fragment {} target {} endpoint {} has no live target session in read manifest {}",
+                    plan.fragment_index, plan.target_id, plan.endpoint, version_id
+                ));
+                continue;
+            };
+            let chunk_id = chunk_id_from_proto(&plan.chunk_id)?;
+            let endpoint = plan.endpoint.clone();
+            let target_id = plan.target_id.clone();
+            let fragment_index = plan.fragment_index as usize;
+            reads.spawn(async move {
+                match data_rpc(
+                    "target read",
+                    TARGET_IO_TIMEOUT,
+                    session.read_chunk(chunk_id),
+                )
+                .await
+                {
+                    Ok(reply) => Ok((fragment_index, reply.value.payload, reply.phases)),
+                    Err(err) => Err(format!(
+                        "fragment {} target {} endpoint {} failed: {}",
+                        fragment_index, target_id, endpoint, err
+                    )),
+                }
+            });
+        }
+        let mut phase_totals = RequestPhaseTimes::default();
+        while let Some(result) = reads.join_next().await {
+            match result {
+                Ok(Ok((fragment_index, payload, phases))) => {
+                    fragments[fragment_index] = Some(payload);
+                    add_request_phase_times(&mut phase_totals, &phases);
+                }
+                Ok(Err(err)) => failures.push(err),
+                Err(err) => failures.push(format!(
+                    "object read worker task failed before completing a fragment read: {}",
+                    err
+                )),
+            }
+        }
+        Ok((failures, phase_totals))
+    }
+
+    async fn read_single_stripe(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+        manifest: &ObjectVersionManifest,
+        ec_profile: &EcProfile,
+        stripe_index: usize,
+    ) -> Result<StripeReadResult, ObjectError> {
+        let mut phases = ObjectPhaseTimes::default();
+        let stripe = &manifest.stripes[stripe_index];
+        let data_fragments = ec_profile.data_fragments as usize;
+        if stripe.fragments.len() < data_fragments {
+            return Err(ObjectError::Metadata(format!(
+                "manifest stripe only carries {} fragments but profile {} needs {} data fragments",
+                stripe.fragments.len(),
+                ec_profile.id,
+                data_fragments
+            )));
+        }
+        let stripe_logical_bytes =
+            stripe_logical_length_bytes(manifest, ec_profile, stripe_index as u32);
+        let needed_data_fragments = needed_data_fragment_count(ec_profile, stripe_logical_bytes);
+        let needed_data_plans = stripe
+            .fragments
+            .iter()
+            .take(needed_data_fragments)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let (connect_elapsed, mut connect_failures) =
+            self.ensure_read_target_sessions(&needed_data_plans).await;
+        phases.target_connect += connect_elapsed;
+
+        let phase_started = Instant::now();
+        let mut fragments = vec![None; stripe.fragments.len()];
+        let (read_failures, read_rpc_phases) = self
+            .read_plans(&needed_data_plans, &mut fragments, &manifest.version_id)
+            .await?;
+        let mut failures = Vec::new();
+        failures.append(&mut connect_failures);
+        failures.extend(read_failures);
+        let mut data_fragment_reads = needed_data_plans.len();
+        accumulate_target_request_phases(&mut phases, &read_rpc_phases);
+        phases.target_read += phase_started.elapsed();
+
+        let missing_data = fragments
+            .iter()
+            .take(needed_data_fragments)
+            .filter(|slot| slot.is_none())
+            .count();
+        if missing_data == 0 {
+            let mut payload = Vec::with_capacity(stripe_logical_bytes as usize);
+            for fragment in fragments.iter().take(needed_data_fragments) {
+                payload.extend_from_slice(fragment.as_ref().ok_or_else(|| {
+                    ObjectError::Metadata(
+                        "healthy read fallback path lost a data fragment after validation"
+                            .to_string(),
+                    )
+                })?);
+            }
+            payload.truncate(stripe_logical_bytes as usize);
+            return Ok(StripeReadResult {
+                payload,
+                missing_fragments: failures.len(),
+                data_fragment_reads,
+                parity_fragment_reads: 0,
+                reconstructed: false,
+                phases,
+            });
+        }
+        if missing_data > ec_profile.parity_fragments as usize {
+            return Err(ObjectError::Transport(format!(
+                "KSC object read for {}/{} lost too many fragments in one stripe: {}",
+                bucket_id,
+                key,
+                failures.join(" | ")
+            )));
+        }
+        let remaining_data_plans = stripe
+            .fragments
+            .iter()
+            .skip(needed_data_fragments)
+            .take(data_fragments.saturating_sub(needed_data_fragments))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !remaining_data_plans.is_empty() {
+            let (connect_elapsed, mut connect_failures) = self
+                .ensure_read_target_sessions(&remaining_data_plans)
+                .await;
+            phases.target_connect += connect_elapsed;
+
+            let phase_started = Instant::now();
+            let (remaining_failures, remaining_rpc_phases) = self
+                .read_plans(&remaining_data_plans, &mut fragments, &manifest.version_id)
+                .await?;
+            accumulate_target_request_phases(&mut phases, &remaining_rpc_phases);
+            phases.target_read += phase_started.elapsed();
+            data_fragment_reads += remaining_data_plans.len();
+            failures.append(&mut connect_failures);
+            failures.extend(remaining_failures);
+        }
+        let all_parity_plans = stripe
+            .fragments
+            .iter()
+            .skip(data_fragments)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut parity_fragment_reads = 0_usize;
+        let mut parity_offset = 0_usize;
+        while fragments
+            .iter()
+            .take(data_fragments)
+            .filter(|slot| slot.is_some())
+            .count()
+            < data_fragments
+            && parity_offset < all_parity_plans.len()
+        {
+            let still_needed = data_fragments.saturating_sub(
+                fragments
+                    .iter()
+                    .take(data_fragments)
+                    .filter(|slot| slot.is_some())
+                    .count(),
+            );
+            let batch_len = still_needed.min(all_parity_plans.len().saturating_sub(parity_offset));
+            let parity_plans = all_parity_plans[parity_offset..parity_offset + batch_len].to_vec();
+            let (connect_elapsed, mut connect_failures) =
+                self.ensure_read_target_sessions(&parity_plans).await;
+            phases.target_connect += connect_elapsed;
+
+            let phase_started = Instant::now();
+            let (parity_read_failures, parity_rpc_phases) = self
+                .read_plans(&parity_plans, &mut fragments, &manifest.version_id)
+                .await?;
+            accumulate_target_request_phases(&mut phases, &parity_rpc_phases);
+            phases.target_read += phase_started.elapsed();
+            parity_fragment_reads += parity_plans.len();
+            failures.append(&mut connect_failures);
+            failures.extend(parity_read_failures);
+            parity_offset += batch_len;
+        }
+        if failures.len() > ec_profile.parity_fragments as usize {
+            return Err(ObjectError::Transport(format!(
+                "KSC object read for {}/{} lost too many fragments: {}",
+                bucket_id,
+                key,
+                failures.join(" | ")
+            )));
+        }
+        if fragments.iter().filter(|slot| slot.is_some()).count() < data_fragments {
+            return Err(ObjectError::Transport(format!(
+                "KSC object read for {}/{} could not gather enough fragments to reconstruct: {}",
+                bucket_id,
+                key,
+                failures.join(" | ")
+            )));
+        }
+        let phase_started = Instant::now();
+        // The plan is a cheap clone (an EcProfile plus a &'static table); move it and
+        // the owned fragment buffers onto a blocking worker so the CPU-bound Reed-Solomon
+        // reconstruct never stalls a tokio runtime thread.
+        let plan = self
+            .prepared_encoders
+            .get(&ec_profile.id)
+            .ok_or_else(|| {
+                ObjectError::Metadata(format!(
+                    "prepared EC workspace for profile {} disappeared before reconstruct",
+                    ec_profile.id
+                ))
+            })?
+            .pool
+            .plan
+            .clone();
+        let restored = tokio::task::spawn_blocking(move || {
+            plan.reconstruct(&mut fragments).map_err(ObjectError::from)
+        })
+        .await
+        .map_err(|err| {
+            ObjectError::Metadata(format!("EC reconstruct worker task failed: {err}"))
+        })??;
+        phases.ec_reconstruct += phase_started.elapsed();
+        let mut payload = Vec::with_capacity(stripe_logical_bytes as usize);
+        for fragment in restored.iter().take(data_fragments) {
+            payload.extend_from_slice(fragment);
+        }
+        payload.truncate(stripe_logical_bytes as usize);
+        Ok(StripeReadResult {
+            payload,
+            missing_fragments: failures.len(),
+            data_fragment_reads,
+            parity_fragment_reads,
+            reconstructed: true,
+            phases,
+        })
+    }
+
+    fn cached_resolved_read(
+        &mut self,
+        bucket_id: &str,
+        key: &str,
+    ) -> Option<(ObjectVersionManifest, EcProfile)> {
+        self.shared_read_cache.cached_resolved_read(bucket_id, key)
+    }
+
+    fn cache_resolved_read(&mut self, manifest: ObjectVersionManifest, ec_profile: EcProfile) {
+        self.shared_read_cache
+            .cache_resolved_read(manifest, ec_profile);
+    }
+
+    fn invalidate_resolved_read(&mut self, bucket_id: &str, key: &str) {
+        self.shared_read_cache.invalidate_key(bucket_id, key);
+    }
+
+    fn cached_payload_read(&mut self, manifest: &ObjectVersionManifest) -> Option<Vec<u8>> {
+        self.shared_read_cache.cached_payload_read(manifest)
+    }
+
+    fn cache_payload_read(&mut self, manifest: &ObjectVersionManifest, payload: &[u8]) {
+        self.shared_read_cache.cache_payload_read(manifest, payload);
+    }
+
+    async fn ensure_read_target_sessions(
+        &mut self,
+        plans: &[FragmentPlan],
+    ) -> (Duration, Vec<String>) {
+        let phase_started = Instant::now();
+        let mut pending = Vec::new();
+        for plan in plans {
+            if !self.target_sessions.contains_key(&plan.endpoint)
+                && !pending.iter().any(|endpoint| endpoint == &plan.endpoint)
+            {
+                pending.push(plan.endpoint.clone());
+            }
+        }
+        if pending.is_empty() {
+            return (phase_started.elapsed(), Vec::new());
+        }
+
+        {
+            let shared = self.shared_target_sessions.lock().await;
+            for endpoint in &pending {
+                if let Some(pool) = shared.get(endpoint) {
+                    self.target_sessions
+                        .entry(endpoint.clone())
+                        .or_insert_with(|| pool.pick());
+                    // Cache the whole pool too, so the write fan-out can spread one object's
+                    // fragments across all N connections (round-robin per batch), not just one.
+                    self.target_session_pools
+                        .entry(endpoint.clone())
+                        .or_insert_with(|| pool.clone());
+                }
+            }
+        }
+        pending.retain(|endpoint| !self.target_sessions.contains_key(endpoint));
+        if pending.is_empty() {
+            return (phase_started.elapsed(), Vec::new());
+        }
+
+        let mut connects = JoinSet::new();
+        let session_options = self.session_options;
+        for endpoint in pending {
+            connects.spawn(async move {
+                let pool =
+                    connect_target_pool(&endpoint, session_options, TARGET_CONNECTIONS_PER_ENDPOINT)
+                        .await;
+                (endpoint, pool)
+            });
+        }
+        let mut failures = Vec::new();
+        while let Some(result) = connects.join_next().await {
+            match result {
+                Ok((endpoint, Ok(pool))) => {
+                    let session = {
+                        let mut shared = self.shared_target_sessions.lock().await;
+                        shared.entry(endpoint.clone()).or_insert(pool).pick()
+                    };
+                    self.target_sessions.insert(endpoint, session);
+                }
+                Ok((endpoint, Err(err))) => failures.push(format!(
+                    "target session endpoint {} could not connect for degraded read: {}",
+                    endpoint, err
+                )),
+                Err(err) => failures.push(format!(
+                    "KSC target-session connect task failed before completing a degraded read connection: {}",
+                    err
+                )),
+            }
+        }
+        (phase_started.elapsed(), failures)
+    }
+
+    async fn ensure_target_sessions(&mut self, plans: &[FragmentPlan]) -> Result<(), ObjectError> {
+        let mut pending = Vec::new();
+        for plan in plans {
+            if !self.target_sessions.contains_key(&plan.endpoint)
+                && !pending.iter().any(|endpoint| endpoint == &plan.endpoint)
+            {
+                pending.push(plan.endpoint.clone());
+            }
+        }
+        self.ensure_endpoint_pools(pending).await
+    }
+
+    /// Connects (and caches the pool for) any of `pending` endpoints not already pooled. Shared by
+    /// the per-write ensure path above and the startup pre-warm, so a single object's first batch
+    /// does not pay the pool's connect cost incrementally.
+    async fn ensure_endpoint_pools(&mut self, mut pending: Vec<String>) -> Result<(), ObjectError> {
+        pending.sort();
+        pending.dedup();
+        pending.retain(|endpoint| !self.target_sessions.contains_key(endpoint));
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let shared = self.shared_target_sessions.lock().await;
+            for endpoint in &pending {
+                if let Some(pool) = shared.get(endpoint) {
+                    self.target_sessions
+                        .entry(endpoint.clone())
+                        .or_insert_with(|| pool.pick());
+                    // Cache the whole pool too, so the write fan-out can spread one object's
+                    // fragments across all N connections (round-robin per batch), not just one.
+                    self.target_session_pools
+                        .entry(endpoint.clone())
+                        .or_insert_with(|| pool.clone());
+                }
+            }
+        }
+        pending.retain(|endpoint| !self.target_sessions.contains_key(endpoint));
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let mut connects = JoinSet::new();
+        let session_options = self.session_options;
+        for endpoint in pending {
+            connects.spawn(async move {
+                let pool =
+                    connect_target_pool(&endpoint, session_options, TARGET_CONNECTIONS_PER_ENDPOINT)
+                        .await;
+                (endpoint, pool)
+            });
+        }
+        while let Some(result) = connects.join_next().await {
+            let (endpoint, pool) = result.map_err(|err| {
+                ObjectError::Transport(format!(
+                    "KSC target-session connect task failed before completing: {}",
+                    err
+                ))
+            })?;
+            let pool = pool?;
+            let pool = {
+                let mut shared = self.shared_target_sessions.lock().await;
+                shared.entry(endpoint.clone()).or_insert(pool).clone()
+            };
+            self.target_sessions.insert(endpoint.clone(), pool.pick());
+            self.target_session_pools.insert(endpoint, pool);
+        }
+        Ok(())
+    }
+
+    async fn reconnect_target_sessions(&mut self, endpoints: &[String]) -> Result<(), ObjectError> {
+        let mut pending = Vec::new();
+        for endpoint in endpoints {
+            if !pending.iter().any(|value| value == endpoint) {
+                pending.push(endpoint.clone());
+            }
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let mut connects = JoinSet::new();
+        let session_options = self.session_options;
+        for endpoint in pending {
+            connects.spawn(async move {
+                let pool =
+                    connect_target_pool(&endpoint, session_options, TARGET_CONNECTIONS_PER_ENDPOINT)
+                        .await;
+                (endpoint, pool)
+            });
+        }
+        while let Some(result) = connects.join_next().await {
+            let (endpoint, pool) = result.map_err(|err| {
+                ObjectError::Transport(format!(
+                    "KSC target-session reconnect task failed before completing: {}",
+                    err
+                ))
+            })?;
+            let pool = pool?;
+            // Reconnect replaces the (presumed-dead) pool wholesale.
+            let session = pool.pick();
+            self.target_session_pools
+                .insert(endpoint.clone(), pool.clone());
+            {
+                let mut shared = self.shared_target_sessions.lock().await;
+                shared.insert(endpoint.clone(), pool);
+            }
+            self.target_sessions.insert(endpoint, session);
+        }
+        Ok(())
+    }
+
+    async fn write_fragment_plans(
+        &self,
+        intent_id: &str,
+        object_id: u32,
+        object_version: u32,
+        plans: &[FragmentPlan],
+        fragments: &[Vec<u8>],
+    ) -> Result<(Vec<FragmentWriteFailure>, RequestPhaseTimes, Vec<LandedFragment>), ObjectError> {
+        write_fragment_plans_with_sessions(
+            Arc::new(snapshot_target_sessions(
+                &self.target_session_pools,
+                plans,
+                intent_id,
+            )?),
+            intent_id,
+            object_id,
+            object_version,
+            plans,
+            fragments,
+            Arc::clone(&self.write_inflight_limiter),
+        )
+        .await
+    }
+
+    async fn retry_fragment_failures_same_target(
+        &mut self,
+        intent_id: &str,
+        object_id: u32,
+        object_version: u32,
+        plans: &[FragmentPlan],
+        fragments: &[Vec<u8>],
+        failures: Vec<FragmentWriteFailure>,
+    ) -> Result<RetryWriteResult, ObjectError> {
+        let mut pending_failures = failures;
+        let mut result = RetryWriteResult::default();
+        for attempt in 0..TARGET_SAME_PLAN_RETRY_ATTEMPTS {
+            if pending_failures.is_empty() {
+                break;
+            }
+            let retry_plans = retry_plans_for_failures(plans, &pending_failures)?;
+            if retry_plans.is_empty() {
+                break;
+            }
+            let retry_endpoints = retry_plans
+                .iter()
+                .map(|plan| plan.endpoint.clone())
+                .collect::<Vec<_>>();
+            let connect_started = Instant::now();
+            self.reconnect_target_sessions(&retry_endpoints).await?;
+            result.connect_elapsed += connect_started.elapsed();
+
+            let write_started = Instant::now();
+            let (retry_failures, retry_phases, retry_landed) = self
+                .write_fragment_plans(intent_id, object_id, object_version, &retry_plans, fragments)
+                .await?;
+            result.write_elapsed += write_started.elapsed();
+            add_request_phase_times(&mut result.phases, &retry_phases);
+            result.landed.extend(retry_landed);
+            pending_failures = retry_failures;
+
+            if !pending_failures.is_empty() && attempt + 1 < TARGET_SAME_PLAN_RETRY_ATTEMPTS {
+                // Honor the MAX 429 Retry-After across this batch's rate-limited
+                // failures (clamped); fall back to a capped exponential backoff
+                // when no target asked for a specific pause.
+                //
+                // Note: with TARGET_SAME_PLAN_RETRY_ATTEMPTS == 2 only one backoff
+                // sleep fires (attempt == 0), so the `<< attempt` exponential
+                // growth is dormant today; it is retained (and unit-tested) so the
+                // backoff scales correctly if the attempt count is raised.
+                let backoff = compute_retry_backoff(
+                    &pending_failures,
+                    attempt as u32,
+                    TARGET_SAME_PLAN_RETRY_BACKOFF,
+                    TARGET_RETRY_BACKOFF_CEILING,
+                );
+                sleep(backoff).await;
+            }
+        }
+        result.failures = pending_failures;
+        Ok(result)
+    }
+
+    /// Returns a cloneable handle to the (thread-safe) shard pool for `profile`,
+    /// ensuring the prepared encoder exists first. The handle can be moved into a
+    /// `spawn_blocking` task to run the CPU-bound encode/reconstruct off the async
+    /// runtime while still recycling buffers back into the shared pool.
+    fn prepared_shard_pool(&mut self, profile: &EcProfile) -> Result<ShardPool, ObjectError> {
+        self.ensure_prepared_encoder(profile)?;
+        self.prepared_encoders
+            .get(&profile.id)
+            .map(|workspace| workspace.pool.clone())
+            .ok_or_else(|| {
+                ObjectError::Metadata(format!(
+                    "prepared EC workspace for profile {} disappeared mid-write",
+                    profile.id
+                ))
+            })
+    }
+
+    fn return_prepared_shards(&mut self, profile_id: &str, shards: Vec<Vec<u8>>) {
+        if let Some(workspace) = self.prepared_encoders.get(profile_id) {
+            workspace.pool.return_shards(shards);
+        }
+    }
+
+    fn ensure_prepared_encoder(&mut self, profile: &EcProfile) -> Result<(), ObjectError> {
+        if self.prepared_encoders.contains_key(&profile.id) {
+            return Ok(());
+        }
+        let kee_profile = kee_profile_from_control(profile)?;
+        let engine = KeeEngine::new(kee_profile)?;
+        let prepared = engine.prepared_plan()?;
+        let reusable_shards = self.shard_freelist_for(&profile.id);
+        self.prepared_encoders.insert(
+            profile.id.clone(),
+            PreparedEncodeWorkspace::new(prepared, reusable_shards),
+        );
+        Ok(())
+    }
+
+    /// Resolve the recycling free-list for `profile_id`. When this client is part
+    /// of a shared write pool (`shared_shard_freelists` is `Some`), every client
+    /// shares ONE free-list per profile, so encode-buffer recycling is bounded to
+    /// a single working set instead of multiplying by the pool size (the 2026-06
+    /// write-RAM growth: up to 16 write clients each retaining ~320 MiB).
+    /// Standalone/read clients get their own fresh free-list.
+    fn shard_freelist_for(&self, profile_id: &str) -> Arc<Mutex<Vec<Vec<Vec<u8>>>>> {
+        match &self.shared_shard_freelists {
+            Some(shared) => shared
+                .lock()
+                .unwrap()
+                .entry(profile_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(Vec::new())))
+                .clone(),
+            None => Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+/// One inflight batch of stripes whose payloads have already been EC-encoded.
+struct EncodedStripeBatch {
+    prepared_batch: Vec<PreparedStripeWrite>,
+    batch_plans: Vec<FragmentPlan>,
+    ec_encode: Duration,
+}
+
+/// Produces (reads + EC-encodes) one inflight batch of stripes.
+///
+/// Reads run on the async task because the supplied `read_range` closure is a
+/// synchronous, non-`Send` `FnMut`. The CPU-bound EC encode for every stripe is
+/// dispatched to `tokio::task::spawn_blocking` so it never blocks a tokio worker,
+/// and the per-stripe encodes run concurrently with one another. Encoded shard
+/// buffers are drawn from and (on this happy path) stay owned by the caller, who
+/// recycles them back into the shared pool after the network writes complete.
+///
+/// The returned `prepared_batch` is ordered by ascending stripe index, matching
+/// the pre-pipelining behaviour so downstream batching/commit logic is unchanged.
+async fn encode_stripe_batch<F>(
+    pool: ShardPool,
+    window_plans: &[FragmentPlan],
+    window_start: usize,
+    stripe_offset: usize,
+    stripe_batch_len: usize,
+    logical_length_bytes: usize,
+    stripe_logical_bytes: usize,
+    read_range: &mut F,
+) -> Result<EncodedStripeBatch, ObjectError>
+where
+    F: FnMut(u64, usize) -> Result<Vec<u8>, ObjectError>,
+{
+    let mut batch_plans = Vec::new();
+    let mut encodes: JoinSet<Result<(usize, Vec<FragmentPlan>, u32, Vec<Vec<u8>>), ObjectError>> =
+        JoinSet::new();
+    for batch_offset in 0..stripe_batch_len {
+        let stripe_index = (window_start + stripe_offset + batch_offset) as u32;
+        let stripe_plans = fragment_plans_for_stripe(window_plans, stripe_index)?;
+        batch_plans.extend(stripe_plans.iter().cloned());
+        let (stripe_start, stripe_end) =
+            stripe_payload_range(logical_length_bytes, stripe_index as usize, stripe_logical_bytes)?;
+        // Read on the async task (closure is sync + !Send), then hand the owned
+        // payload + shard buffers to a blocking worker for the CPU-bound encode.
+        let stripe_payload = read_range(stripe_start as u64, stripe_end - stripe_start)?;
+        let pool = pool.clone();
+        let mut shards = pool.take_shards();
+        encodes.spawn_blocking(move || {
+            pool.plan.encode_into(&stripe_payload, &mut shards)?;
+            Ok((batch_offset, stripe_plans, stripe_index, shards))
+        });
+    }
+
+    let encode_started = Instant::now();
+    let mut encoded_slots: Vec<Option<PreparedStripeWrite>> =
+        (0..stripe_batch_len).map(|_| None).collect();
+    while let Some(joined) = encodes.join_next().await {
+        let (batch_offset, plans, stripe_index, fragments) = joined.map_err(|err| {
+            ObjectError::Metadata(format!("EC encode worker task failed: {err}"))
+        })??;
+        encoded_slots[batch_offset] = Some(PreparedStripeWrite {
+            stripe_index,
+            plans,
+            fragments,
+        });
+    }
+    let ec_encode = encode_started.elapsed();
+    let prepared_batch = encoded_slots
+        .into_iter()
+        .map(|slot| {
+            slot.ok_or_else(|| {
+                ObjectError::Metadata(
+                    "EC encode pipeline dropped a stripe before completing".to_string(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(EncodedStripeBatch {
+        prepared_batch,
+        batch_plans,
+        ec_encode,
+    })
+}
+
+fn snapshot_target_sessions(
+    target_session_pools: &HashMap<String, TargetSessionPool>,
+    plans: &[FragmentPlan],
+    intent_id: &str,
+) -> Result<HashMap<String, TargetSessionPool>, ObjectError> {
+    let mut snapshot = HashMap::new();
+    for plan in plans {
+        if snapshot.contains_key(&plan.endpoint) {
+            continue;
+        }
+        // Snapshot the whole pool (shares the Arc'd connections + round-robin counter), so the
+        // fan-out picks a different connection per endpoint-batch.
+        let pool = target_session_pools.get(&plan.endpoint).ok_or_else(|| {
+            ObjectError::Metadata(format!(
+                "KSC has no cached target session pool for endpoint {} in write intent {}",
+                plan.endpoint, intent_id
+            ))
+        })?;
+        snapshot.insert(plan.endpoint.clone(), pool.clone());
+    }
+    Ok(snapshot)
+}
+
+async fn write_fragment_plans_with_sessions(
+    target_pools: Arc<HashMap<String, TargetSessionPool>>,
+    intent_id: &str,
+    object_id: u32,
+    object_version: u32,
+    plans: &[FragmentPlan],
+    fragments: &[Vec<u8>],
+    write_inflight_limiter: Arc<AdaptiveWriteLimiter>,
+) -> Result<(Vec<FragmentWriteFailure>, RequestPhaseTimes, Vec<LandedFragment>), ObjectError> {
+    let mut writes = JoinSet::new();
+    for plan in plans {
+        // Round-robin a connection from the pool per retried fragment (spread across N conns).
+        let session = target_pools
+            .get(&plan.endpoint)
+            .ok_or_else(|| {
+                ObjectError::Metadata(format!(
+                    "KSC has no cached target session pool for endpoint {} in write intent {}",
+                    plan.endpoint, intent_id
+                ))
+            })?
+            .pick();
+        let chunk_id = chunk_id_from_proto(&plan.chunk_id)?;
+        let fragment = fragments
+            .get(plan.fragment_index as usize)
+            .ok_or_else(|| {
+                ObjectError::Metadata(format!(
+                    "fragment index {} is out of range for write intent {}",
+                    plan.fragment_index, intent_id
+                ))
+            })?
+            .clone();
+        let endpoint = plan.endpoint.clone();
+        let target_id = plan.target_id.clone();
+        let fragment_index = plan.fragment_index;
+        let stripe_index = plan.stripe_index;
+        let granule_index = plan.granule_index;
+        let generation = plan.generation;
+        // Honor the shared adaptive gate on the same-target RETRY path too: a 429
+        // that shrank the gate to 1 must still bound this fan-out. Acquire a
+        // permit BEFORE spawning; it moves into the task and is released on
+        // completion (success or error).
+        let permit = write_inflight_limiter.acquire().await;
+        writes.spawn(async move {
+            let _permit = permit;
+            data_rpc(
+                "target write",
+                TARGET_IO_TIMEOUT,
+                session.write_chunk(
+                    chunk_id,
+                    granule_index,
+                    generation,
+                    WriteIdentity {
+                        object_id,
+                        object_version: object_version as u16,
+                        stripe: stripe_index as u16,
+                        frag: fragment_index as u16,
+                    },
+                    fragment,
+                ),
+            )
+            .await
+            .map(|outcome| {
+                (
+                    outcome.phases,
+                    LandedFragment {
+                        stripe_index,
+                        fragment_index,
+                        granule_index: outcome.granule_index,
+                        generation: outcome.generation,
+                    },
+                )
+            })
+            .map_err(|err| {
+                let signal = err.rate_limit_signal();
+                FragmentWriteFailure::new(
+                    stripe_index,
+                    fragment_index,
+                    format!(
+                        "fragment {} target {} endpoint {} failed: {}",
+                        fragment_index, target_id, endpoint, err
+                    ),
+                    signal,
+                )
+            })
+        });
+    }
+    let mut failures = Vec::new();
+    let mut phase_totals = RequestPhaseTimes::default();
+    let mut landed: Vec<LandedFragment> = Vec::new();
+    while let Some(result) = writes.join_next().await {
+        match result {
+            Ok(Ok((phases, landed_fragment))) => {
+                add_request_phase_times(&mut phase_totals, &phases);
+                landed.push(landed_fragment);
+            }
+            Ok(Err(err)) => failures.push(err),
+            Err(err) => failures.push(FragmentWriteFailure::plain(
+                u32::MAX,
+                u32::MAX,
+                format!(
+                    "object write worker task failed before completing a fragment write: {}",
+                    err
+                ),
+            )),
+        }
+    }
+    // Feed the shared gate from the retry path as well so 429s observed during
+    // retries shrink the client-wide inflight ceiling (and clean retries let it
+    // recover). Mirrors the primary batched path: only an all-clean batch grows
+    // the gate; a 429 shrinks it; a non-429 failure is a no-op (neither grow nor
+    // shrink) so a failing-but-not-rate-limited target is not nudged wider.
+    feed_inflight_limiter(&write_inflight_limiter, failures.iter());
+    Ok((failures, phase_totals, landed))
+}
+
+/// Drive the adaptive write gate from a completed batch's failures.
+///
+/// - Any 429 shrinks the gate toward the smallest advertised max-in-flight.
+/// - A fully clean batch (no failures of any kind) additively recovers it.
+/// - A batch with only non-429 failures is a no-op: a target failing for
+///   transport/join/length reasons is not healthy, so growing concurrency at it
+///   is counterproductive, and it asked for no specific backpressure.
+fn feed_inflight_limiter<'a, I>(limiter: &AdaptiveWriteLimiter, failures: I)
+where
+    I: Iterator<Item = &'a FragmentWriteFailure>,
+{
+    let mut observed_rate_limit = false;
+    let mut any_failure = false;
+    let mut advertised_inflight: Option<usize> = None;
+    for failure in failures {
+        any_failure = true;
+        if failure.rate_limited {
+            observed_rate_limit = true;
+            if let Some(limit) = failure.limit_max_inflight {
+                advertised_inflight = Some(match advertised_inflight {
+                    Some(existing) => existing.min(limit),
+                    None => limit,
+                });
+            }
+        }
+    }
+    if observed_rate_limit {
+        limiter.note_rate_limited(advertised_inflight);
+    } else if !any_failure {
+        limiter.note_success();
+    }
+}
+
+async fn write_prepared_stripe_batch_with_sessions(
+    target_pools: Arc<HashMap<String, TargetSessionPool>>,
+    intent_id: &str,
+    object_id: u32,
+    object_version: u32,
+    prepared_batch: Vec<PreparedStripeWrite>,
+    write_inflight_limiter: Arc<AdaptiveWriteLimiter>,
+) -> Result<PreparedStripeBatchWriteResult, ObjectError> {
+    let endpoint_batches =
+        build_endpoint_write_batches(intent_id, object_id, object_version, &prepared_batch)?;
+    // Wall-clock around the whole fan-out, INCLUDING the per-fragment limiter permit waits
+    // below (which serialize the spawn loop when the adaptive gate is saturated). Compared
+    // against the per-fragment `write_elapsed` SUM, this is the true latency of the batch's
+    // network writes.
+    let fanout_started = Instant::now();
+    let mut writes = JoinSet::new();
+    for batch in endpoint_batches {
+        let endpoint = batch
+            .first()
+            .map(|item| item.endpoint.clone())
+            .ok_or_else(|| {
+                ObjectError::Metadata(format!(
+                    "KSC built an empty target batch for write intent {}",
+                    intent_id
+                ))
+            })?;
+        // Pick a connection round-robin from this endpoint's pool. A large object makes many
+        // single-fragment batches per endpoint, so successive picks spread them across all N
+        // connections => N KST receive pumps per target instead of one (the single-object fix).
+        let session = target_pools
+            .get(&endpoint)
+            .ok_or_else(|| {
+                ObjectError::Metadata(format!(
+                    "KSC has no cached target session pool for endpoint {} in write intent {}",
+                    endpoint, intent_id
+                ))
+            })?
+            .pick();
+        // Acquire a permit BEFORE spawning so the fan-out is bounded by the
+        // adaptive gate. The permit moves into the task and is dropped (released)
+        // when the task finishes, on both the success and error paths. The wait here
+        // gates the request BEFORE `write_chunk` opens a stream, so it is invisible to
+        // the per-request phases (ready_wait et al. only start once the permit is held) —
+        // the frame trace below reports it as `permit_wait`, the limiter-contention signal.
+        let permit_wait_started = Instant::now();
+        let permit = write_inflight_limiter.acquire().await;
+        let permit_wait = permit_wait_started.elapsed();
+        writes.spawn(async move {
+            let _permit = permit;
+            let write_started = Instant::now();
+            let outcome = if batch.len() == 1 {
+                let mut item = batch.into_iter().next().expect("single-item batch");
+                // Move the fragment payload into the request rather than cloning it; the
+                // result only needs `item`'s routing/index fields afterwards, so the now
+                // empty `payload` is never read again on the single-write path.
+                let payload = std::mem::take(&mut item.payload);
+                let identity = WriteIdentity {
+                    object_id: item.object_id,
+                    object_version: item.version as u16,
+                    stripe: item.stripe_index as u16,
+                    frag: item.fragment_index as u16,
+                };
+                let trace_on = frame_trace_enabled();
+                match data_rpc(
+                    "target write",
+                    TARGET_IO_TIMEOUT,
+                    session.write_chunk(
+                        item.chunk_id,
+                        item.granule_index,
+                        item.generation,
+                        identity,
+                        payload,
+                    ),
+                )
+                .await
+                {
+                    Ok(outcome) => {
+                        let wall = write_started.elapsed();
+                        if trace_on {
+                            emit_ksc_frame_trace(
+                                &item.endpoint,
+                                identity,
+                                &outcome.phases,
+                                permit_wait,
+                                wall,
+                                "ok",
+                            );
+                        }
+                        EndpointWriteBatchResult::Single {
+                            item,
+                            phases: outcome.phases,
+                            write_elapsed: wall,
+                            // The target reports where the fragment landed (target-chosen
+                            // granule under allocate-mode).
+                            landed: Some((outcome.granule_index, outcome.generation)),
+                            error: None,
+                        }
+                    }
+                    Err(err) => {
+                        let wall = write_started.elapsed();
+                        let signal = err.rate_limit_signal();
+                        // Trace the error/timeout tail too — these fragments stall hardest
+                        // (the I/O timeout fires here, in `data_rpc`) and would otherwise be
+                        // missing from the per-fragment distribution. Phases are unavailable
+                        // on this path, so they emit as zeros; `permit_wait`/`total_us` stand.
+                        if trace_on {
+                            emit_ksc_frame_trace(
+                                &item.endpoint,
+                                identity,
+                                &RequestPhaseTimes::default(),
+                                permit_wait,
+                                wall,
+                                "error",
+                            );
+                        }
+                        EndpointWriteBatchResult::Single {
+                            item,
+                            phases: RequestPhaseTimes::default(),
+                            write_elapsed: wall,
+                            landed: None,
+                            error: Some((err.to_string(), signal)),
+                        }
+                    }
+                }
+            } else {
+                let mut batch = batch;
+                // Move each fragment payload out of the batch into the packed request
+                // (zero extra copy) instead of cloning. The batch is still returned in
+                // the result for failure reporting; only its routing/index fields are
+                // read after the write, so the emptied payloads are never used again.
+                let pack = PackedWriteRequest {
+                    entries: batch
+                        .iter_mut()
+                        .map(|item| PackedWriteEntry {
+                            chunk_id: item.chunk_id,
+                            slot_index: item.granule_index,
+                            generation: item.generation,
+                            // Carry the fragment's object identity + EC position into the entry.
+                            identity: WriteIdentity {
+                                object_id: item.object_id,
+                                object_version: item.version as u16,
+                                stripe: item.stripe_index as u16,
+                                frag: item.fragment_index as u16,
+                            },
+                            payload: std::mem::take(&mut item.payload),
+                        })
+                        .collect(),
+                };
+                match data_rpc(
+                    "target packed write",
+                    TARGET_IO_TIMEOUT,
+                    session.packed_write(pack),
+                )
+                .await
+                {
+                    Ok(reply) => EndpointWriteBatchResult::Packed {
+                        items: batch,
+                        reply: Ok(reply.value),
+                        phases: reply.phases,
+                        write_elapsed: write_started.elapsed(),
+                    },
+                    Err(err) => {
+                        let signal = err.rate_limit_signal();
+                        EndpointWriteBatchResult::Packed {
+                            items: batch,
+                            reply: Err((err.to_string(), signal)),
+                            phases: RequestPhaseTimes::default(),
+                            write_elapsed: write_started.elapsed(),
+                        }
+                    }
+                }
+            };
+            Ok::<EndpointWriteBatchResult, ObjectError>(outcome)
+        });
+    }
+
+    let mut failures_by_stripe = HashMap::<u32, Vec<FragmentWriteFailure>>::new();
+    let mut phase_totals = RequestPhaseTimes::default();
+    let mut write_elapsed = Duration::ZERO;
+    // Where each fragment landed, reported by the target's reply — recorded so the
+    // manifest (and the reverse log built from it) names the target-chosen granule.
+    let mut landed: Vec<LandedFragment> = Vec::new();
+    while let Some(result) = writes.join_next().await {
+        match result {
+            Ok(Ok(batch_result)) => match batch_result {
+                EndpointWriteBatchResult::Single {
+                    item,
+                    phases,
+                    write_elapsed: batch_elapsed,
+                    landed: single_landed,
+                    error,
+                } => {
+                    add_request_phase_times(&mut phase_totals, &phases);
+                    write_elapsed += batch_elapsed;
+                    if let Some((message, signal)) = error {
+                        record_batched_write_failure(
+                            &mut failures_by_stripe,
+                            FragmentWriteFailure::new(
+                                item.stripe_index,
+                                item.fragment_index,
+                                format!(
+                                    "fragment {} target {} endpoint {} failed: {}",
+                                    item.fragment_index, item.target_id, item.endpoint, message
+                                ),
+                                signal,
+                            ),
+                        );
+                    } else if let Some((granule_index, generation)) = single_landed {
+                        landed.push(LandedFragment {
+                            stripe_index: item.stripe_index,
+                            fragment_index: item.fragment_index,
+                            granule_index,
+                            generation,
+                        });
+                    }
+                }
+                EndpointWriteBatchResult::Packed {
+                    items,
+                    reply,
+                    phases,
+                    write_elapsed: batch_elapsed,
+                } => {
+                    add_request_phase_times(&mut phase_totals, &phases);
+                    write_elapsed += batch_elapsed;
+                    match reply {
+                        Ok(reply) => {
+                            let item_count = items.len();
+                            if reply.entries.len() != item_count {
+                                for item in items {
+                                    record_batched_write_failure(
+                                        &mut failures_by_stripe,
+                                        FragmentWriteFailure::plain(
+                                            item.stripe_index,
+                                            item.fragment_index,
+                                            format!(
+                                                "fragment {} target {} endpoint {} failed: packed write reply length {} did not match request length {}",
+                                                item.fragment_index,
+                                                item.target_id,
+                                                item.endpoint,
+                                                reply.entries.len(),
+                                                item_count
+                                            ),
+                                        ),
+                                    );
+                                }
+                                continue;
+                            }
+                            for (item, entry) in items.into_iter().zip(reply.entries) {
+                                if entry.success() {
+                                    // The reply's location reports where the fragment
+                                    // landed (target-chosen granule under allocate-mode).
+                                    if let Some(location) = &entry.location {
+                                        landed.push(LandedFragment {
+                                            stripe_index: item.stripe_index,
+                                            fragment_index: item.fragment_index,
+                                            granule_index: location.slot_index,
+                                            generation: location.generation,
+                                        });
+                                    }
+                                    continue;
+                                }
+                                let detail = entry.error.unwrap_or_else(|| {
+                                    format!("target returned status {}", entry.status_code)
+                                });
+                                record_batched_write_failure(
+                                    &mut failures_by_stripe,
+                                    FragmentWriteFailure::plain(
+                                        item.stripe_index,
+                                        item.fragment_index,
+                                        format!(
+                                            "fragment {} target {} endpoint {} failed: {}",
+                                            item.fragment_index,
+                                            item.target_id,
+                                            item.endpoint,
+                                            detail
+                                        ),
+                                    ),
+                                );
+                            }
+                        }
+                        Err((message, signal)) => {
+                            for item in items {
+                                record_batched_write_failure(
+                                    &mut failures_by_stripe,
+                                    FragmentWriteFailure::new(
+                                        item.stripe_index,
+                                        item.fragment_index,
+                                        format!(
+                                            "fragment {} target {} endpoint {} failed: {}",
+                                            item.fragment_index,
+                                            item.target_id,
+                                            item.endpoint,
+                                            message
+                                        ),
+                                        signal,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            },
+            Ok(Err(err)) => {
+                return Err(err);
+            }
+            Err(err) => {
+                record_batched_write_failure(
+                    &mut failures_by_stripe,
+                    FragmentWriteFailure::plain(
+                        u32::MAX,
+                        u32::MAX,
+                        format!(
+                            "object write worker task failed before completing a batched target write: {}",
+                            err
+                        ),
+                    ),
+                );
+            }
+        }
+    }
+
+    // Drain complete: every fragment task has finished, so this is the true wall-clock
+    // of the concurrent fan-out.
+    let write_wall = fanout_started.elapsed();
+
+    // Feed the adaptive gate: if any fragment in this batch hit a 429, shrink
+    // toward the smallest advertised max-in-flight; if the batch was fully clean,
+    // additively recover; if it failed for non-429 reasons, leave the gate alone
+    // (don't grow concurrency at an unhealthy target).
+    feed_inflight_limiter(&write_inflight_limiter, failures_by_stripe.values().flatten());
+
+    let stripe_results = prepared_batch
+        .into_iter()
+        .map(|prepared| PreparedStripeWriteResult {
+            failures: failures_by_stripe
+                .remove(&prepared.stripe_index)
+                .unwrap_or_default(),
+            prepared,
+        })
+        .collect();
+    Ok(PreparedStripeBatchWriteResult {
+        stripe_results,
+        phases: phase_totals,
+        write_elapsed,
+        write_wall,
+        landed,
+    })
+}
+
+enum EndpointWriteBatchResult {
+    Single {
+        item: BatchedTargetWritePlan,
+        phases: RequestPhaseTimes,
+        write_elapsed: Duration,
+        // (granule_index, generation) the fragment landed at, on success.
+        landed: Option<(u64, u32)>,
+        // (message, 429 signal) so the consumer can build a structured
+        // FragmentWriteFailure instead of just a string.
+        error: Option<(String, RateLimitSignal)>,
+    },
+    Packed {
+        items: Vec<BatchedTargetWritePlan>,
+        reply: Result<kp2::PackedWriteReply, (String, RateLimitSignal)>,
+        phases: RequestPhaseTimes,
+        write_elapsed: Duration,
+    },
+}
+
+enum EndpointReadBatchResult {
+    Single {
+        item: BatchedTargetReadPlan,
+        payload: Option<Vec<u8>>,
+        phases: RequestPhaseTimes,
+        read_elapsed: Duration,
+    },
+    Packed {
+        items: Vec<BatchedTargetReadPlan>,
+        reply: Option<kp2::PackedReadResponse>,
+        phases: RequestPhaseTimes,
+        read_elapsed: Duration,
+    },
+}
+
+struct BatchedTargetReadResult {
+    phases: RequestPhaseTimes,
+    read_elapsed: Duration,
+}
+
+fn build_endpoint_write_batches(
+    intent_id: &str,
+    object_id: u32,
+    object_version: u32,
+    prepared_batch: &[PreparedStripeWrite],
+) -> Result<Vec<Vec<BatchedTargetWritePlan>>, ObjectError> {
+    let mut by_endpoint = HashMap::<String, Vec<BatchedTargetWritePlan>>::new();
+    for prepared in prepared_batch {
+        for plan in &prepared.plans {
+            let chunk_id = chunk_id_from_proto(&plan.chunk_id)?;
+            let payload = prepared
+                .fragments
+                .get(plan.fragment_index as usize)
+                .ok_or_else(|| {
+                    ObjectError::Metadata(format!(
+                        "fragment index {} is out of range for write intent {}",
+                        plan.fragment_index, intent_id
+                    ))
+                })?
+                .clone();
+            by_endpoint
+                .entry(plan.endpoint.clone())
+                .or_default()
+                .push(BatchedTargetWritePlan {
+                    endpoint: plan.endpoint.clone(),
+                    target_id: plan.target_id.clone(),
+                    stripe_index: plan.stripe_index,
+                    fragment_index: plan.fragment_index,
+                    granule_index: plan.granule_index,
+                    generation: plan.generation,
+                    object_id,
+                    version: object_version,
+                    chunk_id,
+                    payload,
+                });
+        }
+    }
+
+    let mut batches = Vec::new();
+    for (_, items) in by_endpoint {
+        let mut current = Vec::new();
+        let mut current_payload_bytes = 0usize;
+        for item in items {
+            if !current.is_empty()
+                && current_payload_bytes.saturating_add(item.payload.len()) > MAX_PACK_PAYLOAD_BYTES
+            {
+                batches.push(current);
+                current = Vec::new();
+                current_payload_bytes = 0;
+            }
+            current_payload_bytes = current_payload_bytes.saturating_add(item.payload.len());
+            current.push(item);
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
+    }
+    Ok(batches)
+}
+
+fn build_endpoint_read_batches(
+    read_plans: Vec<BatchedTargetReadPlan>,
+) -> Vec<Vec<BatchedTargetReadPlan>> {
+    let mut by_endpoint = HashMap::<String, Vec<BatchedTargetReadPlan>>::new();
+    for item in read_plans {
+        by_endpoint
+            .entry(item.endpoint.clone())
+            .or_default()
+            .push(item);
+    }
+
+    let mut batches = Vec::new();
+    for (_, items) in by_endpoint {
+        let mut current = Vec::new();
+        let mut current_payload_bytes = 0usize;
+        for item in items {
+            if !current.is_empty()
+                && current_payload_bytes.saturating_add(item.payload_bytes) > MAX_PACK_PAYLOAD_BYTES
+            {
+                batches.push(current);
+                current = Vec::new();
+                current_payload_bytes = 0;
+            }
+            current_payload_bytes = current_payload_bytes.saturating_add(item.payload_bytes);
+            current.push(item);
+        }
+        if !current.is_empty() {
+            batches.push(current);
+        }
+    }
+    batches
+}
+
+async fn read_plans_batched_with_sessions(
+    target_sessions: Arc<HashMap<String, TargetSession>>,
+    window_start: usize,
+    window_states: &mut [WindowStripeReadState],
+    read_plans: Vec<BatchedTargetReadPlan>,
+) -> Result<BatchedTargetReadResult, ObjectError> {
+    let endpoint_batches = build_endpoint_read_batches(read_plans);
+    let mut reads = JoinSet::new();
+    for batch in endpoint_batches {
+        let endpoint = batch
+            .first()
+            .map(|item| item.endpoint.clone())
+            .ok_or_else(|| {
+                ObjectError::Metadata("KSC built an empty target batch for object read".to_string())
+            })?;
+        let Some(session) = target_sessions.get(&endpoint).cloned() else {
+            let degraded = if batch.len() == 1 {
+                EndpointReadBatchResult::Single {
+                    item: batch.into_iter().next().expect("single-item read batch"),
+                    payload: None,
+                    phases: RequestPhaseTimes::default(),
+                    read_elapsed: Duration::ZERO,
+                }
+            } else {
+                EndpointReadBatchResult::Packed {
+                    items: batch,
+                    reply: None,
+                    phases: RequestPhaseTimes::default(),
+                    read_elapsed: Duration::ZERO,
+                }
+            };
+            reads.spawn(async move { Ok::<EndpointReadBatchResult, ObjectError>(degraded) });
+            continue;
+        };
+        reads.spawn(async move {
+            let read_started = Instant::now();
+            let outcome = if batch.len() == 1 {
+                let item = batch.into_iter().next().expect("single-item read batch");
+                match data_rpc(
+                    "target read",
+                    TARGET_IO_TIMEOUT,
+                    session.read_chunk(item.chunk_id),
+                )
+                .await
+                {
+                    Ok(reply) => EndpointReadBatchResult::Single {
+                        item,
+                        payload: Some(reply.value.payload),
+                        phases: reply.phases,
+                        read_elapsed: read_started.elapsed(),
+                    },
+                    Err(_) => EndpointReadBatchResult::Single {
+                        item,
+                        payload: None,
+                        phases: RequestPhaseTimes::default(),
+                        read_elapsed: read_started.elapsed(),
+                    },
+                }
+            } else {
+                let query = PackedReadQuery {
+                    chunk_ids: batch.iter().map(|item| item.chunk_id).collect(),
+                    ranges: None,
+                };
+                match data_rpc(
+                    "target packed read",
+                    TARGET_IO_TIMEOUT,
+                    session.packed_read(&query, batch.iter().map(|item| item.payload_bytes).sum()),
+                )
+                .await
+                {
+                    Ok(reply) => EndpointReadBatchResult::Packed {
+                        items: batch,
+                        reply: Some(reply.value),
+                        phases: reply.phases,
+                        read_elapsed: read_started.elapsed(),
+                    },
+                    Err(_) => EndpointReadBatchResult::Packed {
+                        items: batch,
+                        reply: None,
+                        phases: RequestPhaseTimes::default(),
+                        read_elapsed: read_started.elapsed(),
+                    },
+                }
+            };
+            Ok::<EndpointReadBatchResult, ObjectError>(outcome)
+        });
+    }
+
+    let mut phase_totals = RequestPhaseTimes::default();
+    let mut read_elapsed = Duration::ZERO;
+    while let Some(result) = reads.join_next().await {
+        match result {
+            Ok(Ok(batch_result)) => match batch_result {
+                EndpointReadBatchResult::Single {
+                    item,
+                    payload,
+                    phases,
+                    read_elapsed: batch_elapsed,
+                } => {
+                    add_request_phase_times(&mut phase_totals, &phases);
+                    read_elapsed += batch_elapsed;
+                    if let Some(payload) = payload {
+                        let state_index = item.stripe_index as usize - window_start;
+                        if let Some(state) = window_states.get_mut(state_index) {
+                            if item.fragment_index < state.fragments.len() {
+                                state.fragments[item.fragment_index] = Some(payload);
+                            }
+                        }
+                    }
+                }
+                EndpointReadBatchResult::Packed {
+                    items,
+                    reply,
+                    phases,
+                    read_elapsed: batch_elapsed,
+                } => {
+                    add_request_phase_times(&mut phase_totals, &phases);
+                    read_elapsed += batch_elapsed;
+                    let Some(reply) = reply else {
+                        continue;
+                    };
+                    if reply.entries.len() != items.len() {
+                        continue;
+                    }
+                    let mut by_chunk = items
+                        .into_iter()
+                        .map(|item| (item.chunk_id, item))
+                        .collect::<HashMap<_, _>>();
+                    for entry in reply.entries {
+                        if entry.status_code != 200 {
+                            continue;
+                        }
+                        let Some(item) = by_chunk.remove(&entry.chunk_id) else {
+                            continue;
+                        };
+                        let state_index = item.stripe_index as usize - window_start;
+                        if let Some(state) = window_states.get_mut(state_index) {
+                            if item.fragment_index < state.fragments.len() {
+                                state.fragments[item.fragment_index] = Some(entry.payload);
+                            }
+                        }
+                    }
+                }
+            },
+            Ok(Err(err)) => return Err(err),
+            Err(err) => {
+                return Err(ObjectError::Transport(format!(
+                    "object read worker task failed before completing a batched target read: {}",
+                    err
+                )));
+            }
+        }
+    }
+
+    Ok(BatchedTargetReadResult {
+        phases: phase_totals,
+        read_elapsed,
+    })
+}
+
+/// Compute how long to sleep before the next same-target retry attempt.
+///
+/// Pure function so the backpressure math is unit-testable in isolation:
+/// - If any failure in `failures` carried a KP2 429 `Retry-After`, honor the
+///   MAX advertised delay across them (a target that asked for the longest
+///   pause gets it), clamped to `ceiling`.
+/// - Otherwise fall back to an exponential backoff seeded at `fallback`
+///   (`fallback << attempt`), also clamped to `ceiling`, so repeated transient
+///   failures back off instead of hammering at a fixed interval.
+///
+/// `attempt` is zero-based (0 for the first retry pause).
+fn compute_retry_backoff(
+    failures: &[FragmentWriteFailure],
+    attempt: u32,
+    fallback: Duration,
+    ceiling: Duration,
+) -> Duration {
+    let max_retry_after_ms = failures
+        .iter()
+        .filter(|failure| failure.rate_limited)
+        .filter_map(|failure| failure.retry_after_ms)
+        .max();
+    let backoff = match max_retry_after_ms {
+        Some(ms) => Duration::from_millis(ms),
+        None => {
+            let shift = attempt.min(16);
+            fallback
+                .checked_mul(1u32 << shift)
+                .unwrap_or(ceiling)
+        }
+    };
+    backoff.min(ceiling)
+}
+
+/// Pure adaptive-limit transition for the write inflight gate (AIMD-style).
+///
+/// `current` and `max` are the live and configured ceilings; the result is
+/// always clamped to `[1, max]` so the gate never deadlocks (>= 1) and never
+/// exceeds the operator-configured limit.
+fn adaptive_inflight_after_429(current: usize, max: usize, advertised: Option<usize>) -> usize {
+    let target = match advertised {
+        // Honor the target's advertised ceiling, but never grow past it here
+        // and never below 1.
+        Some(advertised) => advertised.min(current),
+        // No advertised ceiling: multiplicative decrease (halve).
+        None => current / 2,
+    };
+    target.clamp(1, max.max(1))
+}
+
+/// Additive-increase recovery for the write inflight gate after a clean batch.
+fn adaptive_inflight_after_success(current: usize, max: usize, step: usize) -> usize {
+    current.saturating_add(step).clamp(1, max.max(1))
+}
+
+/// Client-wide adaptive concurrency gate for fragment writes.
+///
+/// Scope: this is a single per-`ObjectClient` limiter, not per-target-endpoint.
+/// `write_prepared_stripe_batch_with_sessions` is a free function that fans out
+/// one task per *endpoint batch*, so a per-target gate would mean threading a
+/// keyed map of semaphores through every spawn site and the retry path. The spec
+/// permits a client-wide limiter; it is chosen here for minimal blast radius. A
+/// 429 from any target shrinks the shared gate, which is conservative (it also
+/// throttles healthy targets briefly) but safe and deadlock-free. Both the
+/// primary batched path and the same-target retry path
+/// (`write_fragment_plans_with_sessions`) acquire permits from and report 429s
+/// to this shared gate.
+///
+/// Mechanics: a `tokio::sync::Semaphore` carries the permit budget. tokio has no
+/// atomic "resize" primitive, so the limiter maintains a target ceiling plus a
+/// *forget debt* under a mutex:
+/// - Shrinking lowers `target` and forgets as many *available* permits as it can
+///   immediately (`try_acquire_many` + `forget`); permits that are checked out by
+///   in-flight tasks can't be forgotten yet, so the shortfall is recorded as
+///   `forget_debt`.
+/// - Every `acquire` first reconciles: it pays down the debt by forgetting freshly
+///   available permits before taking one for itself. This is what keeps a
+///   returned in-flight permit from overshooting a shrunken ceiling — the next
+///   acquirer absorbs it.
+/// - Growing raises `target`, first cancelling outstanding debt, then
+///   `add_permits` for any real surplus.
+///
+/// Invariants: `target` is always clamped to `[1, max]` (never deadlocks, never
+/// exceeds the configured ceiling); the limiter never forgets more permits than
+/// are available at the moment, so in-flight work is never starved. Permits are
+/// acquired before a task spawns and released (dropped) on completion — success
+/// or error — on BOTH the primary batched fan-out
+/// (`write_prepared_stripe_batch_with_sessions`) and the same-target retry
+/// fan-out (`write_fragment_plans_with_sessions`), and both paths feed the gate
+/// via `feed_inflight_limiter`.
+///
+/// Ceiling semantics: `max` is the only HARD ceiling — total issued permits is
+/// always `target + forget_debt <= max`, so in-flight work never exceeds `max`.
+/// The live shrunk `target` is a SOFT ceiling honored at acquire boundaries:
+/// after a shrink-with-debt where in-flight tasks then return their permits
+/// before any intervening acquire, `available_permits()` can transiently sit
+/// above `target` until the next `acquire()` (or a `note_success()`, which now
+/// pays down debt eagerly) reconciles it.
+struct AdaptiveWriteLimiter {
+    semaphore: Arc<tokio::sync::Semaphore>,
+    max: usize,
+    state: Mutex<AdaptiveLimiterState>,
+}
+
+struct AdaptiveLimiterState {
+    /// Desired live ceiling (`[1, max]`).
+    target: usize,
+    /// Permits we still owe forgetting because they were checked out when a
+    /// shrink happened; paid down opportunistically as permits free up.
+    forget_debt: usize,
+}
+
+impl AdaptiveWriteLimiter {
+    /// `initial` is the live ceiling the limiter starts at; `max` is the ceiling it may
+    /// recover up to after a 429-driven shrink. Decoupling the two lets the write path
+    /// fan out to many distinct targets (`max`) while still backing off under target
+    /// overload — previously `max` was pinned to `initial`, capping fan-out forever.
+    fn new(initial: usize, max: usize) -> Self {
+        let max = max.max(1);
+        let initial = initial.max(1).min(max);
+        Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(initial)),
+            max,
+            state: Mutex::new(AdaptiveLimiterState {
+                target: initial,
+                forget_debt: 0,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn current_limit(&self) -> usize {
+        self.state.lock().unwrap().target
+    }
+
+    /// Forget as many currently-available permits as the outstanding debt
+    /// allows. Caller holds `state`. Returns nothing; debt is decremented by the
+    /// number actually forgotten.
+    fn pay_forget_debt(&self, state: &mut AdaptiveLimiterState) {
+        if state.forget_debt == 0 {
+            return;
+        }
+        let available = self.semaphore.available_permits();
+        // Bound the request to both what is available and the configured ceiling
+        // so the `as u32` cast is provably in range regardless of future callers
+        // (`forget_debt` is bounded by `max` today, but make that explicit).
+        let forgettable = state.forget_debt.min(available).min(self.max);
+        debug_assert!(forgettable <= u32::MAX as usize);
+        if forgettable > 0 {
+            if let Ok(permits) = self.semaphore.try_acquire_many(forgettable as u32) {
+                permits.forget();
+                state.forget_debt -= forgettable;
+            }
+        }
+    }
+
+    /// Acquire one permit, held by the returned guard until it is dropped (on
+    /// task completion). Reconciles any pending shrink debt first so a permit
+    /// returned by a finished task cannot overshoot a shrunken ceiling. Never
+    /// fails unless the semaphore is closed, which this limiter never does.
+    async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        {
+            let mut state = self.state.lock().unwrap();
+            self.pay_forget_debt(&mut state);
+        }
+        Arc::clone(&self.semaphore)
+            .acquire_owned()
+            .await
+            .expect("write inflight semaphore is never closed")
+    }
+
+    /// Shrink the live ceiling toward a 429's advertised max-in-flight (or
+    /// halve when none was advertised). Forgets available permits immediately and
+    /// records the rest as debt; never forgets more than are available, so
+    /// in-flight work is never wedged.
+    fn note_rate_limited(&self, advertised: Option<usize>) {
+        let mut state = self.state.lock().unwrap();
+        let next = adaptive_inflight_after_429(state.target, self.max, advertised);
+        if next < state.target {
+            state.forget_debt += state.target - next;
+            state.target = next;
+            self.pay_forget_debt(&mut state);
+        }
+    }
+
+    /// Additively recover the live ceiling toward the configured max after a
+    /// clean batch. Cancels outstanding shrink debt first (cheapest way to
+    /// re-grant capacity), then adds real permits for any remaining growth.
+    fn note_success(&self) {
+        let mut state = self.state.lock().unwrap();
+        // Reconcile any outstanding shrink debt first so permits returned by
+        // finished in-flight tasks (which can sit above the shrunken `target`
+        // until the next acquire) are reclaimed eagerly here rather than only at
+        // the next acquire(). This keeps the live ceiling closer to `target`
+        // between batches instead of relying solely on an acquire to reconcile.
+        self.pay_forget_debt(&mut state);
+        let next =
+            adaptive_inflight_after_success(state.target, self.max, ADAPTIVE_INFLIGHT_RECOVERY_STEP);
+        if next > state.target {
+            let mut grow = next - state.target;
+            let debt_cancelled = grow.min(state.forget_debt);
+            state.forget_debt -= debt_cancelled;
+            grow -= debt_cancelled;
+            if grow > 0 {
+                self.semaphore.add_permits(grow);
+            }
+            state.target = next;
+        }
+    }
+}
+
+fn record_batched_write_failure(
+    failures_by_stripe: &mut HashMap<u32, Vec<FragmentWriteFailure>>,
+    failure: FragmentWriteFailure,
+) {
+    failures_by_stripe
+        .entry(failure.stripe_index)
+        .or_default()
+        .push(failure);
+}
+
+fn join_fragment_failures(failures: &[FragmentWriteFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| failure.message.clone())
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn add_object_phase_times(into: &mut ObjectPhaseTimes, from: &ObjectPhaseTimes) {
+    into.kms_initiate += from.kms_initiate;
+    into.kms_begin += from.kms_begin;
+    into.kms_cluster_config += from.kms_cluster_config;
+    into.kms_commit += from.kms_commit;
+    into.kms_resolve += from.kms_resolve;
+    into.ec_encode += from.ec_encode;
+    into.ec_reconstruct += from.ec_reconstruct;
+    into.target_connect += from.target_connect;
+    into.target_write += from.target_write;
+    into.target_write_wall += from.target_write_wall;
+    into.target_read += from.target_read;
+    into.target_ready_wait += from.target_ready_wait;
+    into.target_request_prepare += from.target_request_prepare;
+    into.target_send_headers += from.target_send_headers;
+    into.target_send_body += from.target_send_body;
+    into.target_wait_response += from.target_wait_response;
+    into.target_collect_response += from.target_collect_response;
+    into.target_protocol_decode += from.target_protocol_decode;
+    into.target_payload_validate += from.target_payload_validate;
+}
+
+/// Diagnostic: gated on `KSC_FRAME_TRACE=1`. The object write path aggregates per-fragment
+/// phase timings into one `ObjectPhaseTimes` by SUMMING across the concurrent fan-out, which
+/// hides whether a slow batch is one stalled fragment or all of them. The write fan-out emits
+/// the untouched per-request phases for a single fragment (see [`emit_ksc_frame_trace`]),
+/// keyed by the same trace-id the storage target derives (`object_id:object_version:stripe:frag`),
+/// so a fragment's client-side life can be lined up against the target's `kst_frame_trace` line
+/// for the same key. Off by default — one `OnceLock` env read, zero cost on the hot path when
+/// disabled.
+fn frame_trace_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("KSC_FRAME_TRACE")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// The cross-hop correlation key for a single fragment write. Both the client and the
+/// storage target derive it from the same four request fields (no extra wire bytes), so a
+/// fragment's `ksc_frame_trace` and `kst_frame_trace` lines join on this string.
+fn fragment_trace_id(identity: WriteIdentity) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        identity.object_id, identity.object_version, identity.stripe, identity.frag
+    )
+}
+
+/// Emits one fragment's client-side timeline. Called from the write fan-out (not from
+/// `write_chunk`) so it can include the limiter `permit_wait` — the gate the fan-out holds
+/// BEFORE the request opens, invisible to the per-request phases below — and so it fires on
+/// the error/timeout tail too (`outcome`), where `phases` are unavailable and arrive as
+/// zeros. `total_us` is the full fragment life: permit wait plus the post-permit round trip.
+fn emit_ksc_frame_trace(
+    endpoint: &str,
+    identity: WriteIdentity,
+    phases: &RequestPhaseTimes,
+    permit_wait: Duration,
+    wall: Duration,
+    outcome: &str,
+) {
+    eprintln!(
+        "ksc_frame_trace trace={} endpoint={} outcome={} permit_wait_us={} ready_wait_us={} \
+         request_prepare_us={} send_headers_us={} send_body_us={} wait_response_us={} \
+         collect_response_us={} total_us={}",
+        fragment_trace_id(identity),
+        endpoint,
+        outcome,
+        permit_wait.as_micros(),
+        phases.ready_wait.as_micros(),
+        phases.request_prepare.as_micros(),
+        phases.send_headers.as_micros(),
+        phases.send_body.as_micros(),
+        phases.wait_response.as_micros(),
+        phases.collect_response.as_micros(),
+        (permit_wait + wall).as_micros(),
+    );
+}
+
+fn stripe_logical_bytes(profile: &EcProfile) -> Result<usize, ObjectError> {
+    (profile.data_fragments as usize)
+        .checked_mul(profile.fragment_bytes as usize)
+        .ok_or_else(|| {
+            ObjectError::Metadata(format!(
+                "EC profile {} has an unsupported stripe geometry",
+                profile.id
+            ))
+        })
+}
+
+/// Map a non-empty, length-clamped object byte range `[start, end)` to the
+/// inclusive span of stripe indices it touches, given the uniform stripe width.
+/// Caller guarantees `end > start` and `stripe_width > 0`.
+fn range_to_stripe_indices(start: u64, end: u64, stripe_width: u64) -> (usize, usize) {
+    let first = (start / stripe_width) as usize;
+    let last = ((end - 1) / stripe_width) as usize;
+    (first, last)
+}
+
+/// For one covered stripe, the `[lo, hi)` slice of its payload (already
+/// truncated to the stripe's logical length) that falls inside the requested
+/// object range `[start, end)`. Returns an empty slice if the range does not
+/// overlap this stripe's payload.
+fn stripe_slice_bounds(
+    start: u64,
+    end: u64,
+    stripe_index: usize,
+    stripe_width: u64,
+    payload_len: usize,
+) -> (usize, usize) {
+    let stripe_object_start = (stripe_index as u64) * stripe_width;
+    let payload_len = payload_len as u64;
+    let lo = start.saturating_sub(stripe_object_start).min(payload_len) as usize;
+    let hi = end.saturating_sub(stripe_object_start).min(payload_len) as usize;
+    (lo, hi)
+}
+
+fn stripe_payload_range(
+    payload_len: usize,
+    stripe_index: usize,
+    stripe_logical_bytes: usize,
+) -> Result<(usize, usize), ObjectError> {
+    let start = stripe_index
+        .checked_mul(stripe_logical_bytes)
+        .ok_or_else(|| {
+            ObjectError::Metadata(format!(
+                "stripe {} overflowed payload indexing for {} bytes",
+                stripe_index, payload_len
+            ))
+        })?;
+    if start >= payload_len {
+        return Err(ObjectError::Metadata(format!(
+            "stripe {} starts past payload end {}",
+            stripe_index, payload_len
+        )));
+    }
+    Ok((
+        start,
+        payload_len.min(start.saturating_add(stripe_logical_bytes)),
+    ))
+}
+
+fn fragment_plans_for_stripe(
+    plans: &[FragmentPlan],
+    stripe_index: u32,
+) -> Result<Vec<FragmentPlan>, ObjectError> {
+    let mut stripe_plans = plans
+        .iter()
+        .filter(|plan| plan.stripe_index == stripe_index)
+        .cloned()
+        .collect::<Vec<_>>();
+    if stripe_plans.is_empty() {
+        return Err(ObjectError::Metadata(format!(
+            "write intent is missing fragment plans for stripe {}",
+            stripe_index
+        )));
+    }
+    stripe_plans.sort_unstable_by_key(|plan| plan.fragment_index);
+    Ok(stripe_plans)
+}
+
+fn fragment_window_stripe_count(plans: &[FragmentPlan]) -> usize {
+    plans
+        .iter()
+        .map(|plan| plan.stripe_index as usize)
+        .max()
+        .map(|index| index.saturating_add(1))
+        .unwrap_or(0)
+}
+
+fn retry_plans_for_failures(
+    plans: &[FragmentPlan],
+    failures: &[FragmentWriteFailure],
+) -> Result<Vec<FragmentPlan>, ObjectError> {
+    let mut retry_plans = Vec::with_capacity(failures.len());
+    for failure in failures {
+        let Some(plan) = plans.iter().find(|plan| {
+            plan.stripe_index == failure.stripe_index
+                && plan.fragment_index == failure.fragment_index
+        }) else {
+            return Err(ObjectError::Metadata(format!(
+                "KSC could not map a failed fragment retry for stripe {} fragment {} back to a fragment plan",
+                failure.stripe_index, failure.fragment_index
+            )));
+        };
+        retry_plans.push(plan.clone());
+    }
+    Ok(retry_plans)
+}
+
+pub async fn put_object_single_stripe(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+    payload: &[u8],
+) -> Result<ObjectPutResult, ObjectError> {
+    put_object_single_stripe_with_options(
+        kms_endpoints,
+        bucket_id,
+        key,
+        payload,
+        ObjectClientOptions::default(),
+    )
+    .await
+}
+
+pub async fn put_object_single_stripe_with_options(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+    payload: &[u8],
+    options: ObjectClientOptions,
+) -> Result<ObjectPutResult, ObjectError> {
+    let mut client = ObjectClient::connect_with_options(kms_endpoints, options).await?;
+    client
+        .put_object_single_stripe(bucket_id, key, payload)
+        .await
+}
+
+pub async fn put_object_from_path(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+    path: &Path,
+) -> Result<ObjectPutResult, ObjectError> {
+    put_object_from_path_with_options(
+        kms_endpoints,
+        bucket_id,
+        key,
+        path,
+        ObjectClientOptions::default(),
+    )
+    .await
+}
+
+pub async fn put_object_from_path_with_options(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+    path: &Path,
+    options: ObjectClientOptions,
+) -> Result<ObjectPutResult, ObjectError> {
+    // Standalone CLI/test caller: there is no externally-held handle lock, so the
+    // file's on-disk length IS the authoritative length. Stat once here and pass
+    // it through the length-bounded path.
+    let logical_length = std::fs::metadata(path)
+        .map_err(|err| {
+            ObjectError::Metadata(format!(
+                "failed to stat object payload path {}: {err}",
+                path.display()
+            ))
+        })?
+        .len();
+    let mut client = ObjectClient::connect_with_options(kms_endpoints, options).await?;
+    client
+        .put_object_from_path(bucket_id, key, path, logical_length)
+        .await
+}
+
+pub async fn get_object_single_stripe(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+) -> Result<ObjectGetResult, ObjectError> {
+    get_object_single_stripe_with_options(
+        kms_endpoints,
+        bucket_id,
+        key,
+        ObjectClientOptions::default(),
+    )
+    .await
+}
+
+pub async fn get_object_single_stripe_with_options(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+    options: ObjectClientOptions,
+) -> Result<ObjectGetResult, ObjectError> {
+    let mut client = ObjectClient::connect_with_options(kms_endpoints, options).await?;
+    client.get_object_single_stripe(bucket_id, key).await
+}
+
+pub async fn get_object_range(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+    offset: u64,
+    len: u64,
+) -> Result<RangedGetResult, ObjectError> {
+    get_object_range_with_options(
+        kms_endpoints,
+        bucket_id,
+        key,
+        offset,
+        len,
+        ObjectClientOptions::default(),
+    )
+    .await
+}
+
+pub async fn get_object_range_with_options(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+    offset: u64,
+    len: u64,
+    options: ObjectClientOptions,
+) -> Result<RangedGetResult, ObjectError> {
+    let mut client = ObjectClient::connect_with_options(kms_endpoints, options).await?;
+    client.get_object_range(bucket_id, key, offset, len).await
+}
+
+pub async fn delete_object(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+    version_ids: &[String],
+) -> Result<ObjectDeleteResult, ObjectError> {
+    delete_object_with_options(
+        kms_endpoints,
+        bucket_id,
+        key,
+        version_ids,
+        ObjectClientOptions::default(),
+    )
+    .await
+}
+
+pub async fn delete_object_with_options(
+    kms_endpoints: &[String],
+    bucket_id: &str,
+    key: &str,
+    version_ids: &[String],
+    options: ObjectClientOptions,
+) -> Result<ObjectDeleteResult, ObjectError> {
+    let mut client = ObjectClient::connect_with_options(kms_endpoints, options).await?;
+    client.delete_object(bucket_id, key, version_ids).await
+}
+
+pub fn kee_profile_from_control(profile: &EcProfile) -> Result<KeeProfile, ObjectError> {
+    let failure_domain = match FailureDomain::try_from(profile.failure_domain)
+        .unwrap_or(FailureDomain::Unspecified)
+    {
+        FailureDomain::DriveDomainLab => KeeFailureDomain::DriveDomainLab,
+        FailureDomain::Node => KeeFailureDomain::Node,
+        FailureDomain::Rack => KeeFailureDomain::Rack,
+        FailureDomain::Unspecified => {
+            return Err(ObjectError::Metadata(format!(
+                "control-plane EC profile {} does not specify a valid failure domain",
+                profile.id
+            )));
+        }
+    };
+    Ok(KeeProfile {
+        id: profile.id.clone(),
+        codec_id: profile.codec_id.clone(),
+        data_fragments: profile.data_fragments as usize,
+        parity_fragments: profile.parity_fragments as usize,
+        fragment_bytes: profile.fragment_bytes as usize,
+        failure_domain,
+    })
+}
+
+pub fn chunk_id_from_proto(bytes: &[u8]) -> Result<ChunkId, ObjectError> {
+    if bytes.len() != 32 {
+        return Err(ObjectError::Metadata(format!(
+            "fragment chunk id must be 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut raw = [0_u8; 32];
+    raw.copy_from_slice(bytes);
+    Ok(ChunkId(raw))
+}
+
+fn stripe_logical_length_bytes(
+    manifest: &ObjectVersionManifest,
+    ec_profile: &EcProfile,
+    stripe_index: u32,
+) -> u64 {
+    let stripe_width_bytes =
+        u64::from(ec_profile.data_fragments) * u64::from(ec_profile.fragment_bytes);
+    let stripe_start = u64::from(stripe_index).saturating_mul(stripe_width_bytes);
+    manifest
+        .logical_length_bytes
+        .saturating_sub(stripe_start)
+        .min(stripe_width_bytes)
+}
+
+fn data_fragment_payload_bytes(
+    ec_profile: &EcProfile,
+    stripe_logical_bytes: u64,
+    fragment_index: usize,
+) -> usize {
+    if stripe_logical_bytes == 0 {
+        return 0;
+    }
+    let fragment_bytes = u64::from(ec_profile.fragment_bytes.max(1));
+    let fragment_start = (fragment_index as u64).saturating_mul(fragment_bytes);
+    stripe_logical_bytes
+        .saturating_sub(fragment_start)
+        .min(fragment_bytes) as usize
+}
+
+fn needed_data_fragment_count(ec_profile: &EcProfile, stripe_logical_bytes: u64) -> usize {
+    if stripe_logical_bytes == 0 {
+        return 0;
+    }
+    let fragment_bytes = u64::from(ec_profile.fragment_bytes.max(1));
+    let needed = stripe_logical_bytes.div_ceil(fragment_bytes);
+    needed
+        .min(u64::from(ec_profile.data_fragments))
+        .try_into()
+        .unwrap_or(ec_profile.data_fragments as usize)
+}
+
+static NEXT_KMS_ENDPOINT: AtomicUsize = AtomicUsize::new(0);
+
+fn initial_kms_endpoint_offset(endpoint_count: usize) -> usize {
+    if endpoint_count == 0 {
+        return 0;
+    }
+    let process_bias = std::process::id() as usize;
+    let time_bias = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos() as usize)
+        .unwrap_or(0);
+    let global_bias = NEXT_KMS_ENDPOINT.fetch_add(1, Ordering::Relaxed);
+    process_bias
+        .wrapping_mul(1_103_515_245)
+        .wrapping_add(time_bias)
+        .wrapping_add(global_bias)
+        % endpoint_count
+}
+
+impl KmsEndpointBalancer {
+    /// Returns the process-shared balancer for this endpoint set, connecting it on
+    /// first use. Distinct message caps get distinct channel sets (the cap is applied
+    /// per client handle, but keeping the key exact makes behavior predictable).
+    /// Only a COMPLETE channel set (every endpoint connected, full pool) is cached:
+    /// a partial set is returned to the caller uncached, so a client constructed
+    /// during a KMS rolling restart does not freeze the degraded view into the
+    /// process for its lifetime — the next construction retries the full connect.
+    async fn shared(
+        kms_endpoints: &[String],
+        grpc_max_message_bytes: usize,
+    ) -> Result<Self, ObjectError> {
+        let canonical = canonicalize_endpoints(kms_endpoints);
+        let key = format!("{}#{}", canonical.join(","), grpc_max_message_bytes);
+        let cell = {
+            let mut registry = global_kms_balancers()
+                .lock()
+                .expect("kms balancer registry mutex poisoned");
+            Arc::clone(
+                registry
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new())),
+            )
+        };
+        // Concurrent first-uses await one leader's connect through the cell. A
+        // partial connect is surfaced as an "error" carrying the usable balancer so
+        // the cell stays uninitialized (later constructions re-attempt the full set);
+        // the caller still gets the partial set and stays operational.
+        let complete_len = canonical.len() * Self::connections_per_endpoint();
+        match cell
+            .get_or_try_init(|| async {
+                let fresh = Self::connect(&canonical, grpc_max_message_bytes).await?;
+                if fresh.channels.len() < complete_len {
+                    return Err(SharedConnectOutcome::Partial(fresh));
+                }
+                Ok(fresh)
+            })
+            .await
+        {
+            Ok(cached) => Ok(cached.clone()),
+            Err(SharedConnectOutcome::Partial(partial)) => Ok(partial),
+            Err(SharedConnectOutcome::Failed(err)) => Err(err),
+        }
+    }
+
+    /// The number of independent h2 connections opened per KMS endpoint for the
+    /// process-shared channel set. Control RPCs are small and multiplex well, but
+    /// two pumps per endpoint keep one slow connection from serializing everything.
+    fn connections_per_endpoint() -> usize {
+        std::env::var("KSC_KMS_CONNS_PER_ENDPOINT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value >= 1)
+            .unwrap_or(2)
+    }
+
+    async fn connect(
+        kms_endpoints: &[String],
+        grpc_max_message_bytes: usize,
+    ) -> Result<Self, ObjectError> {
+        if kms_endpoints.is_empty() {
+            return Err(ObjectError::Transport(
+                "KSC has no KMS endpoints configured".to_string(),
+            ));
+        }
+        let start = initial_kms_endpoint_offset(kms_endpoints.len());
+        let conns_per_endpoint = Self::connections_per_endpoint();
+        // All connects are issued concurrently; endpoint-major order keeps the
+        // round-robin alternating endpoints before reusing a second connection to
+        // the same one.
+        let mut attempts = Vec::with_capacity(kms_endpoints.len() * conns_per_endpoint);
+        for conn_index in 0..conns_per_endpoint {
+            for offset in 0..kms_endpoints.len() {
+                let kms_endpoint = kms_endpoints[(start + offset) % kms_endpoints.len()].clone();
+                attempts.push(async move {
+                    let endpoint = Endpoint::from_shared(kms_endpoint.clone())
+                        .map_err(|err| format!("{} invalid: {}", kms_endpoint, err))?
+                        .initial_stream_window_size(KMS_GRPC_INITIAL_STREAM_WINDOW_BYTES)
+                        .initial_connection_window_size(KMS_GRPC_INITIAL_CONNECTION_WINDOW_BYTES)
+                        .http2_keep_alive_interval(KMS_GRPC_KEEPALIVE_INTERVAL)
+                        .keep_alive_timeout(KMS_GRPC_KEEPALIVE_TIMEOUT)
+                        .keep_alive_while_idle(true);
+                    endpoint.connect().await.map_err(|err| {
+                        format!(
+                            "{} connect failed (conn {}): {}",
+                            kms_endpoint, conn_index, err
+                        )
+                    })
+                });
+            }
+        }
+        let mut errors = Vec::new();
+        let mut channels = Vec::with_capacity(attempts.len());
+        for outcome in futures_util::future::join_all(attempts).await {
+            match outcome {
+                Ok(channel) => channels.push(channel),
+                Err(err) => errors.push(err),
+            }
+        }
+        if channels.is_empty() {
+            return Err(ObjectError::Transport(format!(
+                "KSC could not connect to any KMS endpoint: {}",
+                errors.join(" | ")
+            )));
+        }
+        Ok(Self {
+            channels: Arc::new(channels),
+            next: Arc::new(AtomicUsize::new(start)),
+            grpc_max_message_bytes,
+        })
+    }
+
+    fn client(&self) -> KmsClient<Channel> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.channels.len();
+        KmsClient::new(self.channels[index].clone())
+            .max_decoding_message_size(self.grpc_max_message_bytes)
+            .max_encoding_message_size(self.grpc_max_message_bytes)
+    }
+}
+
+/// A small process-wide pool of distinct h2 connections to one storage target. Cloning a
+/// [`TargetSession`] shares the SAME underlying connection, so a pool holds N genuinely
+/// independent connections (and thus N independent KST-side receive pumps). `pick` hands
+/// out one round-robin; callers cache the picked session, so different clients land on
+/// different connections and a target's receive is no longer single-pump serialized.
+#[derive(Clone)]
+struct TargetSessionPool {
+    sessions: Arc<Vec<TargetSession>>,
+    next: Arc<AtomicUsize>,
+}
+
+impl TargetSessionPool {
+    fn pick(&self) -> TargetSession {
+        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len();
+        self.sessions[index].clone()
+    }
+}
+
+/// Opens up to `count` independent connections to `endpoint` concurrently and returns them
+/// as a pool. Tolerates partial failure (a pool with ≥1 connection is usable); only errors
+/// if every connect attempt fails, surfacing the last error.
+async fn connect_target_pool(
+    endpoint: &str,
+    session_options: TargetSessionOptions,
+    count: usize,
+) -> Result<TargetSessionPool, ObjectError> {
+    let mut connects = JoinSet::new();
+    for _ in 0..count.max(1) {
+        let endpoint = endpoint.to_string();
+        connects.spawn(async move {
+            data_rpc(
+                "target connect",
+                TARGET_CONNECT_TIMEOUT,
+                TargetSession::connect_with_options(&endpoint, session_options),
+            )
+            .await
+        });
+    }
+    let mut sessions = Vec::with_capacity(count.max(1));
+    let mut last_err: Option<ObjectError> = None;
+    while let Some(result) = connects.join_next().await {
+        match result {
+            Ok(Ok(session)) => sessions.push(session),
+            Ok(Err(err)) => last_err = Some(err),
+            Err(join_err) => {
+                last_err = Some(ObjectError::Transport(format!(
+                    "KSC target-session connect task failed before completing: {join_err}"
+                )))
+            }
+        }
+    }
+    if sessions.is_empty() {
+        return Err(last_err.unwrap_or_else(|| {
+            ObjectError::Transport(format!("KSC could not open any connection to {endpoint}"))
+        }));
+    }
+    Ok(TargetSessionPool {
+        sessions: Arc::new(sessions),
+        next: Arc::new(AtomicUsize::new(0)),
+    })
+}
+
+fn global_target_sessions() -> Arc<tokio::sync::Mutex<HashMap<String, TargetSessionPool>>> {
+    static SHARED: OnceLock<Arc<tokio::sync::Mutex<HashMap<String, TargetSessionPool>>>> =
+        OnceLock::new();
+    SHARED
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(HashMap::new())))
+        .clone()
+}
+
+/// Parses a decentralized version id of the form `"{object_id}:{version}"` back into
+/// `(object_id, object_version)`. The version is narrowed to u16 to match the on-media
+/// identity and the placement/chunk-id derivation used at write time.
+fn parse_version_id(version_id: &str) -> Result<(u32, u16), ObjectError> {
+    let (object_id, version) = version_id.split_once(':').ok_or_else(|| {
+        ObjectError::Metadata(format!(
+            "version id {version_id} is not in object_id:version form (not a decentralized object?)"
+        ))
+    })?;
+    let object_id = object_id.parse::<u32>().map_err(|_| {
+        ObjectError::Metadata(format!("version id {version_id} has a non-numeric object id"))
+    })?;
+    let version = version.parse::<u32>().map_err(|_| {
+        ObjectError::Metadata(format!("version id {version_id} has a non-numeric version"))
+    })?;
+    Ok((object_id, version as u16))
+}
+
+/// Reconstructs the object manifest from the head + cluster config by COMPUTING the
+/// fragment layout (HRW placement + chunk ids) — the read-side mirror of the
+/// decentralized write. `granule_index` is left 0: reads resolve a fragment by its chunk
+/// id, so the granule (a write-time placement detail) is not needed to read it back.
+fn reconstruct_manifest_from_head(
+    bucket_id: &str,
+    key: &str,
+    head: &ObjectHead,
+    ec_profile: &EcProfile,
+    cluster: &ClusterConfig,
+) -> Result<ObjectVersionManifest, ObjectError> {
+    let (object_id, object_version) = parse_version_id(&head.current_version_id)?;
+    let salt = cluster.cluster_salt.as_slice();
+    let placement_targets = cluster
+        .targets
+        .iter()
+        .map(keinctl::placement::PlacementTarget::from_record)
+        .collect::<Vec<_>>();
+    let endpoint_by_target: HashMap<&str, &str> = cluster
+        .targets
+        .iter()
+        .map(|target| (target.target_id.as_str(), target.endpoint.as_str()))
+        .collect();
+    let failure_domain =
+        FailureDomain::try_from(ec_profile.failure_domain).unwrap_or(FailureDomain::Unspecified);
+    let fragments_per_stripe = (ec_profile.data_fragments + ec_profile.parity_fragments) as usize;
+    let stripe_logical = stripe_logical_bytes(ec_profile)?;
+    let stripe_count = if head.logical_length_bytes == 0 || stripe_logical == 0 {
+        0
+    } else {
+        (head.logical_length_bytes as usize).div_ceil(stripe_logical)
+    };
+    let no_excluded = std::collections::HashSet::new();
+    let mut stripes = Vec::with_capacity(stripe_count);
+    for stripe_index in 0..stripe_count as u32 {
+        let targets = keinctl::placement::place_stripe(
+            salt,
+            object_id,
+            object_version,
+            stripe_index,
+            fragments_per_stripe,
+            failure_domain,
+            &placement_targets,
+            &no_excluded,
+        )
+        .map_err(|err| {
+            ObjectError::Metadata(format!(
+                "computed placement failed for {bucket_id}/{key} stripe {stripe_index}: {err}"
+            ))
+        })?;
+        let mut fragments = Vec::with_capacity(fragments_per_stripe);
+        for (fragment_index, target_id) in targets.iter().enumerate() {
+            let endpoint = endpoint_by_target.get(target_id.as_str()).ok_or_else(|| {
+                ObjectError::Metadata(format!(
+                    "cluster config has no endpoint for computed target {target_id}"
+                ))
+            })?;
+            fragments.push(FragmentPlan {
+                fragment_index: fragment_index as u32,
+                chunk_id: ChunkId::for_fragment(
+                    salt,
+                    object_id,
+                    object_version,
+                    stripe_index as u16,
+                    fragment_index as u16,
+                )
+                .0
+                .to_vec(),
+                target_id: target_id.clone(),
+                endpoint: (*endpoint).to_string(),
+                granule_index: 0,
+                generation: 0,
+                stripe_index,
+            });
+        }
+        stripes.push(StripeManifest { fragments });
+    }
+    Ok(ObjectVersionManifest {
+        version_id: head.current_version_id.clone(),
+        bucket_id: bucket_id.to_string(),
+        key: key.to_string(),
+        logical_length_bytes: head.logical_length_bytes,
+        ec_profile_id: head.ec_profile_id.clone(),
+        stripes,
+        namespace_id: String::new(),
+        object_entry_id: head.object_entry_id.clone(),
+        bucket_entry_id: String::new(),
+    })
+}
+
+async fn control_rpc<T, F>(label: &str, future: F) -> Result<T, ObjectError>
+where
+    F: Future<Output = Result<T, tonic::Status>>,
+{
+    timeout(CONTROL_RPC_TIMEOUT, future)
+        .await
+        .map_err(|_| {
+            ObjectError::Transport(format!(
+                "{} timed out after {} ms",
+                label,
+                CONTROL_RPC_TIMEOUT.as_millis()
+            ))
+        })?
+        .map_err(ObjectError::from)
+}
+
+/// Commits a freshly-written object through the single-shot `CommitObject` RPC.
+///
+/// The commit only writes metadata (the fragment bytes are already durable on the
+/// targets), and the server side is idempotent: a retry whose own version already
+/// won returns OK. So a transport failure is retried by re-issuing the identical
+/// request — it never double-commits or rewrites fragment data. A
+/// `FailedPrecondition` is terminal: the object already exists, or another writer
+/// won the create race; retrying cannot change that.
+/// Aborts a spawned task when dropped, so a long-write lease-heartbeat task is torn down on
+/// EVERY exit from the write — success, error, or early return — rather than leaking and
+/// renewing a doomed write's lease forever.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Stripes per ManifestSegment on the append-then-seal path. Bounds each segment's KMS
+/// transaction well under FDB's 10 MB ceiling: ~10 fragments/stripe x ~1 KB of reverse-log +
+/// occupancy + committed-granule per fragment => ~512 stripes ≈ ~5 MB. Objects with more stripes
+/// than this stream through `commit_object_segmented_rpc` instead of the single-shot path.
+const SEAL_SEGMENT_STRIPES: usize = 512;
+
+/// Returns false when `KSC_DISABLE_STREAMING_COMMIT=1`, forcing the buffered
+/// append-then-seal path (rollback + A/B lever). Default on.
+fn streaming_segmented_commit_enabled() -> bool {
+    !matches!(std::env::var("KSC_DISABLE_STREAMING_COMMIT"), Ok(value) if value == "1")
+}
+
+/// A `CommitObjectSegmented` stream fed DURING the write loop: each time a contiguous
+/// block of `SEAL_SEGMENT_STRIPES` stripes lands, its `ManifestSegment` is sent
+/// immediately rather than buffering every segment until the last byte. Only the
+/// final partial segment + seal remain at the end, collapsing the post-data commit
+/// tail from `ceil(stripes/512) + 1` sequential appends to ~one seal. A mid-loop send
+/// failure (the server rejected an append, or the RPC ended) marks the stream
+/// unhealthy; the caller then falls back to the buffered path, whose re-sent appends
+/// are idempotent because no seal was ever sent. Once the seal IS sent, the outcome is
+/// as authoritative — and as ambiguous on a lost response — as the buffered seal.
+struct StreamingSegmentedCommit {
+    tx: tokio::sync::mpsc::Sender<CommitObjectSegment>,
+    response: tokio::task::JoinHandle<
+        Result<tonic::Response<keinctl::proto::CommitObjectReply>, tonic::Status>,
+    >,
+    version_id: String,
+    sent_stripes: usize,
+    segments_sent: usize,
+    /// `KSC_FAULT_ABORT_AFTER_SEGMENTS` on the streaming path: abort the process
+    /// once this many segments have streamed (never sending the seal), leaving the
+    /// exact durable state of a client that died mid-commit for the reaper drill.
+    abort_after_segments: Option<usize>,
+    healthy: bool,
+}
+
+impl StreamingSegmentedCommit {
+    /// Opens the stream and spawns the RPC. The RPC is NOT wrapped in a timeout here
+    /// — it drives the request stream for the whole (multi-hour, on a large object)
+    /// data phase; `SEGMENTED_COMMIT_TIMEOUT` bounds only the seal round-trip in
+    /// `finish`. Segments are fed via `flush_ready`.
+    fn open(mut kms: KmsClient<Channel>, version_id: String) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<CommitObjectSegment>(4);
+        let request_stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|segment| (segment, rx))
+        });
+        let response =
+            tokio::spawn(
+                async move { kms.commit_object_segmented(tonic::Request::new(request_stream)).await },
+            );
+        let abort_after_segments = std::env::var("KSC_FAULT_ABORT_AFTER_SEGMENTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|limit| limit.max(1));
+        Self {
+            tx,
+            response,
+            version_id,
+            sent_stripes: 0,
+            segments_sent: 0,
+            abort_after_segments,
+            healthy: true,
+        }
+    }
+
+    fn stripe_manifest(
+        plans: &HashMap<(u32, u32), FragmentPlan>,
+        stripe_index: usize,
+        fragments_per_stripe: usize,
+    ) -> Option<StripeManifest> {
+        let mut fragments = Vec::with_capacity(fragments_per_stripe);
+        for fragment_index in 0..fragments_per_stripe {
+            fragments.push(
+                plans
+                    .get(&(stripe_index as u32, fragment_index as u32))?
+                    .clone(),
+            );
+        }
+        Some(StripeManifest { fragments })
+    }
+
+    /// Sends every full `SEAL_SEGMENT_STRIPES` segment now fully landed (`landed_upto`
+    /// = count of contiguous final stripes). No-op once unhealthy; a send failure or a
+    /// missing fragment (a stripe that is not actually complete) marks it unhealthy so
+    /// the caller falls back to buffered.
+    async fn flush_ready(
+        &mut self,
+        plans: &HashMap<(u32, u32), FragmentPlan>,
+        landed_upto: usize,
+        fragments_per_stripe: usize,
+    ) {
+        while self.healthy && landed_upto - self.sent_stripes >= SEAL_SEGMENT_STRIPES {
+            let end = self.sent_stripes + SEAL_SEGMENT_STRIPES;
+            let mut stripes = Vec::with_capacity(SEAL_SEGMENT_STRIPES);
+            for stripe_index in self.sent_stripes..end {
+                match Self::stripe_manifest(plans, stripe_index, fragments_per_stripe) {
+                    Some(stripe) => stripes.push(stripe),
+                    None => {
+                        self.healthy = false;
+                        return;
+                    }
+                }
+            }
+            let segment = CommitObjectSegment {
+                content: Some(keinctl::proto::commit_object_segment::Content::ManifestSegment(
+                    ManifestSegment {
+                        version_id: self.version_id.clone(),
+                        stripes,
+                    },
+                )),
+            };
+            // A send error (receiver gone) or a timeout (a wedged connection stalling
+            // the send) drops to buffered at commit; the write loop keeps going.
+            match timeout(SEGMENTED_COMMIT_TIMEOUT, self.tx.send(segment)).await {
+                Ok(Ok(())) => {}
+                _ => {
+                    self.healthy = false;
+                    return;
+                }
+            }
+            self.sent_stripes = end;
+            self.segments_sent += 1;
+            if self
+                .abort_after_segments
+                .is_some_and(|limit| self.segments_sent >= limit)
+            {
+                eprintln!(
+                    "KSC_FAULT_ABORT_AFTER_SEGMENTS: aborting after {} streamed segments, no seal",
+                    self.segments_sent
+                );
+                std::process::abort();
+            }
+        }
+    }
+
+    /// Sends the tail stripes (those past `sent_stripes`) and the seal, then awaits the
+    /// server's head. Called only when the stream is still healthy. The tail is at most
+    /// `SEAL_SEGMENT_STRIPES - 1` stripes, so it fits one bounded transaction.
+    ///
+    /// Returns `Ok(None)` when a send fails BEFORE the seal was handed to the channel —
+    /// no seal reached KMS, so the caller safely re-sends everything on the buffered
+    /// path (appends are idempotent against the still-`WRITING` marker). Once the seal
+    /// is queued the outcome is authoritative-or-ambiguous exactly like the buffered
+    /// single-attempt seal, so a later failure surfaces as `Err` (never a re-append
+    /// that could race a landed seal against a cleared marker).
+    async fn finish(
+        self,
+        seal: CommitObjectSeal,
+        manifest_stripes: &[StripeManifest],
+    ) -> Result<Option<ObjectHead>, ObjectError> {
+        let StreamingSegmentedCommit {
+            tx,
+            response,
+            version_id,
+            sent_stripes,
+            ..
+        } = self;
+        if sent_stripes < manifest_stripes.len() {
+            let segment = CommitObjectSegment {
+                content: Some(keinctl::proto::commit_object_segment::Content::ManifestSegment(
+                    ManifestSegment {
+                        version_id: version_id.clone(),
+                        stripes: manifest_stripes[sent_stripes..].to_vec(),
+                    },
+                )),
+            };
+            // Pre-seal: a send error (receiver gone) OR a timeout (a wedged-but-alive
+            // KMS connection h2-stalling the send) means the seal never entered the
+            // channel — dropping the send future leaves the message un-enqueued — so
+            // fall back to the buffered path (idempotent re-append).
+            match timeout(SEGMENTED_COMMIT_TIMEOUT, tx.send(segment)).await {
+                Ok(Ok(())) => {}
+                _ => return Ok(None),
+            }
+        }
+        match timeout(
+            SEGMENTED_COMMIT_TIMEOUT,
+            tx.send(CommitObjectSegment {
+                content: Some(keinctl::proto::commit_object_segment::Content::Seal(seal)),
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            // Still pre-seal (the seal never entered the channel): fall back.
+            _ => return Ok(None),
+        }
+        drop(tx);
+        // The seal is queued to the server; from here the result is authoritative or
+        // ambiguous but never safe to re-append. Bound only this seal round-trip.
+        let responded = match timeout(SEGMENTED_COMMIT_TIMEOUT, response).await {
+            Ok(joined) => joined.map_err(|err| {
+                ObjectError::Transport(format!("segmented commit task failed to join: {err}"))
+            })?,
+            Err(_) => {
+                return Err(ObjectError::Transport(format!(
+                    "streamed CommitObjectSegmented seal timed out after {} ms",
+                    SEGMENTED_COMMIT_TIMEOUT.as_millis()
+                )));
+            }
+        };
+        responded
+            .map_err(ObjectError::from)?
+            .into_inner()
+            .head
+            .map(Some)
+            .ok_or_else(|| {
+                ObjectError::Metadata(
+                    "KMS CommitObjectSegmented did not return an object head".to_string(),
+                )
+            })
+    }
+}
+
+/// Append-then-seal commit for objects too large for one single-shot FDB transaction. Streams
+/// the manifest's stripes as bounded `ManifestSegment`s (each durably recorded in its own KMS
+/// transaction, the object staying invisible + lease-protected) then a terminating
+/// `CommitObjectSeal` that atomically flips the head. Decentralized only: the per-fragment
+/// reverse-log the segments write is the sole record (omit_manifest), so there is no manifest
+/// blob. Single attempt (the stream is not cheaply replayable); the fragment bytes are already
+/// durable, so a failure surfaces to the caller to retry the whole object.
+async fn commit_object_segmented_rpc(
+    kms: &mut KmsClient<Channel>,
+    object_id: u32,
+    object_version: u32,
+    expected_prior_version: u32,
+    manifest: &ObjectVersionManifest,
+    parent_entry_id: &str,
+    parent_path: &str,
+    topology_epoch: u64,
+) -> Result<ObjectHead, ObjectError> {
+    let mut segments: Vec<CommitObjectSegment> = manifest
+        .stripes
+        .chunks(SEAL_SEGMENT_STRIPES)
+        .map(|chunk| CommitObjectSegment {
+            content: Some(keinctl::proto::commit_object_segment::Content::ManifestSegment(
+                ManifestSegment {
+                    version_id: manifest.version_id.clone(),
+                    stripes: chunk.to_vec(),
+                },
+            )),
+        })
+        .collect();
+    segments.push(CommitObjectSegment {
+        content: Some(keinctl::proto::commit_object_segment::Content::Seal(CommitObjectSeal {
+            object_id,
+            namespace_id: manifest.namespace_id.clone(),
+            bucket_id: manifest.bucket_id.clone(),
+            key: manifest.key.clone(),
+            version: object_version,
+            expected_prior_version,
+            parent_entry_id: parent_entry_id.to_string(),
+            parent_path: parent_path.to_string(),
+            topology_epoch,
+            logical_length_bytes: manifest.logical_length_bytes,
+            ec_profile_id: manifest.ec_profile_id.clone(),
+            version_id: manifest.version_id.clone(),
+            object_entry_id: manifest.object_entry_id.clone(),
+        })),
+    });
+    // Fault-injection hook (like `fault_skip_commit`, for reclaim testing): stream only
+    // the first N manifest segments — never the seal — then abort the PROCESS, leaving
+    // the exact durable state of a client that died mid-commit: appended reverse-log/
+    // occupancy rows, a writing pending-version marker, a lease, and no head.
+    if let Ok(value) = std::env::var("KSC_FAULT_ABORT_AFTER_SEGMENTS") {
+        if let Ok(limit) = value.parse::<usize>() {
+            let append_count = segments.len().saturating_sub(1).min(limit.max(1));
+            segments.truncate(append_count);
+            let request = tonic::Request::new(futures_util::stream::iter(segments));
+            let _ = timeout(SEGMENTED_COMMIT_TIMEOUT, kms.commit_object_segmented(request)).await;
+            eprintln!(
+                "KSC_FAULT_ABORT_AFTER_SEGMENTS: aborting after {append_count} segments, no seal"
+            );
+            std::process::abort();
+        }
+    }
+    let request = tonic::Request::new(futures_util::stream::iter(segments));
+    match timeout(SEGMENTED_COMMIT_TIMEOUT, kms.commit_object_segmented(request)).await {
+        Ok(Ok(response)) => response.into_inner().head.ok_or_else(|| {
+            ObjectError::Metadata(
+                "KMS CommitObjectSegmented did not return an object head".to_string(),
+            )
+        }),
+        Ok(Err(status)) => Err(ObjectError::from(status)),
+        Err(_) => Err(ObjectError::Transport(format!(
+            "KMS CommitObjectSegmented timed out after {} ms",
+            SEGMENTED_COMMIT_TIMEOUT.as_millis()
+        ))),
+    }
+}
+
+/// Builds one object's CommitObject request. A decentralized merged-begin write
+/// sends the target-reported landed rows plus the head fields instead of the full
+/// manifest — the server derives the reverse-log/occupancy rows from them (chunk
+/// ids are recomputable pure functions) — and requires the pending-version marker
+/// its BeginObject minted, so a version the reaper claimed or the GC fenced rejects
+/// cleanly. `require_marker` is only set for merged-begin writes (only those minted
+/// a marker; the InitiateObjectWrite fallback against an older KMS did not).
+/// Zero-byte objects have no landed rows and fall back to the manifest shape (the
+/// server rejects an empty landed list), keeping the marker requirement. The env
+/// override KSC_COMMIT_MANIFEST=1 forces the legacy manifest shape on the
+/// decentralized path (rollback + A/B lever); the manifest-backed tools path
+/// always uses the manifest shape.
+fn build_commit_object_request(
+    object_id: u32,
+    object_version: u32,
+    expected_prior_version: u32,
+    manifest: &ObjectVersionManifest,
+    parent_entry_id: &str,
+    parent_path: &str,
+    topology_epoch: u64,
+    decentralized: bool,
+    require_marker: bool,
+) -> CommitObjectRequest {
+    let landed_shape = decentralized
+        && require_marker
+        && !manifest.stripes.is_empty()
+        && !matches!(std::env::var("KSC_COMMIT_MANIFEST"), Ok(value) if value == "1");
+    let (manifest_field, landed, omit_manifest, logical_length, ec_profile_id, object_entry_id) =
+        if landed_shape {
+            let landed: Vec<LandedFragmentRow> = manifest
+                .stripes
+                .iter()
+                .flat_map(|stripe| {
+                    stripe.fragments.iter().map(|fragment| LandedFragmentRow {
+                        target_id: fragment.target_id.clone(),
+                        stripe_index: fragment.stripe_index,
+                        fragment_index: fragment.fragment_index,
+                        granule_index: fragment.granule_index,
+                        generation: fragment.generation,
+                    })
+                })
+                .collect();
+            (
+                None,
+                landed,
+                true,
+                manifest.logical_length_bytes,
+                manifest.ec_profile_id.clone(),
+                manifest.object_entry_id.clone(),
+            )
+        } else {
+            (
+                Some(manifest.clone()),
+                Vec::new(),
+                decentralized,
+                0,
+                String::new(),
+                String::new(),
+            )
+        };
+    CommitObjectRequest {
+        object_id,
+        namespace_id: manifest.namespace_id.clone(),
+        bucket_id: manifest.bucket_id.clone(),
+        key: manifest.key.clone(),
+        version: object_version,
+        manifest: manifest_field,
+        expected_prior_version,
+        parent_entry_id: parent_entry_id.to_string(),
+        parent_path: parent_path.to_string(),
+        topology_epoch,
+        omit_manifest,
+        require_pending_version_marker: require_marker,
+        landed,
+        object_logical_length_bytes: logical_length,
+        ec_profile_id,
+        object_entry_id,
+    }
+}
+
+async fn commit_object_single_shot_rpc(
+    kms: &mut KmsClient<Channel>,
+    object_id: u32,
+    object_version: u32,
+    expected_prior_version: u32,
+    manifest: &ObjectVersionManifest,
+    parent_entry_id: &str,
+    parent_path: &str,
+    topology_epoch: u64,
+    decentralized: bool,
+    require_marker: bool,
+) -> Result<ObjectHead, ObjectError> {
+    const MAX_ATTEMPTS: usize = 3;
+    let mut last_err: Option<ObjectError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let request = build_commit_object_request(
+            object_id,
+            object_version,
+            expected_prior_version,
+            manifest,
+            parent_entry_id,
+            parent_path,
+            topology_epoch,
+            decentralized,
+            require_marker,
+        );
+        match timeout(CONTROL_RPC_TIMEOUT, kms.commit_object(request)).await {
+            Ok(Ok(response)) => {
+                let head = response.into_inner().head.ok_or_else(|| {
+                    ObjectError::Metadata(
+                        "KMS CommitObject did not return an object head".to_string(),
+                    )
+                })?;
+                // Fault injection: re-issue the identical commit and require the
+                // idempotent-success path to return the same head (lost-reply retry
+                // proof). Unary route only — the batched committer never sees this
+                // knob. Only for validation runs; never set in production.
+                if matches!(std::env::var("KSC_FAULT_COMMIT_TWICE"), Ok(value) if value == "1") {
+                    let replay = build_commit_object_request(
+                        object_id,
+                        object_version,
+                        expected_prior_version,
+                        manifest,
+                        parent_entry_id,
+                        parent_path,
+                        topology_epoch,
+                        decentralized,
+                        require_marker,
+                    );
+                    let replayed = timeout(CONTROL_RPC_TIMEOUT, kms.commit_object(replay))
+                        .await
+                        .map_err(|_| {
+                            ObjectError::Transport(
+                                "fault-commit-twice: replayed CommitObject timed out".to_string(),
+                            )
+                        })?
+                        .map_err(ObjectError::from)?
+                        .into_inner()
+                        .head;
+                    match replayed {
+                        Some(replayed_head)
+                            if replayed_head.current_version_id == head.current_version_id =>
+                        {
+                            eprintln!(
+                                "fault-commit-twice: replayed commit idempotently returned head version_id={}",
+                                head.current_version_id
+                            );
+                        }
+                        other => {
+                            return Err(ObjectError::Metadata(format!(
+                                "fault-commit-twice: replayed commit returned {:?}, expected the original head version_id={}",
+                                other.map(|h| h.current_version_id),
+                                head.current_version_id
+                            )));
+                        }
+                    }
+                }
+                return Ok(head);
+            }
+            Ok(Err(status)) => {
+                // Semantic rejections are deterministic; retrying re-earns the same
+                // answer (InvalidArgument notably covers an older KMS that drops the
+                // landed-shape fields and sees no manifest — set KSC_COMMIT_MANIFEST=1
+                // against such a fleet).
+                if matches!(
+                    status.code(),
+                    tonic::Code::FailedPrecondition | tonic::Code::InvalidArgument
+                ) {
+                    return Err(ObjectError::from(status));
+                }
+                last_err = Some(ObjectError::from(status));
+            }
+            Err(_) => {
+                last_err = Some(ObjectError::Transport(format!(
+                    "KMS CommitObject timed out after {} ms",
+                    CONTROL_RPC_TIMEOUT.as_millis()
+                )));
+            }
+        }
+        // Back off before re-issuing so a briefly unavailable/overloaded KMS is not
+        // hammered with back-to-back attempts. Capped exponential, matching the
+        // data-plane retry convention.
+        if attempt + 1 < MAX_ATTEMPTS {
+            let backoff = COMMIT_RETRY_BASE_BACKOFF
+                .saturating_mul(1u32 << attempt)
+                .min(COMMIT_RETRY_BACKOFF_CEILING);
+            sleep(backoff).await;
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        ObjectError::Transport("KMS CommitObject exhausted retries".to_string())
+    }))
+}
+
+/// One queued object commit awaiting a batched `MultiCommitObject` flush.
+struct CommitJob {
+    request: CommitObjectRequest,
+    reply: oneshot::Sender<Result<ObjectHead, ObjectError>>,
+}
+
+/// Process-shared handle to a background committer that coalesces object-head commits from
+/// many concurrent writers into single `MultiCommitObject` RPCs. Folding N commits into one
+/// KMS call collapses N per-object FoundationDB transactions (each a fresh read-version +
+/// resolver pass + TLog fsync + gRPC round-trip) into one amortized across the batch — the
+/// measured limiter on small/medium-object commit rate.
+#[derive(Clone)]
+struct ObjectCommitter {
+    tx: mpsc::Sender<CommitJob>,
+}
+
+impl ObjectCommitter {
+    /// Enqueues one commit and awaits its batched outcome.
+    async fn commit(&self, request: CommitObjectRequest) -> Result<ObjectHead, ObjectError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(CommitJob {
+                request,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ObjectError::Transport("object commit batcher is shut down".to_string()))?;
+        reply_rx.await.map_err(|_| {
+            ObjectError::Transport("object commit batcher dropped the reply".to_string())
+        })?
+    }
+}
+
+/// Spawns the background flush task for one committer. It drains the queue, coalescing up to
+/// `batch_max` jobs (or until the `linger` window elapses after the first arrives), issues
+/// one `MultiCommitObject`, and fans the per-object outcomes back to each waiter.
+fn spawn_object_committer(
+    mut kms: KmsClient<Channel>,
+    batch_max: usize,
+    linger: Duration,
+) -> ObjectCommitter {
+    let (tx, mut rx) = mpsc::channel::<CommitJob>(8192);
+    tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            let mut jobs = vec![first];
+            if batch_max > 1 && !linger.is_zero() {
+                let deadline = Instant::now() + linger;
+                while jobs.len() < batch_max {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match timeout(remaining, rx.recv()).await {
+                        Ok(Some(job)) => jobs.push(job),
+                        Ok(None) => break, // all senders dropped
+                        Err(_) => break,   // linger window elapsed
+                    }
+                }
+            }
+            let (requests, replies): (
+                Vec<CommitObjectRequest>,
+                Vec<oneshot::Sender<Result<ObjectHead, ObjectError>>>,
+            ) = jobs.into_iter().map(|job| (job.request, job.reply)).unzip();
+            match call_multi_commit_object(&mut kms, requests).await {
+                Ok(per_object) => {
+                    for (reply, outcome) in replies.into_iter().zip(per_object.into_iter()) {
+                        let _ = reply.send(outcome);
+                    }
+                }
+                Err(err) => {
+                    // A whole-batch (transport) failure fails every waiter identically;
+                    // ObjectError is not Clone, so reconstruct it from its message.
+                    let message = err.to_string();
+                    for reply in replies {
+                        let _ = reply.send(Err(ObjectError::Transport(message.clone())));
+                    }
+                }
+            }
+        }
+    });
+    ObjectCommitter { tx }
+}
+
+/// Issues one `MultiCommitObject` and maps the index-aligned reply back to per-object
+/// results. Retries the whole call on transport/timeout (the heads are already durable; this
+/// only flips metadata), matching `commit_object_single_shot_rpc`. A per-object rejection
+/// (e.g. a CAS mismatch) is carried in that object's slot and is not retried.
+async fn call_multi_commit_object(
+    kms: &mut KmsClient<Channel>,
+    requests: Vec<CommitObjectRequest>,
+) -> Result<Vec<Result<ObjectHead, ObjectError>>, ObjectError> {
+    let count = requests.len();
+    const MAX_ATTEMPTS: usize = 3;
+    let mut last_err: Option<ObjectError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let request = MultiCommitObjectRequest {
+            commits: requests.clone(),
+        };
+        match timeout(CONTROL_RPC_TIMEOUT, kms.multi_commit_object(request)).await {
+            Ok(Ok(response)) => {
+                let reply = response.into_inner();
+                let mut out: Vec<Result<ObjectHead, ObjectError>> = (0..count)
+                    .map(|_| {
+                        Err(ObjectError::Metadata(
+                            "KMS MultiCommitObject omitted a result for this object".to_string(),
+                        ))
+                    })
+                    .collect();
+                for result in reply.results {
+                    let index = result.index as usize;
+                    if index < count {
+                        out[index] = match result.head {
+                            Some(head) => Ok(head),
+                            None => Err(ObjectError::Metadata(if result.error.is_empty() {
+                                "KMS MultiCommitObject rejected this object".to_string()
+                            } else {
+                                result.error
+                            })),
+                        };
+                    }
+                }
+                return Ok(out);
+            }
+            Ok(Err(status)) => {
+                last_err = Some(ObjectError::from(status));
+            }
+            Err(_) => {
+                last_err = Some(ObjectError::Transport(format!(
+                    "KMS MultiCommitObject timed out after {} ms",
+                    CONTROL_RPC_TIMEOUT.as_millis()
+                )));
+            }
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            let backoff = COMMIT_RETRY_BASE_BACKOFF
+                .saturating_mul(1u32 << attempt)
+                .min(COMMIT_RETRY_BACKOFF_CEILING);
+            sleep(backoff).await;
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        ObjectError::Transport("KMS MultiCommitObject exhausted retries".to_string())
+    }))
+}
+
+/// Returns the process-shared committer for a set of KMS endpoints, spawning its flush task
+/// on first use. Keyed by the endpoint set so every writer against the same KMS — e.g. all
+/// benchmark workers in one process — batches into one committer.
+fn global_object_committer(
+    key: &str,
+    kms: &KmsEndpointBalancer,
+    batch_max: usize,
+    linger: Duration,
+) -> ObjectCommitter {
+    static SHARED: OnceLock<std::sync::Mutex<HashMap<String, ObjectCommitter>>> = OnceLock::new();
+    let registry = SHARED.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = registry.lock().expect("object committer registry poisoned");
+    guard
+        .entry(key.to_string())
+        .or_insert_with(|| spawn_object_committer(kms.client(), batch_max, linger))
+        .clone()
+}
+
+async fn data_rpc<T, F>(
+    label: &str,
+    timeout_duration: Duration,
+    future: F,
+) -> Result<T, ObjectError>
+where
+    F: Future<Output = Result<T, ClientError>>,
+{
+    timeout(timeout_duration, future)
+        .await
+        .map_err(|_| {
+            ObjectError::Transport(format!(
+                "{} timed out after {} ms",
+                label,
+                timeout_duration.as_millis()
+            ))
+        })?
+        .map_err(ObjectError::from)
+}
+
+fn add_request_phase_times(into: &mut RequestPhaseTimes, phases: &RequestPhaseTimes) {
+    into.ready_wait += phases.ready_wait;
+    into.request_prepare += phases.request_prepare;
+    into.send_headers += phases.send_headers;
+    into.send_body += phases.send_body;
+    into.wait_response += phases.wait_response;
+    into.collect_response += phases.collect_response;
+    into.protocol_decode += phases.protocol_decode;
+    into.payload_validate += phases.payload_validate;
+}
+
+fn accumulate_target_request_phases(into: &mut ObjectPhaseTimes, request: &RequestPhaseTimes) {
+    into.target_ready_wait += request.ready_wait;
+    into.target_request_prepare += request.request_prepare;
+    into.target_send_headers += request.send_headers;
+    into.target_send_body += request.send_body;
+    into.target_wait_response += request.wait_response;
+    into.target_collect_response += request.collect_response;
+    into.target_protocol_decode += request.protocol_decode;
+    into.target_payload_validate += request.payload_validate;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- ranged-read stripe arithmetic (get_object_range) ----
+
+    #[test]
+    fn range_to_stripe_indices_spans_boundaries() {
+        let w = 100u64;
+        // Whole first stripe.
+        assert_eq!(range_to_stripe_indices(0, 100, w), (0, 0));
+        // Range entirely inside stripe 1.
+        assert_eq!(range_to_stripe_indices(100, 200, w), (1, 1));
+        // Range crossing the 0/1 boundary.
+        assert_eq!(range_to_stripe_indices(50, 150, w), (0, 1));
+        // End exactly on a boundary stays in the lower stripe (exclusive end).
+        assert_eq!(range_to_stripe_indices(0, 100, w), (0, 0));
+        assert_eq!(range_to_stripe_indices(99, 100, w), (0, 0));
+        assert_eq!(range_to_stripe_indices(100, 101, w), (1, 1));
+        // Multi-stripe span.
+        assert_eq!(range_to_stripe_indices(50, 350, w), (0, 3));
+        // Single byte at the very start of stripe 2.
+        assert_eq!(range_to_stripe_indices(200, 201, w), (2, 2));
+    }
+
+    #[test]
+    fn stripe_slice_bounds_clamps_to_payload_and_range() {
+        let w = 100u64;
+        // First covered stripe (index 0): range starts mid-stripe.
+        assert_eq!(stripe_slice_bounds(50, 150, 0, w, 100), (50, 100));
+        // Interior/last covered stripe (index 1): range ends mid-stripe.
+        assert_eq!(stripe_slice_bounds(50, 150, 1, w, 100), (0, 50));
+        // Range fully inside a single interior stripe (index 1).
+        assert_eq!(stripe_slice_bounds(120, 180, 1, w, 100), (20, 80));
+        // Short last stripe: payload shorter than stripe width clamps hi.
+        assert_eq!(stripe_slice_bounds(300, 340, 3, w, 25), (0, 25));
+        // Stripe not overlapping the range yields an empty slice.
+        assert_eq!(stripe_slice_bounds(0, 50, 2, w, 100), (0, 0));
+    }
+
+    #[test]
+    fn stripe_slice_bounds_reassembles_a_full_object() {
+        // Object of 250 bytes, stripe width 100 => stripes [100,100,50].
+        let w = 100u64;
+        let stripes = [vec![1u8; 100], vec![2u8; 100], vec![3u8; 50]];
+        // Read [80, 230): stripe0[80..100] + stripe1[0..100] + stripe2[0..30].
+        let (start, end) = (80u64, 230u64);
+        let (first, last) = range_to_stripe_indices(start, end, w);
+        assert_eq!((first, last), (0, 2));
+        let mut out = Vec::new();
+        for s in first..=last {
+            let (lo, hi) = stripe_slice_bounds(start, end, s, w, stripes[s].len());
+            out.extend_from_slice(&stripes[s][lo..hi]);
+        }
+        assert_eq!(out.len(), 150);
+        assert_eq!(&out[..20], &[1u8; 20]);
+        assert_eq!(&out[20..120], &[2u8; 100]);
+        assert_eq!(&out[120..150], &[3u8; 30]);
+    }
+
+    fn test_client_with_cache(shared_read_cache: SharedObjectMetadataCache) -> ObjectClient {
+        ObjectClient {
+            kms: KmsEndpointBalancer {
+                channels: Arc::new(Vec::new()),
+                next: Arc::new(AtomicUsize::new(0)),
+                grpc_max_message_bytes: DEFAULT_KMS_GRPC_MAX_MESSAGE_BYTES,
+            },
+            target_sessions: HashMap::new(),
+            target_session_pools: HashMap::new(),
+            shared_target_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            bucket_profiles: HashMap::new(),
+            shared_read_cache,
+            prepared_encoders: HashMap::new(),
+            shared_shard_freelists: None,
+            session_options: TargetSessionOptions::default(),
+            write_window_max_stripes: 1,
+            write_window_inflight_stripes: 1,
+            single_shot_commit: false,
+            decentralized: false,
+            fault_skip_commit: false,
+            write_inflight_limiter: Arc::new(AdaptiveWriteLimiter::new(1, 1)),
+            cluster_config_cache: None,
+            committer: None,
+        }
+    }
+
+    fn test_client() -> ObjectClient {
+        let options = ObjectClientOptions {
+            read_resolve_cache_ttl: Duration::from_secs(300),
+            read_payload_cache_max_entries: 4,
+            read_payload_cache_max_bytes: 8 * 1024 * 1024,
+            read_payload_cache_max_object_bytes: 2 * 1024 * 1024,
+            ..ObjectClientOptions::default()
+        };
+        test_client_with_cache(SharedObjectMetadataCache::new(&options))
+    }
+
+    fn test_manifest(version_id: &str, key: &str) -> ObjectVersionManifest {
+        ObjectVersionManifest {
+            version_id: version_id.to_string(),
+            namespace_id: "lab-ns".to_string(),
+            object_entry_id: format!("obj::{version_id}"),
+            bucket_entry_id: "bucket::lab-8p2".to_string(),
+            bucket_id: "lab-8p2".to_string(),
+            key: key.to_string(),
+            logical_length_bytes: 1024,
+            ec_profile_id: "lab-rs-8p2-1m".to_string(),
+            stripes: Vec::new(),
+        }
+    }
+
+    fn test_fragment_plan(endpoint: &str, stripe_index: u32, fragment_index: u32) -> FragmentPlan {
+        FragmentPlan {
+            fragment_index,
+            chunk_id: vec![fragment_index as u8; 32],
+            target_id: format!("target-{fragment_index}"),
+            endpoint: endpoint.to_string(),
+            granule_index: u64::from(fragment_index),
+            generation: 1,
+            stripe_index,
+        }
+    }
+
+    fn test_profile() -> EcProfile {
+        EcProfile {
+            id: "lab-rs-8p2-1m".to_string(),
+            codec_id: "rs".to_string(),
+            data_fragments: 8,
+            parity_fragments: 2,
+            fragment_bytes: 1024 * 1024,
+            failure_domain: FailureDomain::Node as i32,
+        }
+    }
+
+    #[test]
+    fn payload_cache_round_trips_small_object() {
+        let mut client = test_client();
+        let manifest = test_manifest("v1", "bench/object.bin");
+        let payload = vec![7_u8; 1024];
+        client.cache_payload_read(&manifest, &payload);
+        let cached = client.cached_payload_read(&manifest).expect("cache hit");
+        assert_eq!(cached, payload);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batched_read_missing_session_is_treated_as_missing_fragment() {
+        let target_sessions = Arc::new(HashMap::new());
+        let mut window_states = vec![WindowStripeReadState {
+            stripe_index: 0,
+            needed_data_fragments: 1,
+            fragments: vec![None],
+        }];
+        let read_plans = vec![BatchedTargetReadPlan {
+            endpoint: "http://127.0.0.1:18082".to_string(),
+            stripe_index: 0,
+            fragment_index: 0,
+            chunk_id: ChunkId([7; 32]),
+            payload_bytes: 1024,
+        }];
+
+        let result =
+            read_plans_batched_with_sessions(target_sessions, 0, &mut window_states, read_plans)
+                .await
+                .expect("missing target session should degrade, not fail");
+
+        assert_eq!(result.read_elapsed, Duration::ZERO);
+        assert!(window_states[0].fragments[0].is_none());
+    }
+
+    #[test]
+    fn payload_cache_invalidation_drops_all_versions_for_key() {
+        let mut client = test_client();
+        let payload = vec![9_u8; 1024];
+        let manifest_v1 = test_manifest("v1", "bench/object.bin");
+        let manifest_v2 = test_manifest("v2", "bench/object.bin");
+        client.cache_payload_read(&manifest_v1, &payload);
+        client.cache_payload_read(&manifest_v2, &payload);
+        client.invalidate_resolved_read("lab-8p2", "bench/object.bin");
+        assert!(client.cached_payload_read(&manifest_v1).is_none());
+        assert!(client.cached_payload_read(&manifest_v2).is_none());
+    }
+
+    #[test]
+    fn shared_resolve_cache_invalidation_reaches_other_clients() {
+        let options = ObjectClientOptions {
+            read_resolve_cache_ttl: Duration::from_secs(300),
+            ..ObjectClientOptions::default()
+        };
+        let shared_cache = SharedObjectMetadataCache::new(&options);
+        let mut writer = test_client_with_cache(shared_cache.clone());
+        let mut reader = test_client_with_cache(shared_cache);
+        let manifest = test_manifest("v1", "bench/object.bin");
+        writer.cache_resolved_read(manifest.clone(), test_profile());
+
+        assert!(reader
+            .cached_resolved_read("lab-8p2", "bench/object.bin")
+            .is_some());
+
+        writer.invalidate_resolved_read("lab-8p2", "bench/object.bin");
+
+        assert!(reader
+            .cached_resolved_read("lab-8p2", "bench/object.bin")
+            .is_none());
+    }
+
+    #[test]
+    fn endpoint_write_batches_split_at_packed_payload_ceiling() {
+        let prepared_batch = vec![PreparedStripeWrite {
+            stripe_index: 0,
+            plans: (0..17)
+                .map(|fragment_index| test_fragment_plan("http://tiny-target-zero.example", 0, fragment_index))
+                .collect(),
+            fragments: (0..17).map(|_| vec![7_u8; 1024 * 1024]).collect(),
+        }];
+
+        let batches = build_endpoint_write_batches("intent-1", 0, 0, &prepared_batch).unwrap();
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 16);
+        assert_eq!(batches[1].len(), 1);
+        assert!(batches
+            .iter()
+            .all(|batch| batch.iter().all(|entry| entry.endpoint == "http://tiny-target-zero.example")));
+    }
+
+    #[test]
+    fn endpoint_write_batches_do_not_mix_targets() {
+        let prepared_batch = vec![PreparedStripeWrite {
+            stripe_index: 0,
+            plans: vec![
+                test_fragment_plan("http://tiny-target-zero.example", 0, 0),
+                test_fragment_plan("http://tiny-target-one.example", 0, 1),
+            ],
+            fragments: vec![vec![1_u8; 1024], vec![2_u8; 1024]],
+        }];
+
+        let mut batches = build_endpoint_write_batches("intent-2", 0, 0, &prepared_batch).unwrap();
+        batches.sort_by(|left, right| left[0].endpoint.cmp(&right[0].endpoint));
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[1].len(), 1);
+        assert_ne!(batches[0][0].endpoint, batches[1][0].endpoint);
+    }
+
+    #[test]
+    fn endpoint_read_batches_split_at_packed_payload_ceiling() {
+        let plans = (0..17)
+            .map(|fragment_index| BatchedTargetReadPlan {
+                endpoint: "http://tiny-target-zero.example".to_string(),
+                stripe_index: 0,
+                fragment_index,
+                chunk_id: ChunkId([fragment_index as u8; 32]),
+                payload_bytes: 1024 * 1024,
+            })
+            .collect::<Vec<_>>();
+
+        let batches = build_endpoint_read_batches(plans);
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 16);
+        assert_eq!(batches[1].len(), 1);
+        assert!(batches
+            .iter()
+            .all(|batch| batch.iter().all(|entry| entry.endpoint == "http://tiny-target-zero.example")));
+    }
+
+    #[test]
+    fn endpoint_read_batches_do_not_mix_targets() {
+        let mut batches = build_endpoint_read_batches(vec![
+            BatchedTargetReadPlan {
+                endpoint: "http://tiny-target-zero.example".to_string(),
+                stripe_index: 0,
+                fragment_index: 0,
+                chunk_id: ChunkId([0_u8; 32]),
+                payload_bytes: 1024,
+            },
+            BatchedTargetReadPlan {
+                endpoint: "http://tiny-target-one.example".to_string(),
+                stripe_index: 0,
+                fragment_index: 1,
+                chunk_id: ChunkId([1_u8; 32]),
+                payload_bytes: 1024,
+            },
+        ]);
+        batches.sort_by(|left, right| left[0].endpoint.cmp(&right[0].endpoint));
+
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[1].len(), 1);
+        assert_ne!(batches[0][0].endpoint, batches[1][0].endpoint);
+    }
+
+    fn test_shard_pool() -> ShardPool {
+        let kee_profile = kee_profile_from_control(&test_profile()).expect("kee profile");
+        let engine = KeeEngine::new(kee_profile).expect("kee engine");
+        let plan = engine.prepared_plan().expect("prepared plan");
+        ShardPool::new(plan, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    #[test]
+    fn shard_pool_recycles_returned_buffers() {
+        let pool = test_shard_pool();
+        // Empty pool allocates fresh buffers.
+        let shards = pool.take_shards();
+        assert_eq!(shards.len(), 10); // 8 data + 2 parity fragment slots
+        assert_eq!(pool.reusable_shards.lock().unwrap().len(), 0);
+        pool.return_shards(shards);
+        assert_eq!(pool.reusable_shards.lock().unwrap().len(), 1);
+        // The next take pops the recycled set rather than allocating another.
+        let _recycled = pool.take_shards();
+        assert_eq!(pool.reusable_shards.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn shard_pool_is_shared_across_clones_and_threads() {
+        let pool = test_shard_pool();
+        // Pre-seed two recyclable buffer sets (take both first, then return both, so
+        // the second take cannot just pop the set the first one returned).
+        let first = pool.take_shards();
+        let second = pool.take_shards();
+        pool.return_shards(first);
+        pool.return_shards(second);
+        assert_eq!(pool.reusable_shards.lock().unwrap().len(), 2);
+
+        // Clones observe the same backing pool (Arc<Mutex<..>>); concurrent takes and
+        // returns from worker threads keep the recycling accounting consistent.
+        let handles = (0..8)
+            .map(|_| {
+                let pool = pool.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..64 {
+                        let shards = pool.take_shards();
+                        pool.return_shards(shards);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("worker thread");
+        }
+        // No buffers leaked or duplicated: at least the two seeded sets remain, and the
+        // pool never panicked on a poisoned lock.
+        assert!(pool.reusable_shards.lock().unwrap().len() >= 2);
+    }
+
+    #[test]
+    fn shard_pool_is_bounded_plateau_across_many_puts() {
+        // Regression guard for the 2026-06 write-pipeline RAM audit. The audit
+        // ruled the ShardPool free-list OUT as the source of the ~380 MiB/put RSS
+        // growth: take_shards (one per stripe) and return_prepared_shards (one per
+        // stripe on the happy path, and on every abort/retry branch) are exactly
+        // balanced, so the free-list is a hard PLATEAU, not a monotonic grower.
+        // A single take+return cycle is the steady-state shape of one stripe's
+        // lifecycle; repeating it thousands of times must keep the free-list at
+        // that plateau. An unbounded climb here would be a genuine pool leak (a
+        // take without a matching return, or a double-return) — exactly what the
+        // audit traced every path to exclude.
+        let pool = test_shard_pool();
+        let frag_bytes = pool.plan.profile().fragment_bytes;
+        for _ in 0..1000 {
+            let shards = pool.take_shards();
+            assert_eq!(shards.len(), 10); // 8 data + 2 parity slots
+            // Recycled buffers come back INTACT at full fragment capacity, so a
+            // reused set never carries per-put growth in its buffer sizes.
+            for shard in &shards {
+                assert_eq!(shard.len(), frag_bytes);
+            }
+            pool.return_shards(shards);
+            // After each balanced cycle the free-list holds exactly the set just
+            // returned — a plateau independent of iteration count.
+            assert!(
+                pool.reusable_shards.lock().unwrap().len() <= 1,
+                "ShardPool free-list grew unbounded across puts => pool leak"
+            );
+        }
+        assert_eq!(pool.reusable_shards.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn build_endpoint_write_batches_preserves_pooled_originals() {
+        // build_endpoint_write_batches CLONES each fragment into the per-endpoint
+        // request so the pooled originals survive the network write for the
+        // failure-retry path (which re-reads stripe_result.prepared.fragments).
+        // This guards that contract: building batches must NOT drain/empty the
+        // source fragments. A future move/Arc-based churn-reduction fix (deleting
+        // the clone) must consciously update this expectation.
+        let prepared_batch = vec![PreparedStripeWrite {
+            stripe_index: 0,
+            plans: (0..10)
+                .map(|fragment_index| test_fragment_plan("http://tiny-target-zero.example", 0, fragment_index))
+                .collect(),
+            fragments: (0..10).map(|i| vec![i as u8; 4096]).collect(),
+        }];
+        let before: Vec<usize> = prepared_batch
+            .iter()
+            .flat_map(|stripe| stripe.fragments.iter().map(|fragment| fragment.len()))
+            .collect();
+
+        let batches = build_endpoint_write_batches("intent-x", 0, 0, &prepared_batch).unwrap();
+
+        let after: Vec<usize> = prepared_batch
+            .iter()
+            .flat_map(|stripe| stripe.fragments.iter().map(|fragment| fragment.len()))
+            .collect();
+        assert_eq!(
+            before, after,
+            "build must not drain pooled originals (the retry path needs them)"
+        );
+        // All 10 fragments route to the single endpoint (one batch, 10 entries).
+        let routed: usize = batches.iter().map(|batch| batch.len()).sum();
+        assert_eq!(routed, 10);
+    }
+
+    #[test]
+    fn shard_pool_free_list_is_capped() {
+        // A burst of concurrent takes larger than the cap, all returned, must
+        // leave the free-list bounded at SHARD_POOL_FREELIST_CAP — the overflow
+        // is dropped/freed. This is the 2026-06 write-RAM leak guard: without the
+        // cap the (shared) free-list would retain every buffer ever taken.
+        let pool = test_shard_pool();
+        let burst: Vec<_> = (0..SHARD_POOL_FREELIST_CAP + 8)
+            .map(|_| pool.take_shards())
+            .collect();
+        for set in burst {
+            pool.return_shards(set);
+        }
+        assert_eq!(
+            pool.reusable_shards.lock().unwrap().len(),
+            SHARD_POOL_FREELIST_CAP
+        );
+    }
+
+    #[test]
+    fn shared_free_list_recycles_across_pools() {
+        // Two ShardPools sharing one free-list (as kfc-core's write-client pool
+        // does) recycle each other's returned buffers instead of each allocating
+        // its own — the fix for per-client retention multiplying by pool size.
+        let shared = Arc::new(Mutex::new(Vec::new()));
+        let plan = {
+            let kee_profile = kee_profile_from_control(&test_profile()).expect("kee profile");
+            KeeEngine::new(kee_profile)
+                .expect("kee engine")
+                .prepared_plan()
+                .expect("prepared plan")
+        };
+        let pool_a = ShardPool::new(plan.clone(), Arc::clone(&shared));
+        let pool_b = ShardPool::new(plan, Arc::clone(&shared));
+        let set = pool_a.take_shards();
+        pool_a.return_shards(set);
+        assert_eq!(shared.lock().unwrap().len(), 1);
+        // pool_b pops the set pool_a returned (shared recycling), not a fresh alloc.
+        let _reused = pool_b.take_shards();
+        assert_eq!(shared.lock().unwrap().len(), 0);
+    }
+
+    fn encode_test_plans(stripe_count: u32, endpoint: &str) -> Vec<FragmentPlan> {
+        (0..stripe_count)
+            .flat_map(|stripe_index| {
+                (0..10).map(move |fragment_index| {
+                    test_fragment_plan(endpoint, stripe_index, fragment_index)
+                })
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn encode_stripe_batch_preserves_stripe_order_and_recycles_via_pool() {
+        let pool = test_shard_pool();
+        let profile = test_profile();
+        let stripe_logical = stripe_logical_bytes(&profile).expect("stripe logical bytes");
+        let stripe_count = 4_u32;
+        let window_plans = encode_test_plans(stripe_count, "http://tiny-target-zero.example");
+        let logical_length = stripe_logical * stripe_count as usize;
+
+        // The read closure stamps each stripe's payload with its index so we can verify
+        // the encoded batch comes back ordered by ascending stripe index regardless of
+        // the order the blocking encode workers complete in.
+        let mut read_calls = Vec::new();
+        let mut read_range = |offset: u64, len: usize| -> Result<Vec<u8>, ObjectError> {
+            let stripe_index = (offset as usize / stripe_logical) as u8;
+            read_calls.push(stripe_index);
+            Ok(vec![stripe_index; len])
+        };
+
+        let encoded = encode_stripe_batch(
+            pool.clone(),
+            &window_plans,
+            0,
+            0,
+            stripe_count as usize,
+            logical_length,
+            stripe_logical,
+            &mut read_range,
+        )
+        .await
+        .expect("encode batch");
+
+        assert_eq!(encoded.prepared_batch.len(), stripe_count as usize);
+        let returned_order: Vec<u32> = encoded
+            .prepared_batch
+            .iter()
+            .map(|stripe| stripe.stripe_index)
+            .collect();
+        assert_eq!(returned_order, vec![0, 1, 2, 3]);
+        assert_eq!(read_calls, vec![0, 1, 2, 3]);
+        for stripe in &encoded.prepared_batch {
+            assert_eq!(stripe.fragments.len(), 10);
+            assert!(stripe.plans.iter().all(|plan| plan.stripe_index == stripe.stripe_index));
+        }
+
+        // Recycle the encoded shard buffers back into the shared pool, as the write
+        // loop does after the network writes complete, and confirm they are reusable.
+        let before = pool.reusable_shards.lock().unwrap().len();
+        for stripe in encoded.prepared_batch {
+            pool.return_shards(stripe.fragments);
+        }
+        assert_eq!(
+            pool.reusable_shards.lock().unwrap().len(),
+            before + stripe_count as usize
+        );
+    }
+
+    #[tokio::test]
+    async fn encode_stripe_batch_matches_direct_encode_bytes() {
+        // The pipelined off-runtime encode must produce byte-identical fragments to a
+        // direct in-line encode of the same payload.
+        let pool = test_shard_pool();
+        let profile = test_profile();
+        let stripe_logical = stripe_logical_bytes(&profile).expect("stripe logical bytes");
+        let window_plans = encode_test_plans(1, "http://tiny-target-zero.example");
+
+        let payload: Vec<u8> = (0..stripe_logical).map(|i| (i % 251) as u8).collect();
+        let mut read_range = {
+            let payload = payload.clone();
+            move |_offset: u64, len: usize| -> Result<Vec<u8>, ObjectError> {
+                Ok(payload[..len].to_vec())
+            }
+        };
+
+        let encoded = encode_stripe_batch(
+            pool.clone(),
+            &window_plans,
+            0,
+            0,
+            1,
+            stripe_logical,
+            stripe_logical,
+            &mut read_range,
+        )
+        .await
+        .expect("encode batch");
+
+        let mut expected = pool.plan.allocate_output_buffers();
+        pool.plan
+            .encode_into(&payload, &mut expected)
+            .expect("direct encode");
+        assert_eq!(encoded.prepared_batch[0].fragments, expected);
+    }
+
+    // ---- KP2 429 backpressure: backoff + adaptive-limit math ----
+
+    fn rate_limited_failure(retry_after_ms: Option<u64>) -> FragmentWriteFailure {
+        FragmentWriteFailure::new(
+            0,
+            0,
+            "rate limited".to_string(),
+            RateLimitSignal {
+                rate_limited: true,
+                retry_after_ms,
+                limit_max_inflight: None,
+            },
+        )
+    }
+
+    #[test]
+    fn retry_backoff_falls_back_to_exponential_when_no_429() {
+        let fallback = Duration::from_millis(50);
+        let ceiling = Duration::from_secs(3);
+        // Plain (non-429) failure: backoff is fallback << attempt.
+        let plain = vec![FragmentWriteFailure::plain(0, 0, "boom".to_string())];
+        assert_eq!(
+            compute_retry_backoff(&plain, 0, fallback, ceiling),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            compute_retry_backoff(&plain, 1, fallback, ceiling),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            compute_retry_backoff(&plain, 2, fallback, ceiling),
+            Duration::from_millis(200)
+        );
+        // Exponential growth saturates at the ceiling, never beyond.
+        assert_eq!(
+            compute_retry_backoff(&plain, 30, fallback, ceiling),
+            ceiling
+        );
+        // Empty batch behaves like the no-429 fallback path.
+        assert_eq!(
+            compute_retry_backoff(&[], 0, fallback, ceiling),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn retry_backoff_honors_max_retry_after_clamped() {
+        let fallback = Duration::from_millis(50);
+        let ceiling = Duration::from_secs(3);
+        // Takes the MAX retry-after across rate-limited failures (250 > 100).
+        let failures = vec![
+            rate_limited_failure(Some(100)),
+            rate_limited_failure(Some(250)),
+            // A plain failure in the mix is ignored by the 429 path.
+            FragmentWriteFailure::plain(0, 0, "boom".to_string()),
+        ];
+        assert_eq!(
+            compute_retry_backoff(&failures, 0, fallback, ceiling),
+            Duration::from_millis(250)
+        );
+        // A huge retry-after is clamped to the ceiling.
+        let absurd = vec![rate_limited_failure(Some(60_000))];
+        assert_eq!(compute_retry_backoff(&absurd, 0, fallback, ceiling), ceiling);
+        // 429 without a retry-after header falls through to the fallback (not 0).
+        let no_header = vec![rate_limited_failure(None)];
+        assert_eq!(
+            compute_retry_backoff(&no_header, 0, fallback, ceiling),
+            Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn adaptive_inflight_shrinks_on_429() {
+        // Advertised ceiling pulls the limit down to it.
+        assert_eq!(adaptive_inflight_after_429(16, 16, Some(4)), 4);
+        // Advertised >= current does not grow the live limit here.
+        assert_eq!(adaptive_inflight_after_429(8, 16, Some(12)), 8);
+        // No advertised ceiling => multiplicative halving.
+        assert_eq!(adaptive_inflight_after_429(16, 16, None), 8);
+        assert_eq!(adaptive_inflight_after_429(8, 16, None), 4);
+        // Floor is always >= 1, never 0.
+        assert_eq!(adaptive_inflight_after_429(1, 16, None), 1);
+        assert_eq!(adaptive_inflight_after_429(2, 16, Some(0)), 1);
+        assert_eq!(adaptive_inflight_after_429(1, 16, Some(0)), 1);
+    }
+
+    #[test]
+    fn adaptive_inflight_recovers_additively_to_max() {
+        // Additive increase by `step`, capped at the configured max.
+        assert_eq!(adaptive_inflight_after_success(4, 16, 1), 5);
+        assert_eq!(adaptive_inflight_after_success(15, 16, 1), 16);
+        assert_eq!(adaptive_inflight_after_success(16, 16, 1), 16);
+        // Larger step is clamped at max, never overshoots.
+        assert_eq!(adaptive_inflight_after_success(14, 16, 4), 16);
+        // Floor invariant holds even with a zero-ish max.
+        assert_eq!(adaptive_inflight_after_success(1, 1, 1), 1);
+    }
+
+    #[test]
+    fn adaptive_limiter_shrinks_then_recovers_without_deadlock() {
+        let limiter = AdaptiveWriteLimiter::new(8, 8);
+        assert_eq!(limiter.current_limit(), 8);
+        assert_eq!(limiter.semaphore.available_permits(), 8);
+
+        // A 429 advertising max-in-flight 2 shrinks the gate to 2.
+        limiter.note_rate_limited(Some(2));
+        assert_eq!(limiter.current_limit(), 2);
+        assert_eq!(limiter.semaphore.available_permits(), 2);
+
+        // Shrinking never forgets more permits than are available: even an
+        // aggressive shrink leaves at least one permit so the gate cannot wedge.
+        limiter.note_rate_limited(Some(1));
+        assert_eq!(limiter.current_limit(), 1);
+        assert_eq!(limiter.semaphore.available_permits(), 1);
+
+        // Sustained success additively recovers toward the configured max (8).
+        for _ in 0..100 {
+            limiter.note_success();
+        }
+        assert_eq!(limiter.current_limit(), 8);
+        assert_eq!(limiter.semaphore.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn adaptive_limiter_shrink_does_not_lose_held_permits() {
+        let limiter = Arc::new(AdaptiveWriteLimiter::new(4, 4));
+        // Hold two permits (as in-flight tasks would).
+        let held_a = limiter.acquire().await;
+        let held_b = limiter.acquire().await;
+        assert_eq!(limiter.semaphore.available_permits(), 2);
+
+        // Shrink toward 1 while two permits are checked out: only the 2 available
+        // permits can be forgotten immediately, so 1 unit of shrink becomes debt.
+        limiter.note_rate_limited(Some(1));
+        assert_eq!(limiter.current_limit(), 1);
+        assert_eq!(limiter.semaphore.available_permits(), 0);
+
+        // Releasing held permits returns them to the pool (held permits are never
+        // lost), temporarily overshooting the shrunken ceiling.
+        drop(held_a);
+        drop(held_b);
+        assert_eq!(limiter.semaphore.available_permits(), 2);
+
+        // The next acquire reconciles: it pays down the 1-unit debt before taking
+        // its own permit, so the effective ceiling settles back at the target (1).
+        let reconciled = limiter.acquire().await;
+        // One forgotten for the debt, one held by `reconciled` => 0 available.
+        assert_eq!(limiter.semaphore.available_permits(), 0);
+        drop(reconciled);
+        // Now exactly `target` (1) permit is available — ceiling honored, no deadlock.
+        assert_eq!(limiter.semaphore.available_permits(), 1);
+        assert_eq!(limiter.current_limit(), 1);
+    }
+}

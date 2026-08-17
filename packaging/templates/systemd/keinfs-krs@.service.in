@@ -1,0 +1,20 @@
+[Unit]
+Description=KeInFS Rebuild Service %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{SERVICE_USER}}
+Group={{SERVICE_GROUP}}
+PermissionsStartOnly=true
+ExecStartPre=/usr/bin/install -d -o {{SERVICE_USER}} -g {{SERVICE_GROUP}} {{RUNSTATEDIR}}/keinfs/krs
+ExecStart={{BINDIR}}/krs --config {{SYSCONFDIR}}/keinfs/krs/%i.toml
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=1048576
+NoNewPrivileges=true
+WorkingDirectory={{LOCALSTATEDIR}}/lib
+
+[Install]
+WantedBy=multi-user.target

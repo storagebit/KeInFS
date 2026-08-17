@@ -1,0 +1,624 @@
+{
+  "uid": "keinfs-kms-detail",
+  "title": "KeInFS — KMS Metadata Service Detail",
+  "tags": ["keinfs", "kms", "detail"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "15s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "DS_PROMETHEUS", "type": "datasource", "query": "prometheus", "current": { "text": "Prometheus", "value": "keinfs-prom" } },
+      {
+        "name": "shard", "label": "KMS Shard", "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(keinfs_kms_up, shard)",
+        "refresh": 2, "includeAll": true, "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "instance", "label": "Instance", "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(keinfs_kms_up{shard=~\"$shard\"}, instance)",
+        "refresh": 2, "includeAll": true, "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "name": "Annotations & Alerts",
+        "type": "dashboard",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" }
+      },
+      {
+        "name": "Notes",
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": false,
+        "iconColor": "yellow",
+        "type": "dashboard",
+        "tags": ["keinfs"]
+      }
+    ]
+  },
+  "links": [
+    { "title": "Lifecycle Overview", "type": "link", "url": "/d/keinfs-io-lifecycle", "icon": "external link", "tooltip": "Top-of-funnel throughput + WRITE/READ lifecycle" },
+    { "title": "Lifecycle Drill-Down", "type": "link", "url": "/d/keinfs-io-drilldown", "icon": "external link", "tooltip": "Per-phase deep dive across services" },
+    { "title": "KST", "type": "dashboards", "tags": ["kst"], "asDropdown": true, "icon": "external link" },
+    { "title": "KIX", "type": "dashboards", "tags": ["kix"], "asDropdown": true, "icon": "external link" }
+  ],
+  "panels": [
+    {
+      "type": "row", "title": "KMS Health & Vitals (current path)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }, "collapsed": false
+    },
+    {
+      "type": "stat", "title": "Shards Up",
+      "description": "KMS instances reporting `up` for the selected shard(s). Healthy = the full expected instance count; red at 0 means the metadata authority for that namespace shard is offline.",
+      "gridPos": { "h": 4, "w": 3, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value", "justifyMode": "center" },
+      "targets": [ { "expr": "count(keinfs_kms_up{shard=~\"$shard\",instance=~\"$instance\"} == 1) or vector(0)", "refId": "A", "legendFormat": "up" } ]
+    },
+    {
+      "type": "stat", "title": "Total Errors (cumulative)",
+      "description": "Cumulative KMS RPC errors since process start for the selection. Healthy = 0 (green); any non-zero turns red — see the Object RPC Totals row to pin the failing rpc.",
+      "gridPos": { "h": 4, "w": 3, "x": 3, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "textMode": "value", "justifyMode": "center" },
+      "targets": [ { "expr": "sum(keinfs_kms_total_errors{shard=~\"$shard\",instance=~\"$instance\"})", "refId": "A", "legendFormat": "errors" } ]
+    },
+    {
+      "type": "stat", "title": "BeginObject rate (ops/s)",
+      "description": "Current-path merged-begin RPC rate — the front door of every decentralized object write. This should track the client PUT rate; if it is zero while writes flow, traffic is going through the legacy window path (see the collapsed legacy row).",
+      "gridPos": { "h": 4, "w": 4, "x": 6, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "decimals": 1, "color": { "mode": "fixed", "fixedColor": "blue" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value", "justifyMode": "center" },
+      "targets": [ { "expr": "sum(rate(keinfs_kms_begin_object_requests{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "A", "legendFormat": "begin/s" } ]
+    },
+    {
+      "type": "stat", "title": "Commit rate — all flavors (ops/s)",
+      "description": "Combined rate of the three current-path commit RPCs (commit_object + commit_object_segmented + multi_commit_object). In steady state commits ≈ begins; a persistent gap means writes are being abandoned between begin and commit (watch write leases reaped).",
+      "gridPos": { "h": 4, "w": 4, "x": 10, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "ops", "decimals": 1, "color": { "mode": "fixed", "fixedColor": "green" } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value", "justifyMode": "center" },
+      "targets": [ { "expr": "sum(rate(keinfs_kms_rpc_requests_total{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"commit_object|commit_object_segmented|multi_commit_object\"}[$__rate_interval]))", "refId": "A", "legendFormat": "commits/s" } ]
+    },
+    {
+      "type": "stat", "title": "Commit fence rejects (cumulative)",
+      "description": "Commits rejected because the object version was already reclaimed by the orphan-version reaper (keinfs_kms_commit_rejected_version_reclaimed). Must be 0 — any non-zero means a slow writer raced the reaper; pair with keinfs_kst_committed_slot_write_rejections on the KST side.",
+      "gridPos": { "h": 4, "w": 4, "x": 14, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value", "justifyMode": "center" },
+      "targets": [ { "expr": "sum(keinfs_kms_commit_rejected_version_reclaimed{shard=~\"$shard\",instance=~\"$instance\"})", "refId": "A", "legendFormat": "fence rejects" } ]
+    },
+    {
+      "type": "stat", "title": "Write leases reaped (cumulative)",
+      "description": "Current-era write leases reclaimed by the sweeper because the client never committed or renewed (the successor of the legacy expired-write-intents counter). A few are normal churn; steady growth means clients abandon writes after BeginObject.",
+      "gridPos": { "h": 4, "w": 3, "x": 18, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value", "justifyMode": "center" },
+      "targets": [ { "expr": "sum(keinfs_kms_write_leases_reaped{shard=~\"$shard\",instance=~\"$instance\"})", "refId": "A", "legendFormat": "reaped" } ]
+    },
+    {
+      "type": "stat", "title": "Orphan-version backlog",
+      "description": "Live gauge of orphaned object versions awaiting the orphan-version reaper. Should hover near 0; sustained growth means reclaim is falling behind write churn and space is leaking until the reaper catches up.",
+      "gridPos": { "h": 4, "w": 3, "x": 21, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "area", "textMode": "value", "justifyMode": "center" },
+      "targets": [ { "expr": "sum(keinfs_kms_orphan_version_backlog{shard=~\"$shard\",instance=~\"$instance\"})", "refId": "A", "legendFormat": "backlog" } ]
+    },
+
+    {
+      "type": "row", "title": "Current write path — BeginObject (merged begin, one txn)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }
+    },
+    {
+      "type": "timeseries", "title": "BeginObject request & error rate (ops/s)",
+      "description": "Rate of begin_object requests and errors. This is the single pre-data control RPC of the decentralized write path (bucket/profile resolve + computed placement + lease, one FDB txn). Errors should be flat zero; the request rate is the object-write admission rate.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 10, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "ops/s" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "errors/s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_begin_object_requests{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "A", "legendFormat": "begin_object/s" },
+        { "expr": "sum(rate(keinfs_kms_rpc_errors_total{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\"}[$__rate_interval]))", "refId": "B", "legendFormat": "errors/s" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "BeginObject RPC latency (µs) — p50 / p99 / max (pow2-bucketed approx)",
+      "description": "End-to-end begin_object latency. p50/p99 are pow2-bucketed approximations (quantized to power-of-2 steps); max (quantile=1.0) is exact. This RPC bounds the client's control-setup wall before any data moves — if it climbs, check the phase breakdown below to see whether FDB (store_begin_resolved) or a cold cache is at fault.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 6, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "max(keinfs_kms_rpc_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",quantile=\"0.5\"})", "refId": "A", "legendFormat": "p50 (pow2 approx)" },
+        { "expr": "max(keinfs_kms_rpc_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "p99 (pow2 approx)" },
+        { "expr": "max(keinfs_kms_rpc_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",quantile=\"1.0\"})", "refId": "C", "legendFormat": "max" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "BeginObject phase latency p99 (µs) — decode → resolve → route → store (pow2-bucketed approx)",
+      "description": "Full p99 decomposition of the begin_object handler: request decode, bucket-context load, key normalize, profile select/validate, storage-class routing (write_profile_class_route = the small-object→replicated-profile decision), object-parent resolution, and the FDB-backed store_begin_resolved txn. Healthy: everything except store_begin_resolved sits at single-digit µs; store_begin_resolved (the one FDB txn) dominates. p99 values are pow2-bucketed approximations.",
+      "gridPos": { "h": 10, "w": 16, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 1, "fillOpacity": 4, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99, pow2 approx)" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"request_decode\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "request_decode" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"bucket_context_load\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "bucket_context_load" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"key_normalize\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "key_normalize" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"profile_select\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "profile_select" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"profile_validate\",quantile=\"0.99\"})", "refId": "E", "legendFormat": "profile_validate" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"write_profile_class_route\",quantile=\"0.99\"})", "refId": "F", "legendFormat": "write_profile_class_route" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=~\"object_parent_root_fast_path|object_parent_cache_hit|object_parent_cache_miss\",quantile=\"0.99\"})", "refId": "G", "legendFormat": "object_parent (fast/hit/miss max)" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"store_begin_resolved\",quantile=\"0.99\"})", "refId": "H", "legendFormat": "store_begin_resolved (FDB txn)" }
+      ]
+    },
+    {
+      "type": "bargauge", "title": "BeginObject phase budget (last p99, µs, pow2-bucketed approx)",
+      "description": "Where the p99 µs of a begin_object call go right now. Healthy: the store_begin_resolved bar (the single FDB txn) is the only one of consequence; any other bar growing past tens of µs means a cache or resolution step regressed.",
+      "gridPos": { "h": 10, "w": 8, "x": 16, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "µs", "decimals": 0, "min": 0, "color": { "mode": "continuous-GrYlRd" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 50 }, { "color": "red", "value": 5000 } ] } } },
+      "options": { "displayMode": "gradient", "orientation": "horizontal", "valueMode": "color", "reduceOptions": { "calcs": ["lastNotNull"] }, "showUnfilled": true },
+      "targets": [
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"request_decode\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "request_decode" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"bucket_context_load\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "bucket_context_load" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"profile_select\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "profile_select" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"write_profile_class_route\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "write_profile_class_route" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"begin_object\",phase=\"store_begin_resolved\",quantile=\"0.99\"})", "refId": "E", "legendFormat": "store_begin_resolved (FDB)" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Metadata Caches — bucket-context / ec-profile-catalog / object-parent (p99 µs)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 25 }
+    },
+    {
+      "type": "timeseries", "title": "Metadata-cache phase latency p99 (µs) — hit vs miss vs load (pow2-bucketed approx)",
+      "description": "The begin-path metadata caches: bucket-context, ec-profile-catalog, and object-parent, each showing hit, miss, and (where present) load. Filter covers both rpc generations (begin_object current, initiate_object_write legacy) so the panel works whichever pipeline serves traffic. Healthy = hit phases at ~1µs and miss/load phases idle; a busy miss/load line means a cache is cold or thrashing on a hot bucket/profile.",
+      "gridPos": { "h": 10, "w": 16, "x": 0, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 1, "fillOpacity": 4, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99, pow2 approx)" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"bucket_context_cache_hit\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "bucket_context_cache_hit" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"bucket_context_cache_miss\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "bucket_context_cache_miss" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"bucket_context_load\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "bucket_context_load" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"ec_profile_catalog_cache_hit\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "ec_profile_catalog_cache_hit" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"ec_profile_catalog_cache_miss\",quantile=\"0.99\"})", "refId": "E", "legendFormat": "ec_profile_catalog_cache_miss" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"object_parent_cache_hit\",quantile=\"0.99\"})", "refId": "F", "legendFormat": "object_parent_cache_hit" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"object_parent_cache_miss\",quantile=\"0.99\"})", "refId": "G", "legendFormat": "object_parent_cache_miss" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Key / profile resolution phase latency p99 (µs, pow2-bucketed approx)",
+      "description": "Per-request resolution steps on the begin path: key normalize, profile select/validate, the cached EC-profile list, and the storage-class routing outcomes (write_profile_default vs write_profile_alternate = small-object replicated route). Filter covers both rpc generations. All should be sub-µs to a few µs; a climbing profile_validate suggests an expensive EC-profile binding check.",
+      "gridPos": { "h": 10, "w": 8, "x": 16, "y": 26 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 1, "fillOpacity": 4, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99, pow2 approx)" } }
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"key_normalize\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "key_normalize" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"profile_select\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "profile_select" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"profile_validate\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "profile_validate" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"store_list_ec_profiles_cached\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "store_list_ec_profiles_cached" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"write_profile_default\",quantile=\"0.99\"})", "refId": "E", "legendFormat": "write_profile_default" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|initiate_object_write\",phase=\"write_profile_alternate\",quantile=\"0.99\"})", "refId": "F", "legendFormat": "write_profile_alternate (replicated route)" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Current write path — Commit family (commit_object / commit_object_segmented / multi_commit_object)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 }
+    },
+    {
+      "type": "timeseries", "title": "Commit request rate by flavor (ops/s)",
+      "description": "Per-flavor commit rate: commit_object (single-shot small objects), commit_object_segmented (streamed large objects, long-lived), multi_commit_object (batched cross-object flush). The mix tells you the workload shape — a shift from single-shot to segmented means object sizes grew past the single-txn threshold.",
+      "gridPos": { "h": 9, "w": 8, "x": 0, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 10, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "ops/s" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_requests_total{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"commit_object|commit_object_segmented|multi_commit_object\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{rpc}}" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Commit latency p99 by flavor (µs, pow2-bucketed approx)",
+      "description": "Per-flavor commit p99. Do NOT read these on one mental scale: single-shot commit_object is µs-to-ms, while commit_object_segmented spans the whole streamed upload (can be minutes by design) — compare each flavor only against its own history. Values are pow2-bucketed approximations.",
+      "gridPos": { "h": 9, "w": 8, "x": 8, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 6, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99, pow2 approx)", "scaleDistribution": { "type": "log", "log": 10 } } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "max by (rpc) (keinfs_kms_rpc_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"commit_object|commit_object_segmented|multi_commit_object\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "{{rpc}} p99" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Commit store-phase latency p99 (µs) — single-shot / multi / segmented internals (pow2-bucketed approx)",
+      "description": "The FDB-backed store phases that separate the commit flavors internally: store_commit_object_single_shot (one txn), store_multi_commit_object (batched flush), and append_manifest_segments + seal_object (the segmented stream's per-append and final-seal txns). This is the true metadata-durability cost of each flavor; on a healthy FDB these sit in the low-ms range.",
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 1, "fillOpacity": 4, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99, pow2 approx)" } }
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"commit_object|commit_object_segmented|multi_commit_object\",phase=\"store_commit_object_single_shot\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "store_commit_object_single_shot" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"commit_object|commit_object_segmented|multi_commit_object\",phase=\"store_multi_commit_object\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "store_multi_commit_object" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"commit_object|commit_object_segmented|multi_commit_object\",phase=\"append_manifest_segments\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "append_manifest_segments" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"commit_object|commit_object_segmented|multi_commit_object\",phase=\"seal_object\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "seal_object" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"commit_object|commit_object_segmented|multi_commit_object\",phase=\"request_decode\",quantile=\"0.99\"})", "refId": "E", "legendFormat": "request_decode" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Read path — resolve read-cache & route cache", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 46 }
+    },
+    {
+      "type": "timeseries", "title": "Read-cache phase latency p99 (µs) — hit / miss / store (pow2-bucketed approx)",
+      "description": "The resolve_object_read fast path: read_cache_hit should carry nearly all traffic at ~1µs; read_cache_miss + read_cache_store light up on cold objects and after invalidations. The invalidate_* phases (event-driven, matched by phase name since they are not tied to the resolve rpc) show invalidation churn — writes to hot objects. A miss-dominated picture means invalidation churn or a too-small read cache.",
+      "gridPos": { "h": 9, "w": 8, "x": 0, "y": 47 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 1, "fillOpacity": 4, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99, pow2 approx)" } }
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"resolve_object_read\",phase=\"read_cache_hit\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "read_cache_hit" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"resolve_object_read\",phase=\"read_cache_miss\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "read_cache_miss" },
+        { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"resolve_object_read\",phase=\"read_cache_store\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "read_cache_store" },
+        { "expr": "max by (phase) (keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",phase=~\"read_cache_invalidate_all|read_cache_invalidate_namespace|read_cache_invalidate_object\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "{{phase}}" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Read resolve request rate (ops/s)",
+      "description": "Read-resolve demand: resolve_object_read (full resolve) vs resolve_object_head (the decentralized head-only resolve). Together this is the KMS-side read-metadata load; resolve rate well below client GET rate means the KSC-side resolve cache is absorbing reads.",
+      "gridPos": { "h": 9, "w": 8, "x": 8, "y": 47 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "decimals": 2, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 10, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "ops/s" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_rpc_requests_total{shard=~\"$shard\",instance=~\"$instance\",rpc=\"resolve_object_read\"}[$__rate_interval]))", "refId": "A", "legendFormat": "resolve_object_read/s" },
+        { "expr": "sum(rate(keinfs_kms_rpc_requests_total{shard=~\"$shard\",instance=~\"$instance\",rpc=\"resolve_object_head\"}[$__rate_interval]))", "refId": "B", "legendFormat": "resolve_object_head/s" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Route cache & discovery activity (per-second)",
+      "description": "Route-cache hits/misses and the route-discovery lookups/RPCs they trigger on a miss. Healthy = hits dominate; discovery RPCs are an expensive cold-path, so a steady stream of them means routes aren't sticking in cache.",
+      "gridPos": { "h": 9, "w": 8, "x": 16, "y": 47 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "decimals": 2, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 10, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "ops/s" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "route_cache misses/s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
+          { "matcher": { "id": "byName", "options": "discovery rpcs/s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] },
+          { "matcher": { "id": "byName", "options": "route_cache hits/s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_route_cache_hits{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "A", "legendFormat": "route_cache hits/s" },
+        { "expr": "sum(rate(keinfs_kms_route_cache_misses{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "B", "legendFormat": "route_cache misses/s" },
+        { "expr": "sum(rate(keinfs_kms_route_discovery_lookups{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "C", "legendFormat": "discovery lookups/s" },
+        { "expr": "sum(rate(keinfs_kms_route_discovery_rpcs{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "D", "legendFormat": "discovery rpcs/s" }
+      ]
+    },
+    {
+      "type": "stat", "title": "Route Cache Hit %",
+      "description": "Route-cache hit ratio (hits / (hits+misses)). Healthy ≥ 99% (green) once the route table has warmed; a low ratio means repeated discovery RPCs on the object-write begin path.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 56 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 2, "min": 0, "max": 100, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 95 }, { "color": "green", "value": 99 } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value", "justifyMode": "center" },
+      "targets": [ { "expr": "100 * sum(keinfs_kms_route_cache_hits{shard=~\"$shard\",instance=~\"$instance\"}) / clamp_min(sum(keinfs_kms_route_cache_hits{shard=~\"$shard\",instance=~\"$instance\"}) + sum(keinfs_kms_route_cache_misses{shard=~\"$shard\",instance=~\"$instance\"}), 1)", "refId": "A", "legendFormat": "route hit %" } ]
+    },
+    {
+      "type": "stat", "title": "Discovery RPCs (cumulative)",
+      "description": "Cumulative route-discovery RPCs issued on route-cache misses since process start. Should plateau once routes are warm; a continuously rising count signals route churn or a too-small route cache.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 56 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] } } },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value", "justifyMode": "center" },
+      "targets": [ { "expr": "sum(keinfs_kms_route_discovery_rpcs{shard=~\"$shard\",instance=~\"$instance\"})", "refId": "A", "legendFormat": "discovery rpcs" } ]
+    },
+    {
+      "type": "timeseries", "title": "resolve_object_read / resolve_object_head latency p99 (µs, pow2-bucketed approx)",
+      "description": "End-to-end read-resolve latency for both resolve flavors (full resolve vs decentralized head-only). A cache-hit-dominated workload keeps p99 in low µs; sustained ms-range p99 means resolves are falling through to FDB. Values are pow2-bucketed approximations.",
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 56 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 6, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99, pow2 approx)" } }
+      },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "calcs": ["lastNotNull"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "max by (rpc) (keinfs_kms_rpc_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"resolve_object_read|resolve_object_head\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "{{rpc}} p99" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Background Sweeper & Lease / Orphan Health", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 61 }
+    },
+    {
+      "type": "timeseries", "title": "Background reclaim activity (per-second) — sweeper runs / leases reaped / orphan versions",
+      "description": "Current-era background reclaim: sweeper runs/s is the tick rate; write leases reaped/s is abandoned writes being cleaned; orphan versions reaped/s and reap errors/s are the orphan-version reaper. Healthy = steady run rate, near-zero reaps, zero reap errors. Rising lease reaps mean clients abandon writes after BeginObject.",
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 62 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "decimals": 2, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 10, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "ops/s" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "orphan reap errors/s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] },
+          { "matcher": { "id": "byName", "options": "write leases reaped/s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] }
+        ]
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum(rate(keinfs_kms_background_runs{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "A", "legendFormat": "sweeper runs/s" },
+        { "expr": "sum(rate(keinfs_kms_write_leases_reaped{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "B", "legendFormat": "write leases reaped/s" },
+        { "expr": "sum(rate(keinfs_kms_orphan_versions_reaped{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "C", "legendFormat": "orphan versions reaped/s" },
+        { "expr": "sum(rate(keinfs_kms_orphan_version_reap_errors{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "D", "legendFormat": "orphan reap errors/s" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Background sweeper latency (avg µs)",
+      "description": "Average duration of a sweeper run. Should stay flat and small; a climbing run latency means the sweep is scanning more outstanding leases/versions than usual — check the orphan-version backlog stat in the vitals row.",
+      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 62 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 6, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (avg)" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "max(keinfs_kms_background_run_latency_avg_microseconds{shard=~\"$shard\",instance=~\"$instance\"})", "refId": "A", "legendFormat": "run latency avg" },
+        { "expr": "max(keinfs_kms_orphan_version_oldest_age_ms{shard=~\"$shard\",instance=~\"$instance\"}) * 1000", "refId": "B", "legendFormat": "oldest orphan version age (as µs)" }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Instrumentation gaps", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 71 }
+    },
+    {
+      "type": "text", "title": "Not yet instrumented: FDB transaction health",
+      "description": "Visible placeholder for the C6 export gap — no FDB client metrics exist anywhere in the KMS tree.",
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 72 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Missing [pending C6]:** the KMS FoundationDB client (multi-threaded, commit 61ba0a1) exposes **no** transaction-health metrics — no FDB commit latency, no conflict/retry counter, no transaction-too-old counter. Until instrumented, the only visibility into FDB behavior is the indirect `store_*` phase latencies above. If `store_begin_resolved` or the commit store phases spike with no KMS-side cause, suspect FDB — but there is currently no metric to confirm it. Track: code instrumentation in `poc/kms`, then keinexport export, then panels in this row."
+      }
+    },
+
+    {
+      "type": "row", "title": "Object RPC Totals — request / error / latency (current + legacy generations)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 77 }
+    },
+    {
+      "type": "timeseries", "title": "Object RPC request rate (ops/s)",
+      "description": "Per-rpc request rate across BOTH pipeline generations. Current path: begin_object, commit_object(+segmented/multi), resolve_object_read/head, forfeit_object_write, renew_write_lease, repair_object_write, delete_object, delete_namespace_entry. Legacy window path: initiate_object_write, commit_object_write(_window). If any legacy line carries traffic, the deployment is not fully on the decentralized path.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 78 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 10, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "ops/s" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_requests_total{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|commit_object|commit_object_segmented|multi_commit_object|repair_object_write|abort_object_write|forfeit_object_write|renew_write_lease|resolve_object_read|resolve_object_head|delete_object|delete_namespace_entry|initiate_object_write|commit_object_write|commit_object_write_window\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{rpc}}" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Object RPC error rate (errors/s)",
+      "description": "Per-rpc error rate for the object control-plane calls (both generations). Healthy = flat zero; any line lifting off the floor pinpoints which object operation is failing. Errors on forfeit_object_write/renew_write_lease indicate write-recovery problems, not client load.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 78 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "decimals": 2, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 18, "gradientMode": "opacity", "showPoints": "auto", "axisLabel": "errors/s" } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "sum by (rpc) (rate(keinfs_kms_rpc_errors_total{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|commit_object|commit_object_segmented|multi_commit_object|repair_object_write|abort_object_write|forfeit_object_write|renew_write_lease|resolve_object_read|resolve_object_head|delete_object|delete_namespace_entry|initiate_object_write|commit_object_write|commit_object_write_window\"}[$__rate_interval]))", "refId": "A", "legendFormat": "{{rpc}}" }
+      ]
+    },
+    {
+      "type": "timeseries", "title": "Object RPC total latency p99 (µs, pow2-bucketed approx)",
+      "description": "End-to-end p99 latency of each object RPC (all phases included; log scale because commit_object_segmented legitimately spans minutes while begin_object is sub-ms). Compare against the store phases in the rows above to see how much of an RPC is FDB durability vs framing. Values are pow2-bucketed approximations.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 78 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 6, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99, pow2 approx)", "scaleDistribution": { "type": "log", "log": 10 } } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "expr": "max by (rpc) (keinfs_kms_rpc_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|commit_object|commit_object_segmented|multi_commit_object|repair_object_write|abort_object_write|forfeit_object_write|renew_write_lease|resolve_object_read|resolve_object_head|delete_object|delete_namespace_entry|initiate_object_write|commit_object_write|commit_object_write_window\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "{{rpc}}" }
+      ]
+    },
+    {
+      "type": "table", "title": "Object RPC latency table (p50 / p95 / p99 / max, µs — pow2-bucketed approx except max)",
+      "description": "Latest latency percentiles per object RPC across both generations. p50/p95/p99 are pow2-bucketed approximations; the quantile=1.0 row is the exact max. Gauge cells read at a glance: green ≤ 1ms, yellow ≤ 50ms, red above — the threshold where metadata durability starts to dominate the I/O. Remember commit_object_segmented is a long-lived streaming RPC; its large values are by design.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 86 },
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "fieldConfig": {
+        "defaults": { "unit": "µs", "decimals": 0, "custom": { "align": "auto", "cellOptions": { "type": "auto" } } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Value" }, "properties": [
+            { "id": "custom.cellOptions", "value": { "type": "gauge", "mode": "gradient" } },
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1000 }, { "color": "red", "value": 50000 } ] } }
+          ] }
+        ]
+      },
+      "transformations": [
+        { "id": "labelsToFields", "options": { "mode": "columns", "keepLabels": ["rpc", "quantile"] } },
+        { "id": "groupBy", "options": { "fields": {
+          "rpc": { "operation": "groupby" },
+          "quantile": { "operation": "groupby" },
+          "Value": { "operation": "lastNotNull", "aggregations": ["lastNotNull"] }
+        } } }
+      ],
+      "targets": [
+        { "expr": "max by (rpc, quantile) (keinfs_kms_rpc_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=~\"begin_object|commit_object|commit_object_segmented|multi_commit_object|repair_object_write|abort_object_write|forfeit_object_write|renew_write_lease|resolve_object_read|resolve_object_head|delete_object|delete_namespace_entry|initiate_object_write|commit_object_write|commit_object_write_window\"})", "refId": "A", "format": "table", "instant": true }
+      ]
+    },
+
+    {
+      "type": "row", "title": "Legacy window path (reservation era)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 95 }, "collapsed": true,
+      "panels": [
+        {
+          "type": "stat", "title": "Reserve Shard Bypasses (cumulative, legacy)",
+          "description": "LEGACY window path only. Reservation-cache fall-throughs to a direct allocator reserve on the initiate_object_write path. Irrelevant when traffic uses begin_object; if the legacy path still serves writes this should pin at 0.",
+          "gridPos": { "h": 4, "w": 4, "x": 0, "y": 96 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value", "justifyMode": "center" },
+          "targets": [ { "expr": "sum(keinfs_kms_reservation_cache_shard_bypasses{shard=~\"$shard\",instance=~\"$instance\"})", "refId": "A", "legendFormat": "bypasses" } ]
+        },
+        {
+          "type": "gauge", "title": "Reservation Cache Hit % (legacy)",
+          "description": "LEGACY window path only. Share of reserve acquisitions served from the local stripe pool (hits / (hits+misses)). Healthy ≥ 95% when this path carries traffic; ignore when begin_object serves all writes.",
+          "gridPos": { "h": 4, "w": 5, "x": 4, "y": 96 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "min": 0, "max": 100, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 90 }, { "color": "green", "value": 95 } ] } } },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "showThresholdMarkers": true },
+          "targets": [ { "expr": "100 * sum(keinfs_kms_reservation_cache_hits{shard=~\"$shard\",instance=~\"$instance\"}) / clamp_min(sum(keinfs_kms_reservation_cache_hits{shard=~\"$shard\",instance=~\"$instance\"}) + sum(keinfs_kms_reservation_cache_misses{shard=~\"$shard\",instance=~\"$instance\"}), 1)", "refId": "A", "legendFormat": "hit %" } ]
+        },
+        {
+          "type": "stat", "title": "Reservation Cache Depth (legacy)",
+          "description": "LEGACY window path only. Current depth of the in-memory reservation (stripe) pool; a depth trending toward 0 precedes bypasses. Idle/zero when begin_object serves all writes.",
+          "gridPos": { "h": 4, "w": 4, "x": 9, "y": 96 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "yellow", "value": 1 }, { "color": "green", "value": 64 } ] } } },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value", "justifyMode": "center" },
+          "targets": [ { "expr": "sum(keinfs_kms_reservation_cache_depth{shard=~\"$shard\",instance=~\"$instance\"})", "refId": "A", "legendFormat": "depth" } ]
+        },
+        {
+          "type": "stat", "title": "Expired Write Intents (cumulative, legacy)",
+          "description": "LEGACY window path only. Write intents reclaimed because the client never committed after initiate_object_write. The current-era counterpart is 'Write leases reaped' in the vitals row.",
+          "gridPos": { "h": 4, "w": 4, "x": 13, "y": 96 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 1 } ] } } },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none", "textMode": "value", "justifyMode": "center" },
+          "targets": [ { "expr": "sum(keinfs_kms_expired_write_intents{shard=~\"$shard\",instance=~\"$instance\"})", "refId": "A", "legendFormat": "expired" } ]
+        },
+        {
+          "type": "stat", "title": "Reservation Serves (cumulative, legacy)",
+          "description": "LEGACY window path only. Lifetime reservations served from the cache to initiate calls. Pair its rate with the cache hit % to gauge pool churn on the legacy path.",
+          "gridPos": { "h": 4, "w": 3, "x": 17, "y": 96 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] } } },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value", "justifyMode": "center" },
+          "targets": [ { "expr": "sum(keinfs_kms_reservation_cache_serves{shard=~\"$shard\",instance=~\"$instance\"})", "refId": "A", "legendFormat": "serves" } ]
+        },
+        {
+          "type": "stat", "title": "Refills (cumulative, legacy)",
+          "description": "LEGACY window path only. Lifetime reservation-pool refills (batched stripe reservations). A spike means the pool drained faster than it refilled.",
+          "gridPos": { "h": 4, "w": 4, "x": 20, "y": 96 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] } } },
+          "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area", "textMode": "value", "justifyMode": "center" },
+          "targets": [ { "expr": "sum(keinfs_kms_reservation_cache_refills{shard=~\"$shard\",instance=~\"$instance\"})", "refId": "A", "legendFormat": "refills" } ]
+        },
+        {
+          "type": "timeseries", "title": "Legacy reserve phase latency p99 (µs) — route → cache → direct reserve (pow2-bucketed approx)",
+          "description": "LEGACY window path only: p99 decomposition of the reserve path inside initiate_object_write — route-resolve, cache acquire, hit/miss/wait variants, direct reserve, and the store reserve-window txn. Cache-hit phases sit at ~1µs; the wait_for_refill / direct_reserve phases only light up when the pool is starving. Empty when begin_object serves all writes.",
+          "gridPos": { "h": 10, "w": 16, "x": 0, "y": 100 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 1, "fillOpacity": 4, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99, pow2 approx)" } }
+          },
+          "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+          "targets": [
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reserve_route_resolve\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "reserve_route_resolve" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reservation_cache_acquire\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "reservation_cache_acquire" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reserve_cache_hit\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "reserve_cache_hit" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reserve_cache_miss\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "reserve_cache_miss" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reserve_cache_wait_for_refill\",quantile=\"0.99\"})", "refId": "E", "legendFormat": "reserve_cache_wait_for_refill" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reserve_cache_wait_hit\",quantile=\"0.99\"})", "refId": "F", "legendFormat": "reserve_cache_wait_hit" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reserve_cache_wait_retry\",quantile=\"0.99\"})", "refId": "G", "legendFormat": "reserve_cache_wait_retry" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reserve_cache_direct_reserve\",quantile=\"0.99\"})", "refId": "H", "legendFormat": "reserve_cache_direct_reserve" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"store_reserve_object_write_window_total\",quantile=\"0.99\"})", "refId": "I", "legendFormat": "store_reserve_object_write_window_total" }
+          ]
+        },
+        {
+          "type": "bargauge", "title": "Legacy reserve phase budget (last p99, µs, pow2-bucketed approx)",
+          "description": "LEGACY window path only. Where the p99 µs of a legacy reserve go right now; wait/refill/direct bars appearing means the reservation pool is under-provisioned. Empty when begin_object serves all writes.",
+          "gridPos": { "h": 10, "w": 8, "x": 16, "y": 100 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": { "defaults": { "unit": "µs", "decimals": 0, "min": 0, "color": { "mode": "continuous-GrYlRd" }, "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "yellow", "value": 50 }, { "color": "red", "value": 1000 } ] } } },
+          "options": { "displayMode": "gradient", "orientation": "horizontal", "valueMode": "color", "reduceOptions": { "calcs": ["lastNotNull"] }, "showUnfilled": true },
+          "targets": [
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reserve_route_resolve\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "route_resolve" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reservation_cache_acquire\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "cache_acquire" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reserve_cache_wait_for_refill\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "wait_for_refill" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"reserve_cache_direct_reserve\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "direct_reserve" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"store_reserve_object_write_window_total\",quantile=\"0.99\"})", "refId": "E", "legendFormat": "store_reserve_window_total" }
+          ]
+        },
+        {
+          "type": "timeseries", "title": "Reservation cache activity (per-second, legacy)",
+          "description": "LEGACY window path only. Rates of reservation-cache hits, misses, refills, serves, shard-bypasses, plus sweeper reservation releases. Healthy steady state on this path: serves ≈ hits, refills a low trickle, misses/bypasses/releases near zero.",
+          "gridPos": { "h": 9, "w": 12, "x": 0, "y": 110 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": { "unit": "ops", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 10, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "ops/s" } },
+            "overrides": [
+              { "matcher": { "id": "byName", "options": "misses/s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] },
+              { "matcher": { "id": "byName", "options": "shard bypasses/s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] },
+              { "matcher": { "id": "byName", "options": "hits/s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } } ] }
+            ]
+          },
+          "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+          "targets": [
+            { "expr": "sum(rate(keinfs_kms_reservation_cache_hits{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "A", "legendFormat": "hits/s" },
+            { "expr": "sum(rate(keinfs_kms_reservation_cache_misses{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "B", "legendFormat": "misses/s" },
+            { "expr": "sum(rate(keinfs_kms_reservation_cache_refills{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "C", "legendFormat": "refills/s" },
+            { "expr": "sum(rate(keinfs_kms_reservation_cache_serves{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "D", "legendFormat": "serves/s" },
+            { "expr": "sum(rate(keinfs_kms_reservation_cache_shard_bypasses{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "E", "legendFormat": "shard bypasses/s" },
+            { "expr": "sum(rate(keinfs_kms_background_released_reservations{shard=~\"$shard\",instance=~\"$instance\"}[$__rate_interval]))", "refId": "F", "legendFormat": "released reservations/s" }
+          ]
+        },
+        {
+          "type": "timeseries", "title": "Legacy store phase totals p99 (µs) — initiate / commit / windows (pow2-bucketed approx)",
+          "description": "LEGACY window path only. The store_*_total FDB txn costs underneath the legacy object RPCs (initiate, reserve-window, commit, commit-window), plus queue_finalize_reservations from the legacy commit handler. Current-era store phases live in the BeginObject and Commit rows above.",
+          "gridPos": { "h": 9, "w": 12, "x": 12, "y": 110 },
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "fieldConfig": {
+            "defaults": { "unit": "µs", "decimals": 1, "color": { "mode": "palette-classic" }, "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "lineWidth": 2, "fillOpacity": 6, "gradientMode": "opacity", "showPoints": "never", "axisLabel": "µs (p99, pow2 approx)" } }
+          },
+          "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["lastNotNull", "max", "mean"] }, "tooltip": { "mode": "multi", "sort": "desc" } },
+          "targets": [
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"store_initiate_write_total\",quantile=\"0.99\"})", "refId": "A", "legendFormat": "store_initiate_write_total" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"initiate_object_write\",phase=\"store_reserve_object_write_window_total\",quantile=\"0.99\"})", "refId": "B", "legendFormat": "store_reserve_object_write_window_total" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"commit_object_write\",phase=\"store_commit_object_write_total\",quantile=\"0.99\"})", "refId": "C", "legendFormat": "store_commit_object_write_total" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"commit_object_write_window\",phase=\"store_commit_object_write_window_total\",quantile=\"0.99\"})", "refId": "D", "legendFormat": "store_commit_object_write_window_total" },
+            { "expr": "max(keinfs_kms_phase_latency_microseconds{shard=~\"$shard\",instance=~\"$instance\",rpc=\"commit_object_write\",phase=\"queue_finalize_reservations\",quantile=\"0.99\"})", "refId": "E", "legendFormat": "queue_finalize_reservations" }
+          ]
+        }
+      ]
+    }
+  ]
+}

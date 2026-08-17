@@ -1,0 +1,13 @@
+[package]
+name = "kee"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[features]
+default = []
+isa-l-backend = ["dep:keisal"]
+
+[dependencies]
+reed-solomon-erasure = "6"
+keisal = { path = "../keisal", optional = true }

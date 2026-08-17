@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Andreas Krause / storagebit
+
+set -euo pipefail
+
+repo_root=$(git rev-parse --show-toplevel)
+exec python3 "${repo_root}/tools/check-public-safety.py" --index

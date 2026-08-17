@@ -1,0 +1,11 @@
+current_context = {{CONTEXT_NAME_VALUE}}
+
+[contexts.{{CONTEXT_NAME_KEY}}]
+label = {{CONTEXT_LABEL}}
+kms_endpoint = {{CONTEXT_KMS_ENDPOINT}}
+kas_endpoint = {{CONTEXT_KAS_ENDPOINT}}
+kms_runtime_root = {{CONTEXT_KMS_RUNTIME_ROOT}}
+kas_runtime_root = {{CONTEXT_KAS_RUNTIME_ROOT}}
+krs_runtime_root = {{CONTEXT_KRS_RUNTIME_ROOT}}
+kst_runtime_root = {{CONTEXT_KST_RUNTIME_ROOT}}
+kst_http_endpoints = {{CONTEXT_KST_HTTP_ENDPOINTS}}
